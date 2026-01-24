@@ -24,7 +24,6 @@ pre-push hook에서 실행되어 여러 관점으로 코드 리뷰를 병렬 실
 
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 import sys
@@ -271,10 +270,12 @@ def save_result(perspective: str, result: str):
     result_path.parent.mkdir(parents=True, exist_ok=True)
 
     with open(result_path, "w", encoding="utf-8") as f:
-        json.dump({
-            "result": result,
-            "reviewed_at": datetime.now().isoformat()
-        }, f, indent=2, ensure_ascii=False)
+        json.dump(
+            {"result": result, "reviewed_at": datetime.now().isoformat()},
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
 
 
 def save_report(perspective: str, content: str):
@@ -343,7 +344,11 @@ def run_claude_review(diff: str, perspective: dict) -> tuple[str, str, str]:
     except subprocess.TimeoutExpired:
         return (name, "FAIL", "Error: Review timeout (5분 초과)")
     except FileNotFoundError:
-        return (name, "FAIL", "Error: claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code")
+        return (
+            name,
+            "FAIL",
+            "Error: claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code",
+        )
     except Exception as e:
         return (name, "FAIL", f"Error: {e}")
 
@@ -422,10 +427,7 @@ def main():
     # 병렬 리뷰 실행
     results = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {
-            executor.submit(review_perspective, diff, p): p
-            for p in perspectives
-        }
+        futures = {executor.submit(review_perspective, diff, p): p for p in perspectives}
         for future in as_completed(futures):
             name, verdict = future.result()
             results[name] = verdict

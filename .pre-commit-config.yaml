@@ -18,7 +18,7 @@ repos:
       - id: check-yaml
       - id: check-json
       - id: check-added-large-files
-        args: ['--maxkb=1000']
+        args: ["--maxkb=1000"]
       - id: detect-private-key
 
   # ============================================
@@ -42,7 +42,7 @@ repos:
       - id: mypy
         types: [python]
         stages: [pre-push]
-        additional_dependencies: []  # 프로젝트에 맞게 추가
+        additional_dependencies: [] # 프로젝트에 맞게 추가
 
   - repo: https://github.com/seddonym/import-linter
     rev: v2.1
