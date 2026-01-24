@@ -22,11 +22,17 @@ dependencies = []
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pytest-cov>=4.0",
     "ruff>=0.4",
     "mypy>=1.10",
+    "import-linter>=2.0",
+    "pre-commit>=3.0",
 ]
 kafka = [
     "aiokafka>=0.10",
+]
+zmq = [
+    "pyzmq>=25.0",
 ]
 
 [build-system]
@@ -55,3 +61,18 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "C4", "SIM"]
 python_version = "3.11"
 strict = true
 warn_return_any = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disable_error_code = ["import-untyped", "no-untyped-def", "misc"]
+
+# Import Linter - 아키텍처 의존성 규칙
+[tool.importlinter]
+root_packages = ["message_bus"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "ports should not depend on implementations"
+type = "forbidden"
+source_modules = ["message_bus.ports"]
+forbidden_modules = ["message_bus.local", "message_bus.zmq_bus"]
