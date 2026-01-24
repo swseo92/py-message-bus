@@ -45,6 +45,7 @@ GLOBAL_PROMPTS_FILE = Path.home() / ".claude" / "review-prompts.yaml"
 PROJECT_PROMPTS_FILE = Path(".claude/review-prompts.yaml")
 REVIEW_DIR = ".claude-review"
 META_FILE = "meta.json"
+DIFF_FILE = "current.diff"
 RESULTS_DIR = "results"
 REPORTS_DIR = "reports"
 MAX_WORKERS = 4  # 병렬 실행 수
@@ -205,10 +206,21 @@ def get_default_prompts() -> list[dict]:
     ]
 
 
-def build_full_prompt(name: str, perspective_prompt: str, diff: str) -> str:
-    """공통 프롬프트를 주입하여 전체 프롬프트를 생성합니다."""
+def build_full_prompt(name: str, perspective_prompt: str) -> str:
+    """공통 프롬프트를 주입하여 전체 프롬프트를 생성합니다.
+
+    diff는 파일로 저장되어 있으므로 Claude가 직접 읽도록 안내합니다.
+    """
     header = COMMON_HEADER.format(name=name)
-    return f"{header}\n\n{perspective_prompt}\n{COMMON_FOOTER}\n\n--- DIFF ---\n{diff}"
+    diff_path = get_diff_file_path()
+    return f"""{header}
+
+{perspective_prompt}
+{COMMON_FOOTER}
+
+---
+변경사항은 {diff_path} 파일에 있습니다.
+Read 도구로 해당 파일을 읽고 리뷰해주세요."""
 
 
 def load_meta() -> dict:
@@ -228,6 +240,21 @@ def save_meta(diff_hash: str):
     meta_path = review_dir / META_FILE
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump({"diff_hash": diff_hash}, f, indent=2)
+
+
+def save_diff(diff: str):
+    """diff를 파일로 저장합니다 (매번 덮어쓰기)."""
+    review_dir = get_review_dir()
+    review_dir.mkdir(parents=True, exist_ok=True)
+
+    diff_path = review_dir / DIFF_FILE
+    with open(diff_path, "w", encoding="utf-8") as f:
+        f.write(diff)
+
+
+def get_diff_file_path() -> Path:
+    """diff 파일 경로."""
+    return get_review_dir() / DIFF_FILE
 
 
 def initialize_review_dir(diff_hash: str):
@@ -316,8 +343,11 @@ def parse_verdict(output: str) -> str:
     return "FAIL"
 
 
-def run_claude_review(diff: str, perspective: dict) -> tuple[str, str, str]:
+def run_claude_review(perspective: dict) -> tuple[str, str, str]:
     """Claude로 특정 관점의 리뷰를 실행합니다.
+
+    diff는 .claude-review/current.diff에 저장되어 있으며,
+    Claude가 직접 Read 도구로 읽습니다.
 
     Returns:
         (perspective_name, result, report_content)
@@ -325,7 +355,7 @@ def run_claude_review(diff: str, perspective: dict) -> tuple[str, str, str]:
     name = perspective["name"]
     prompt = perspective["prompt"]
 
-    full_prompt = build_full_prompt(name, prompt, diff)
+    full_prompt = build_full_prompt(name, prompt)
 
     try:
         result = subprocess.run(
@@ -354,8 +384,10 @@ def run_claude_review(diff: str, perspective: dict) -> tuple[str, str, str]:
         return (name, "FAIL", f"Error: {e}")
 
 
-def review_perspective(diff: str, perspective: dict) -> tuple[str, str]:
+def review_perspective(perspective: dict) -> tuple[str, str]:
     """단일 관점 리뷰를 실행합니다.
+
+    diff는 .claude-review/current.diff에 저장되어 있습니다.
 
     Returns:
         (perspective_name, result)
@@ -370,7 +402,7 @@ def review_perspective(diff: str, perspective: dict) -> tuple[str, str]:
 
     # 리뷰 실행
     print(f"  [{name}] 리뷰 중...")
-    name, verdict, report = run_claude_review(diff, perspective)
+    name, verdict, report = run_claude_review(perspective)
 
     # 보고서 저장
     save_report(name, report)
@@ -423,13 +455,17 @@ def main():
     else:
         print("Hash 동일 - 기존 결과 사용 가능")
 
+    # diff를 파일로 저장 (매번 덮어쓰기)
+    save_diff(diff)
+    print(f"Diff 저장: {get_diff_file_path()}")
+
     print("-" * 60)
 
     # 병렬 리뷰 실행
     results = {}
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
-            executor.submit(review_perspective, diff, p): p
+            executor.submit(review_perspective, p): p
             for p in perspectives
         }
         for future in as_completed(futures):
