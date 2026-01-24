@@ -44,11 +44,13 @@ src/message_bus/
 ### MessageBus 인터페이스 (ports.py)
 
 **등록 메서드 (부트스트랩 시점):**
+
 - `register_query(query_type, handler)` - 1:1, 응답 반환
 - `register_command(command_type, handler)` - 1:1, 응답 없음
 - `subscribe(event_type, handler)` - 1:N, 다중 구독자
 
 **디스패치 메서드 (런타임 시점):**
+
 - `send(query) -> T` - Query 전송, 동기 응답
 - `execute(command)` - Command 실행
 - `publish(event)` - Event 발행 (멀티캐스트)
@@ -61,11 +63,11 @@ src/message_bus/
 
 ### 메시지 타입
 
-| 타입 | 패턴 | 구독자 | 응답 |
-|------|------|--------|------|
-| Query[T] | 1:1 | 1개 필수 | T 반환 |
-| Command | 1:1 | 1개 필수 | 없음 |
-| Event | 1:N | 0개 이상 | 없음 |
+| 타입     | 패턴 | 구독자   | 응답   |
+| -------- | ---- | -------- | ------ |
+| Query[T] | 1:1  | 1개 필수 | T 반환 |
+| Command  | 1:1  | 1개 필수 | 없음   |
+| Event    | 1:N  | 0개 이상 | 없음   |
 
 ### 에러 규칙
 

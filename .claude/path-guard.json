@@ -2,6 +2,6 @@
   "enabled": true,
   "allowed_paths": ["src/", "tests/", ".omc/"],
   "blocked_paths": ["config/secrets/"],
-  "always_allow": ["*.md", "*.txt"],
+  "always_allow": ["*.md", "*.txt", "pyproject.toml"],
   "always_block": ["**/credentials*", "**/secrets*", "**/*.pem", "**/*.key"]
 }
