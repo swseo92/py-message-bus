@@ -36,10 +36,16 @@
 """
 
 import fnmatch
+import io
 import json
 import os
 import sys
 from pathlib import Path
+
+# Windows cp949 인코딩 문제 해결
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 # ============================================
 # 하드코딩된 보안 경로 (설정으로 우회 불가)
@@ -66,7 +72,10 @@ def load_config() -> dict:
         try:
             return json.loads(config_file.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            print(json.dumps({"decision": "block", "reason": "path-guard.json 파싱 오류"}))
+            print(json.dumps({
+                "decision": "block",
+                "reason": "path-guard.json 파싱 오류"
+            }))
             sys.exit(0)
 
     # 설정 파일 없으면 기본값 (제한 없음)
@@ -99,10 +108,10 @@ def matches_pattern(path: Path, pattern: str) -> bool:
     pattern = pattern.replace("\\", "/")
 
     return (
-        fnmatch.fnmatch(name, pattern)
-        or fnmatch.fnmatch(full, f"*{pattern}")
-        or fnmatch.fnmatch(rel, pattern)
-        or fnmatch.fnmatch(rel, f"*/{pattern}")
+        fnmatch.fnmatch(name, pattern) or
+        fnmatch.fnmatch(full, f"*{pattern}") or
+        fnmatch.fnmatch(rel, pattern) or
+        fnmatch.fnmatch(rel, f"*/{pattern}")
     )
 
 
@@ -135,9 +144,11 @@ def check_hardcoded_block(file_path: Path) -> dict | None:
                 "decision": "block",
                 "reason": (
                     f"[BLOCKED - SECURITY] {rel_path}\n"
-                    f"보안상 수정이 금지된 파일입니다. 이 파일은 우회할 수 없습니다.\n"
-                    f"정말 필요한 경우 사용자에게 직접 수정을 요청하세요."
-                ),
+                    f"보안상 수정이 금지된 파일입니다.\n"
+                    f"\n"
+                    f"⚠️ Bash를 사용한 모든 파일 수정 우회를 금지합니다.\n"
+                    f"불가피하게 수정이 필요하면 path-guard.json에 경로 추가를 요청하세요."
+                )
             }
 
     return None
@@ -153,13 +164,9 @@ def format_block_message(rel_path: str, reason: str, allowed_paths: list[str]) -
             f"사유: {reason}\n"
             f"허용된 경로: {paths_str}\n"
             f"\n"
-            f"[모듈러 모놀리식 원칙]\n"
-            f"다른 모듈의 코드를 직접 수정하지 마세요.\n"
-            f"모듈 간 통신은 public API 또는 이벤트를 통해야 합니다.\n"
-            f"\n"
-            f"현재 모듈 내에서 문제를 해결할 방법을 먼저 찾으세요.\n"
-            f"정말 불가피한 경우에만 사용자에게 권한 추가를 요청하세요."
-        ),
+            f"⚠️ Bash를 사용한 모든 파일 수정 우회를 금지합니다.\n"
+            f"이 파일 수정이 필요하면 사용자에게 예외 등록을 요청하세요."
+        )
     }
 
 
@@ -192,11 +199,19 @@ def check_permission(file_path: str, config: dict) -> dict | None:
     # 1. 항상 차단 패턴 확인 (블랙리스트)
     for pattern in always_block:
         if matches_pattern(path, pattern):
-            return format_block_message(rel_path, f"차단된 패턴 '{pattern}'과 일치", allowed_paths)
+            return format_block_message(
+                rel_path,
+                f"차단된 패턴 '{pattern}'과 일치",
+                allowed_paths
+            )
 
     # 2. 블랙리스트 경로 확인
     if is_under_path(path, blocked_paths):
-        return format_block_message(rel_path, "차단된 경로(blocked_paths)에 포함됨", allowed_paths)
+        return format_block_message(
+            rel_path,
+            "차단된 경로(blocked_paths)에 포함됨",
+            allowed_paths
+        )
 
     # 3. 항상 허용 패턴 확인
     for pattern in always_allow:
@@ -209,7 +224,9 @@ def check_permission(file_path: str, config: dict) -> dict | None:
             return None  # 허용
         else:
             return format_block_message(
-                rel_path, "허용된 경로(allowed_paths)에 포함되지 않음", allowed_paths
+                rel_path,
+                "허용된 경로(allowed_paths)에 포함되지 않음",
+                allowed_paths
             )
 
     # 5. allowed_paths가 비어있으면 모두 허용 (블랙리스트만 사용)
