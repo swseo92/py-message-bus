@@ -1,13 +1,14 @@
 """Lightweight message bus for modular monolith architecture."""
 
 from message_bus.local import LocalMessageBus
-from message_bus.ports import Command, Event, MessageBus, Query
+from message_bus.ports import Command, Event, MessageBus, Query, Task
 
 __all__ = [
     "MessageBus",
     "Query",
     "Command",
     "Event",
+    "Task",
     "LocalMessageBus",
 ]
 

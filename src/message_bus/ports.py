@@ -29,6 +29,13 @@ class Event:
     pass
 
 
+@dataclass(frozen=True)
+class Task:
+    """Base class for distributed tasks. Only one worker processes each task."""
+
+    pass
+
+
 class MessageBus(ABC):
     """
     Message bus interface.
@@ -56,6 +63,13 @@ class MessageBus(ABC):
         """Subscribe to an event. Multiple handlers per event type allowed."""
         ...
 
+    @abstractmethod
+    def register_task(
+        self, task_type: type[Task], handler: Callable[[Task], None]
+    ) -> None:
+        """Register a task handler. In distributed mode, only one worker processes each task."""
+        ...
+
     # Dispatch methods (called at runtime)
 
     @abstractmethod
@@ -71,4 +85,9 @@ class MessageBus(ABC):
     @abstractmethod
     def publish(self, event: Event) -> None:
         """Publish an event to all subscribers."""
+        ...
+
+    @abstractmethod
+    def dispatch(self, task: Task) -> None:
+        """Dispatch a task to one worker. In distributed mode, load-balanced across workers."""
         ...

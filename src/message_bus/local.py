@@ -2,9 +2,9 @@
 
 from collections import defaultdict
 from collections.abc import Callable
-from typing import TypeVar
+from typing import Any, TypeVar, cast
 
-from message_bus.ports import Command, Event, MessageBus, Query
+from message_bus.ports import Command, Event, MessageBus, Query, Task
 
 T = TypeVar("T")
 
@@ -29,12 +29,13 @@ class LocalMessageBus(MessageBus):
     For production with multiple services, use KafkaMessageBus or similar.
     """
 
-    __slots__ = ("_query_handlers", "_command_handlers", "_event_subscribers")
+    __slots__ = ("_query_handlers", "_command_handlers", "_event_subscribers", "_task_handlers")
 
     def __init__(self) -> None:
-        self._query_handlers: dict[type, Callable] = {}
-        self._command_handlers: dict[type, Callable] = {}
-        self._event_subscribers: dict[type, list[Callable]] = defaultdict(list)
+        self._query_handlers: dict[type[Query[Any]], Callable[[Query[Any]], Any]] = {}
+        self._command_handlers: dict[type[Command], Callable[[Command], None]] = {}
+        self._event_subscribers: dict[type[Event], list[Callable[[Event], None]]] = defaultdict(list)
+        self._task_handlers: dict[type[Task], Callable[[Task], None]] = {}
 
     # Registration methods
 
@@ -53,6 +54,13 @@ class LocalMessageBus(MessageBus):
     def subscribe(self, event_type: type[Event], handler: Callable[[Event], None]) -> None:
         self._event_subscribers[event_type].append(handler)
 
+    def register_task(
+        self, task_type: type[Task], handler: Callable[[Task], None]
+    ) -> None:
+        if task_type in self._task_handlers:
+            raise ValueError(f"Task handler already registered for {task_type.__name__}")
+        self._task_handlers[task_type] = handler
+
     # Dispatch methods
 
     def send(self, query: Query[T]) -> T:
@@ -60,7 +68,7 @@ class LocalMessageBus(MessageBus):
         handler = self._query_handlers.get(query_type)
         if handler is None:
             raise LookupError(f"No handler registered for query {query_type.__name__}")
-        return handler(query)
+        return cast(T, handler(query))
 
     def execute(self, command: Command) -> None:
         command_type = type(command)
@@ -76,6 +84,13 @@ class LocalMessageBus(MessageBus):
             for handler in handlers:
                 handler(event)
 
+    def dispatch(self, task: Task) -> None:
+        task_type = type(task)
+        handler = self._task_handlers.get(task_type)
+        if handler is None:
+            raise LookupError(f"No handler registered for task {task_type.__name__}")
+        handler(task)
+
     # Introspection (useful for debugging)
 
     def registered_queries(self) -> list[str]:
@@ -89,3 +104,7 @@ class LocalMessageBus(MessageBus):
     def registered_events(self) -> dict[str, int]:
         """List all registered event types with subscriber counts."""
         return {t.__name__: len(handlers) for t, handlers in self._event_subscribers.items()}
+
+    def registered_tasks(self) -> list[str]:
+        """List all registered task types."""
+        return [t.__name__ for t in self._task_handlers]

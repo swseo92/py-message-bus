@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import pytest
 
-from message_bus import Command, Event, LocalMessageBus, Query
+from message_bus import Command, Event, LocalMessageBus, Query, Task
 
 
 # Test messages
@@ -23,6 +23,12 @@ class CreateOrderCommand(Command):
 class OrderCreatedEvent(Event):
     order_id: str
     user_id: str
+
+
+@dataclass(frozen=True)
+class SendEmailTask(Task):
+    email: str
+    subject: str
 
 
 class TestQueryHandling:
@@ -84,6 +90,31 @@ class TestEventHandling:
         bus.publish(OrderCreatedEvent(order_id="order-1", user_id="123"))
 
 
+class TestTaskHandling:
+    def test_dispatch_task_calls_handler(self):
+        bus = LocalMessageBus()
+        dispatched = []
+        bus.register_task(SendEmailTask, lambda t: dispatched.append(t))
+
+        bus.dispatch(SendEmailTask(email="test@example.com", subject="Hello"))
+
+        assert len(dispatched) == 1
+        assert dispatched[0].email == "test@example.com"
+
+    def test_dispatch_unregistered_task_raises(self):
+        bus = LocalMessageBus()
+
+        with pytest.raises(LookupError, match="No handler registered"):
+            bus.dispatch(SendEmailTask(email="test@example.com", subject="Hello"))
+
+    def test_register_duplicate_task_raises(self):
+        bus = LocalMessageBus()
+        bus.register_task(SendEmailTask, lambda t: None)
+
+        with pytest.raises(ValueError, match="already registered"):
+            bus.register_task(SendEmailTask, lambda t: None)
+
+
 class TestIntrospection:
     def test_registered_queries(self):
         bus = LocalMessageBus()
@@ -98,3 +129,9 @@ class TestIntrospection:
 
         events = bus.registered_events()
         assert events["OrderCreatedEvent"] == 2
+
+    def test_registered_tasks(self):
+        bus = LocalMessageBus()
+        bus.register_task(SendEmailTask, lambda t: None)
+
+        assert "SendEmailTask" in bus.registered_tasks()
