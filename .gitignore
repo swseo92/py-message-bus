@@ -61,3 +61,4 @@ yarn-error.log*
 .env.*.local
 .claude-review/
 /.jbeval/
+uv.lock
