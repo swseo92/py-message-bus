@@ -198,7 +198,7 @@ class TestAsyncMessageBusExceptionPropagation:
             await async_bus.dispatch(SendEmailTask(email="a@b.com", subject="Hi"))
 
     async def test_event_handler_exception_in_gather(self, async_bus):
-        """Event handler exception propagates via asyncio.gather (default behavior)."""
+        """Event handler exception with fault isolation - all handlers called."""
         results = []
 
         async def handler1(e):
@@ -211,9 +211,12 @@ class TestAsyncMessageBusExceptionPropagation:
         async_bus.subscribe(OrderCreatedEvent, handler1)
         async_bus.subscribe(OrderCreatedEvent, handler2)
 
-        # asyncio.gather without return_exceptions=True raises first exception
-        with pytest.raises(ValueError):
+        # With fault isolation, all handlers execute and exception is raised after
+        with pytest.raises(ValueError, match="Handler1 failed"):
             await async_bus.publish(OrderCreatedEvent(order_id="1", user_id="1"))
+
+        # handler2 WAS called despite handler1 failure (fault isolation)
+        assert results == ["handler2"]
 
 
 class TestAsyncMessageBusNoneReturn:

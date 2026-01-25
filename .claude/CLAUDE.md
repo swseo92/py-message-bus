@@ -6,9 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 모듈러 모놀리스 아키텍처를 위한 경량 메시지 버스 라이브러리.
 
-- Zero dependencies
+- Zero dependencies (코어)
 - Type-safe (Generic 지원)
-- ~100줄 코어 코드
+- Interface Segregation (필요한 인터페이스만 주입 가능)
 - 직접 함수 호출 방식 (실제 메시지 큐잉 없음)
 
 ## 명령어
@@ -29,6 +29,9 @@ mypy src
 
 # 설치 (개발 모드)
 pip install -e ".[dev]"
+
+# ZMQ 지원 설치
+pip install -e ".[zmq]"
 ```
 
 ## 아키텍처
@@ -37,45 +40,55 @@ pip install -e ".[dev]"
 
 ```
 src/message_bus/
-├── ports.py    # 인터페이스: MessageBus(ABC), Query[T], Command, Event
-└── local.py    # 구현체: LocalMessageBus
+├── ports.py    # 인터페이스: 분리된 Dispatcher/Registry ABC들
+├── local.py    # 구현체: LocalMessageBus, AsyncLocalMessageBus
+└── zmq_bus.py  # 구현체: ZmqMessageBus, ZmqWorker (optional, pyzmq 필요)
 ```
 
-### MessageBus 인터페이스 (ports.py)
+### Interface Segregation (ports.py)
 
-**등록 메서드 (부트스트랩 시점):**
+**Sync 인터페이스:**
 
-- `register_query(query_type, handler)` - 1:1, 응답 반환
-- `register_command(command_type, handler)` - 1:1, 응답 없음
-- `subscribe(event_type, handler)` - 1:N, 다중 구독자
+| 인터페이스        | 역할                         |
+| ----------------- | ---------------------------- |
+| `QueryDispatcher` | `send(query) -> T`           |
+| `QueryRegistry`   | `register_query(type, handler)` |
+| `MessageDispatcher` | `execute()`, `publish()`, `dispatch()` |
+| `HandlerRegistry` | `register_command()`, `subscribe()`, `register_task()` |
+| `MessageBus`      | 위 4개 모두 상속 (full interface) |
 
-**디스패치 메서드 (런타임 시점):**
+**Async 인터페이스:** 동일 구조에 `Async` 접두사 (`AsyncMessageBus` 등)
 
-- `send(query) -> T` - Query 전송, 동기 응답
-- `execute(command)` - Command 실행
-- `publish(event)` - Event 발행 (멀티캐스트)
-
-### LocalMessageBus는 "라우터"
-
-- 실제 메시지 큐잉 없음
-- dict 조회 + 직접 함수 호출
-- 오버헤드: ~80ns/call
+**사용 예시 - 필요한 인터페이스만 주입:**
+```python
+class OrderService:
+    def __init__(self, queries: QueryDispatcher):  # send()만 필요
+        self._queries = queries
+```
 
 ### 메시지 타입
 
-| 타입     | 패턴 | 구독자   | 응답   |
-| -------- | ---- | -------- | ------ |
-| Query[T] | 1:1  | 1개 필수 | T 반환 |
-| Command  | 1:1  | 1개 필수 | 없음   |
-| Event    | 1:N  | 0개 이상 | 없음   |
+| 타입     | 패턴 | 구독자   | 응답   | 용도 |
+| -------- | ---- | -------- | ------ | ---- |
+| Query[T] | 1:1  | 1개 필수 | T 반환 | 조회 |
+| Command  | 1:1  | 1개 필수 | 없음   | 상태 변경 |
+| Event    | 1:N  | 0개 이상 | 없음   | 알림 |
+| Task     | 1:1  | 1개 필수 | 없음   | 분산 작업 (워커용) |
+
+### 구현체
+
+| 구현체 | 용도 | 특징 |
+| ------ | ---- | ---- |
+| `LocalMessageBus` | 단일 프로세스 | dict 조회 + 직접 함수 호출, ~80ns 오버헤드 |
+| `AsyncLocalMessageBus` | 단일 프로세스 (async) | asyncio.gather로 이벤트 병렬 처리 |
+| `ZmqMessageBus` + `ZmqWorker` | 멀티프로세스 | PUSH/PULL, REQ/REP, PUB/SUB 패턴, pickle 직렬화 |
 
 ### 에러 규칙
 
-- Query/Command 중복 등록 시 `ValueError`
-- 미등록 Query/Command 호출 시 `LookupError`
+- Query/Command/Task 중복 등록 시 `ValueError`
+- 미등록 Query/Command/Task 호출 시 `LookupError`
 - Event는 구독자 없어도 예외 없음 (silent)
 
 ## 확장 계획
 
-1. **AsyncLocalMessageBus** - async/await 지원
-2. **KafkaMessageBus** - 프로덕션 분산 환경용
+1. **KafkaMessageBus** - 프로덕션 분산 환경용

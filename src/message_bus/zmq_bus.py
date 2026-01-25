@@ -138,7 +138,13 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
             try:
                 # Receive query
                 message = self._query_rep_socket.recv(flags=zmq.NOBLOCK)
-                query = pickle.loads(message)
+                try:
+                    query = pickle.loads(message)
+                except Exception as e:
+                    logger.error("Failed to deserialize query: %s", e)
+                    error_response = {"error": ValueError(f"Deserialization failed: {e}")}
+                    self._query_rep_socket.send(pickle.dumps(error_response))
+                    continue
 
                 # Type validation: ensure deserialized object is a Query
                 if not isinstance(query, Query):
@@ -210,6 +216,10 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
                     raise error
                 raise RuntimeError(
                     f"Query failed with unexpected error type: {type(error).__name__}"
+                )
+            if "result" not in response:
+                raise RuntimeError(
+                    f"Malformed response: missing 'result' key. Got keys: {list(response.keys())}"
                 )
             return cast(T, response["result"])
         finally:
@@ -342,7 +352,11 @@ class ZmqWorker(HandlerRegistry):
                 # Handle tasks
                 if self._task_pull_socket in socks:
                     message = self._task_pull_socket.recv()
-                    msg_type, task = pickle.loads(message)
+                    try:
+                        msg_type, task = pickle.loads(message)
+                    except Exception as e:
+                        logger.error("Failed to deserialize task message: %s", e)
+                        continue
                     if msg_type == "task":
                         # Type validation: ensure task is a Task instance
                         if not isinstance(task, Task):
@@ -353,14 +367,20 @@ class ZmqWorker(HandlerRegistry):
                         if task_handler:
                             task_handler(task)
                         else:
-                            logger.warning(
-                                "No handler registered for task type: %s", task_type.__name__
+                            logger.error(
+                                "No handler registered for task type: %s. "
+                                "Message will be dropped. Register handler with register_task().",
+                                task_type.__name__
                             )
 
                 # Handle commands
                 if self._command_pull_socket in socks:
                     message = self._command_pull_socket.recv()
-                    msg_type, command = pickle.loads(message)
+                    try:
+                        msg_type, command = pickle.loads(message)
+                    except Exception as e:
+                        logger.error("Failed to deserialize command message: %s", e)
+                        continue
                     if msg_type == "command":
                         # Type validation: ensure command is a Command instance
                         if not isinstance(command, Command):
@@ -373,15 +393,21 @@ class ZmqWorker(HandlerRegistry):
                         if cmd_handler:
                             cmd_handler(command)
                         else:
-                            logger.warning(
-                                "No handler registered for command type: %s",
+                            logger.error(
+                                "No handler registered for command type: %s. "
+                                "Message will be dropped. "
+                                "Register handler with register_command().",
                                 command_type.__name__,
                             )
 
                 # Handle events
                 if self._event_sub_socket in socks:
                     event_type_name, event_data = self._event_sub_socket.recv_multipart()
-                    event = pickle.loads(event_data)
+                    try:
+                        event = pickle.loads(event_data)
+                    except Exception as e:
+                        logger.error("Failed to deserialize event: %s", e)
+                        continue
                     # Type validation: ensure event is an Event instance
                     if not isinstance(event, Event):
                         logger.warning("Invalid event type received: %s", type(event).__name__)
@@ -390,7 +416,14 @@ class ZmqWorker(HandlerRegistry):
                     event_handlers = self._event_subscribers.get(event_type)
                     if event_handlers:
                         for event_handler in event_handlers:
-                            event_handler(event)
+                            try:
+                                event_handler(event)
+                            except Exception as e:
+                                logger.exception(
+                                    "Event handler failed for %s: %s",
+                                    event_type.__name__,
+                                    e
+                                )
                     else:
                         # Events can have no subscribers - this is normal behavior
                         logger.debug("No subscribers for event type: %s", event_type.__name__)

@@ -53,6 +53,14 @@ class LocalMessageBus(MessageBus, IntrospectionMixin):
     - Backtest simulations (with sync handlers)
 
     For production with multiple services, use KafkaMessageBus or similar.
+
+    Thread Safety:
+        - Registration methods (register_*, subscribe): NOT thread-safe.
+          Call during application bootstrap only.
+        - Dispatch methods (send, execute, publish, dispatch): Thread-safe
+          for reads, but handlers must be thread-safe themselves.
+        - For multi-threaded dispatch, consider using locks in handlers
+          or use AsyncLocalMessageBus with asyncio.
     """
 
     __slots__ = ("_query_handlers", "_command_handlers", "_event_subscribers", "_task_handlers")
@@ -107,8 +115,18 @@ class LocalMessageBus(MessageBus, IntrospectionMixin):
         event_type = type(event)
         handlers = self._event_subscribers.get(event_type)
         if handlers:
+            errors: list[Exception] = []
             for handler in handlers:
-                handler(event)
+                try:
+                    handler(event)
+                except Exception as e:
+                    errors.append(e)
+            if errors:
+                if len(errors) == 1:
+                    raise errors[0]
+                raise ExceptionGroup(
+                    f"{len(errors)} handler(s) failed for {event_type.__name__}", errors
+                )
 
     def dispatch(self, task: Task) -> None:
         task_type = type(task)
@@ -136,6 +154,11 @@ class AsyncLocalMessageBus(AsyncMessageBus, IntrospectionMixin):
     - Concurrent event processing
 
     For production with multiple services, use an async-capable distributed bus.
+
+    Thread Safety:
+        - Registration methods: NOT thread-safe. Call during startup.
+        - Dispatch methods: Safe for concurrent async calls within
+          a single event loop. Do not share across threads.
     """
 
     __slots__ = ("_query_handlers", "_command_handlers", "_event_subscribers", "_task_handlers")
@@ -196,7 +219,17 @@ class AsyncLocalMessageBus(AsyncMessageBus, IntrospectionMixin):
         event_type = type(event)
         handlers = self._event_subscribers.get(event_type)
         if handlers:
-            await asyncio.gather(*[handler(event) for handler in handlers])
+            results = await asyncio.gather(
+                *[handler(event) for handler in handlers],
+                return_exceptions=True
+            )
+            errors = [r for r in results if isinstance(r, Exception)]
+            if errors:
+                if len(errors) == 1:
+                    raise errors[0]
+                raise ExceptionGroup(
+                    f"{len(errors)} handler(s) failed for {event_type.__name__}", errors
+                )
 
     async def dispatch(self, task: Task) -> None:
         task_type = type(task)

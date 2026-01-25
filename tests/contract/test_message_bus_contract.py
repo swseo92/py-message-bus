@@ -169,7 +169,7 @@ class TestMessageBusExceptionPropagation:
             bus_full_contract.dispatch(SendEmailTask(email="a@b.com", subject="Hi"))
 
     def test_event_first_handler_exception_stops_propagation(self, bus_full_contract):
-        """Event handler exception stops subsequent handlers (current behavior)."""
+        """Event handler exception with fault isolation - all handlers called."""
         results = []
 
         def handler1(e):
@@ -181,11 +181,11 @@ class TestMessageBusExceptionPropagation:
         bus_full_contract.subscribe(OrderCreatedEvent, handler1)
         bus_full_contract.subscribe(OrderCreatedEvent, handler2)
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="Handler1 failed"):
             bus_full_contract.publish(OrderCreatedEvent(order_id="1", user_id="1"))
 
-        # handler2 was NOT called due to handler1 failure
-        assert results == []
+        # handler2 WAS called despite handler1 failure (fault isolation)
+        assert results == ["handler2"]
 
 
 class TestMessageBusNoneReturn:
