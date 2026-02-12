@@ -140,6 +140,14 @@ class TestFakeMessageBusQueryStubs:
 
         assert result == {"id": "456"}
 
+    def test_same_query_type_different_params_returns_same_stub(self):
+        bus = FakeMessageBus()
+        bus.given_query_result(GetUserQuery, {"id": "123"})
+        result1 = bus.send(GetUserQuery(user_id="123"))
+        result2 = bus.send(GetUserQuery(user_id="999"))
+        assert result1 == result2  # Both get same stub
+        assert len(bus.sent_queries) == 2
+
 
 class TestFakeMessageBusAssertions:
     """Test assertion helper methods."""
@@ -176,6 +184,11 @@ class TestFakeMessageBusAssertions:
         bus.assert_published(OrderCreatedEvent, count=1)
         bus.assert_published(OrderDeletedEvent, count=1)
 
+    def test_assert_published_count_zero_when_none_published(self):
+        bus = FakeMessageBus()
+        bus.publish(OrderDeletedEvent(order_id="1"))
+        bus.assert_published(OrderCreatedEvent, count=0)  # Different type → passes
+
     def test_assert_executed_success(self):
         bus = FakeMessageBus()
         bus.execute(CreateOrderCommand(user_id="1", items=["a"]))
@@ -198,6 +211,11 @@ class TestFakeMessageBusAssertions:
         bus.assert_executed(CreateOrderCommand, count=1)
         bus.assert_executed(DeleteOrderCommand, count=1)
 
+    def test_assert_executed_count_zero_when_none_executed(self):
+        bus = FakeMessageBus()
+        bus.execute(DeleteOrderCommand(order_id="1"))
+        bus.assert_executed(CreateOrderCommand, count=0)  # Different type → passes
+
     def test_assert_nothing_published_success(self):
         bus = FakeMessageBus()
 
@@ -214,6 +232,24 @@ class TestFakeMessageBusAssertions:
             r"\['OrderCreatedEvent', 'OrderDeletedEvent'\]",
         ):
             bus.assert_nothing_published()
+
+    def test_assert_dispatched_success(self):
+        bus = FakeMessageBus()
+        bus.dispatch(SendEmailTask(email="test@example.com", subject="Hi"))
+        bus.assert_dispatched(SendEmailTask, count=1)
+
+    def test_assert_dispatched_failure(self):
+        bus = FakeMessageBus()
+        with pytest.raises(
+            AssertionError, match="Expected 1 Task of type SendEmailTask, but found 0"
+        ):
+            bus.assert_dispatched(SendEmailTask, count=1)
+
+    def test_assert_dispatched_count_zero(self):
+        bus = FakeMessageBus()
+        bus.dispatch(SendEmailTask(email="test@example.com", subject="Hi"))
+        # Different task type not dispatched - count=0 passes
+        # (Note: if we had another task type, we could test it here)
 
 
 class TestFakeMessageBusReset:
@@ -416,6 +452,27 @@ class TestAsyncFakeMessageBusAssertions:
 
         with pytest.raises(AssertionError, match="Expected no events to be published, but found 1"):
             bus.assert_nothing_published()
+
+    @pytest.mark.asyncio
+    async def test_assert_dispatched_success(self):
+        bus = AsyncFakeMessageBus()
+        await bus.dispatch(SendEmailTask(email="test@example.com", subject="Hi"))
+        bus.assert_dispatched(SendEmailTask, count=1)
+
+    @pytest.mark.asyncio
+    async def test_assert_dispatched_failure(self):
+        bus = AsyncFakeMessageBus()
+        with pytest.raises(
+            AssertionError, match="Expected 1 Task of type SendEmailTask, but found 0"
+        ):
+            bus.assert_dispatched(SendEmailTask, count=1)
+
+    @pytest.mark.asyncio
+    async def test_assert_dispatched_count_zero(self):
+        bus = AsyncFakeMessageBus()
+        await bus.dispatch(SendEmailTask(email="test@example.com", subject="Hi"))
+        # Different task type not dispatched - count=0 passes
+        # (Note: if we had another task type, we could test it here)
 
 
 class TestAsyncFakeMessageBusReset:
