@@ -330,10 +330,15 @@ class _MiddlewareMixin:
     _closed: bool
 
     def close(self) -> None:
-        """Close inner bus if it has close(). Idempotent."""
+        """Close middleware and inner bus if they have close(). Idempotent."""
         if self._closed:
             return
         self._closed = True
+        # Close all middleware first (outer to inner)
+        for mw in self._middlewares:
+            if hasattr(mw, "close"):
+                mw.close()
+        # Then close inner bus
         inner = getattr(self, "_inner", None)
         if inner is not None and hasattr(inner, "close"):
             inner.close()
