@@ -431,3 +431,53 @@ def test_recording_bus_swallows_store_append_exception(
     assert len(error_records) == 1
     assert "Failed to record query dispatch" in error_records[0].message
     assert "SampleQuery" in error_records[0].message
+
+
+def test_recording_bus_delegates_introspection() -> None:
+    """RecordingBus delegates introspection to inner LocalMessageBus."""
+    inner = LocalMessageBus()
+    store = MemoryStore()
+    bus = RecordingBus(inner, store)
+
+    bus.register_query(SampleQuery, lambda q: "result")
+    bus.register_command(SampleCommand, lambda c: None)
+    bus.subscribe(SampleEvent, lambda e: None)
+    bus.register_task(SampleTask, lambda t: None)
+
+    assert "SampleQuery" in bus.registered_queries()
+    assert "SampleCommand" in bus.registered_commands()
+    assert "SampleEvent" in bus.registered_events()
+    assert "SampleTask" in bus.registered_tasks()
+
+
+def test_recording_bus_introspection_raises_without_support() -> None:
+    """RecordingBus raises AttributeError when inner bus lacks introspection."""
+    from unittest.mock import MagicMock
+
+    # Create a mock that doesn't have introspection methods
+    mock_bus = MagicMock(
+        spec=[
+            "send",
+            "execute",
+            "publish",
+            "dispatch",
+            "register_query",
+            "register_command",
+            "subscribe",
+            "register_task",
+        ]
+    )
+    store = MemoryStore()
+    bus = RecordingBus(mock_bus, store)
+
+    with pytest.raises(AttributeError, match="introspection"):
+        bus.registered_queries()
+
+    with pytest.raises(AttributeError, match="introspection"):
+        bus.registered_commands()
+
+    with pytest.raises(AttributeError, match="introspection"):
+        bus.registered_events()
+
+    with pytest.raises(AttributeError, match="introspection"):
+        bus.registered_tasks()

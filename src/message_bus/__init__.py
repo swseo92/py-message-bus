@@ -58,9 +58,14 @@ __all__ = [
 
 # Optional ZMQ support
 try:
-    from message_bus.zmq_bus import ZmqMessageBus, ZmqWorker  # noqa: F401
+    from message_bus.zmq_bus import (  # noqa: F401
+        PickleSerializer,
+        Serializer,
+        ZmqMessageBus,
+        ZmqWorker,
+    )
 
-    __all__.extend(["ZmqMessageBus", "ZmqWorker"])
+    __all__.extend(["ZmqMessageBus", "ZmqWorker", "Serializer", "PickleSerializer"])
 except ImportError:
     pass
 

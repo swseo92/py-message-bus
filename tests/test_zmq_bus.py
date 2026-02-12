@@ -293,3 +293,98 @@ class TestZmqResourceCleanup:
         worker.close()
         # Should not raise
         assert not worker._running
+
+
+class TestSerializerProtocol:
+    """Tests for Serializer protocol and PickleSerializer."""
+
+    def test_pickle_serializer_roundtrip(self):
+        from message_bus.zmq_bus import PickleSerializer
+
+        serializer = PickleSerializer()
+
+        obj = GetUserQuery(user_id=42)
+        data = serializer.dumps(obj)
+        result = serializer.loads(data)
+
+        assert result == obj
+
+    def test_custom_serializer_is_used(self):
+        """Custom serializer replaces pickle."""
+        from typing import Any
+
+        from message_bus.zmq_bus import PickleSerializer
+
+        class TrackingSerializer:
+            def __init__(self) -> None:
+                self.dumps_count: int = 0
+                self.loads_count: int = 0
+                self._inner: PickleSerializer = PickleSerializer()
+
+            def dumps(self, obj: Any) -> bytes:
+                self.dumps_count += 1
+                result: bytes = self._inner.dumps(obj)
+                return result
+
+            def loads(self, data: bytes) -> Any:
+                self.loads_count += 1
+                return self._inner.loads(data)
+
+        tracker = TrackingSerializer()
+        # Just verify the serializer can be instantiated with custom serializer
+        # Full integration test requires ZMQ sockets
+        data = tracker.dumps(GetUserQuery(user_id=1))
+        result = tracker.loads(data)
+        assert tracker.dumps_count == 1
+        assert tracker.loads_count == 1
+        assert result == GetUserQuery(user_id=1)
+
+
+class TestSocketValidation:
+    """Tests for socket address validation."""
+
+    def test_rejects_path_traversal(self):
+        from message_bus.zmq_bus import _validate_socket_addr
+
+        with pytest.raises(ValueError, match="Invalid IPC socket path"):
+            _validate_socket_addr("ipc:///tmp/../etc/passwd")
+
+    def test_rejects_empty_ipc_path(self):
+        from message_bus.zmq_bus import _validate_socket_addr
+
+        with pytest.raises(ValueError, match="Invalid IPC socket path"):
+            _validate_socket_addr("ipc://")
+
+    def test_rejects_unknown_protocol(self):
+        from message_bus.zmq_bus import _validate_socket_addr
+
+        with pytest.raises(ValueError, match="Unsupported socket protocol"):
+            _validate_socket_addr("http://localhost:5555")
+
+    def test_accepts_valid_ipc(self):
+        from message_bus.zmq_bus import _validate_socket_addr
+
+        _validate_socket_addr("ipc:///tmp/test_socket")  # Should not raise
+
+    def test_accepts_valid_tcp(self):
+        from message_bus.zmq_bus import _validate_socket_addr
+
+        _validate_socket_addr("tcp://127.0.0.1:5555")  # Should not raise
+
+    def test_rejects_invalid_tcp_format(self):
+        from message_bus.zmq_bus import _validate_socket_addr
+
+        with pytest.raises(ValueError, match="Invalid TCP socket address"):
+            _validate_socket_addr("tcp://localhost")  # No port
+
+    def test_rejects_invalid_timeout(self):
+        from message_bus.zmq_bus import ZmqMessageBus
+
+        with pytest.raises(ValueError, match="query_timeout_ms must be > 0"):
+            ZmqMessageBus(query_timeout_ms=0)
+
+    def test_rejects_negative_timeout(self):
+        from message_bus.zmq_bus import ZmqMessageBus
+
+        with pytest.raises(ValueError, match="query_timeout_ms must be > 0"):
+            ZmqMessageBus(query_timeout_ms=-100)

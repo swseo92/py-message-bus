@@ -7,9 +7,10 @@ import os
 import pickle
 import sys
 import threading
+import time
 from collections import defaultdict
 from collections.abc import Callable
-from typing import Any, TypeVar, cast
+from typing import Any, Protocol, TypeVar, cast
 
 from message_bus.ports import (
     Command,
@@ -32,6 +33,27 @@ except ImportError:
 T = TypeVar("T")
 
 
+class Serializer(Protocol):
+    """Protocol for message serialization."""
+
+    def dumps(self, obj: Any) -> bytes: ...
+    def loads(self, data: bytes) -> Any: ...
+
+
+class PickleSerializer:
+    """Pickle-based serializer. WARNING: unsafe with untrusted data.
+
+    Only use between trusted processes on the same machine.
+    Pickle deserialization can execute arbitrary code.
+    """
+
+    def dumps(self, obj: Any) -> bytes:
+        return pickle.dumps(obj)
+
+    def loads(self, data: bytes) -> Any:
+        return pickle.loads(data)  # noqa: S301
+
+
 def _default_socket(name: str, port: int) -> str:
     """
     Generate default socket address based on platform.
@@ -42,6 +64,24 @@ def _default_socket(name: str, port: int) -> str:
     if sys.platform == "win32":
         return f"tcp://127.0.0.1:{port}"
     return f"ipc:///tmp/message_bus_{name}_{os.getpid()}"
+
+
+def _validate_socket_addr(addr: str) -> None:
+    """Validate ZMQ socket address format.
+
+    Raises:
+        ValueError: If address format is invalid or contains path traversal
+    """
+    if addr.startswith("ipc://"):
+        path = addr[6:]
+        if not path or ".." in path:
+            raise ValueError(f"Invalid IPC socket path: {addr!r}")
+    elif addr.startswith("tcp://"):
+        parts = addr[6:].split(":")
+        if len(parts) != 2 or not parts[1].isdigit():
+            raise ValueError(f"Invalid TCP socket address: {addr!r}")
+    else:
+        raise ValueError(f"Unsupported socket protocol: {addr!r}. Use 'ipc://' or 'tcp://'")
 
 
 class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
@@ -88,6 +128,10 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
         "_rep_thread",
         "_running",
         "_handlers_lock",
+        "_serializer",
+        "_query_timeout_ms",
+        "_query_req_socket",
+        "_query_lock",
     )
 
     def __init__(
@@ -96,17 +140,36 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
         query_socket: str | None = None,
         event_socket: str | None = None,
         command_socket: str | None = None,
+        serializer: Serializer | None = None,
+        query_timeout_ms: int = 5000,
     ) -> None:
         if zmq is None:
             raise ImportError(
                 "pyzmq is required for ZmqMessageBus. Install with: pip install pyzmq"
             )
 
+        # Validate timeout
+        if query_timeout_ms <= 0:
+            raise ValueError(f"query_timeout_ms must be > 0, got {query_timeout_ms}")
+
         self._context: zmq.Context[Any] = zmq.Context()
         self._task_socket_addr = task_socket or _default_socket("task", 5555)
         self._query_socket_addr = query_socket or _default_socket("query", 5556)
         self._event_socket_addr = event_socket or _default_socket("event", 5557)
         self._command_socket_addr = command_socket or _default_socket("command", 5558)
+
+        # Validate socket addresses
+        for addr in (
+            self._task_socket_addr,
+            self._query_socket_addr,
+            self._event_socket_addr,
+            self._command_socket_addr,
+        ):
+            _validate_socket_addr(addr)
+
+        # Initialize serializer and timeout
+        self._serializer: Serializer = serializer or PickleSerializer()
+        self._query_timeout_ms = query_timeout_ms
 
         # PUSH sockets for distributing tasks/commands
         self._task_push_socket: zmq.Socket[Any] = self._context.socket(zmq.PUSH)
@@ -122,6 +185,12 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
         # PUB socket for broadcasting events
         self._event_pub_socket: zmq.Socket[Any] = self._context.socket(zmq.PUB)
         self._event_pub_socket.bind(self._event_socket_addr)
+
+        # REQ socket for sending queries (persistent, thread-safe)
+        self._query_lock = threading.Lock()
+        self._query_req_socket: zmq.Socket[Any] = self._context.socket(zmq.REQ)
+        self._query_req_socket.setsockopt(zmq.RCVTIMEO, self._query_timeout_ms)
+        self._query_req_socket.connect(self._query_socket_addr)
 
         # Query handlers (for REP socket)
         self._query_handlers: dict[type[Query[Any]], Callable[[Query[Any]], Any]] = {}
@@ -139,17 +208,17 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
                 # Receive query
                 message = self._query_rep_socket.recv(flags=zmq.NOBLOCK)
                 try:
-                    query = pickle.loads(message)
+                    query = self._serializer.loads(message)
                 except Exception as e:
                     logger.error("Failed to deserialize query: %s", e)
                     error_response = {"error": ValueError(f"Deserialization failed: {e}")}
-                    self._query_rep_socket.send(pickle.dumps(error_response))
+                    self._query_rep_socket.send(self._serializer.dumps(error_response))
                     continue
 
                 # Type validation: ensure deserialized object is a Query
                 if not isinstance(query, Query):
                     type_error = TypeError(f"Expected Query, got {type(query).__name__}")
-                    self._query_rep_socket.send(pickle.dumps({"error": type_error}))
+                    self._query_rep_socket.send(self._serializer.dumps({"error": type_error}))
                     continue
 
                 query_type = type(query)
@@ -162,17 +231,17 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
                     lookup_error = LookupError(
                         f"No handler registered for query {query_type.__name__}"
                     )
-                    self._query_rep_socket.send(pickle.dumps({"error": lookup_error}))
+                    self._query_rep_socket.send(self._serializer.dumps({"error": lookup_error}))
                 else:
                     try:
                         result = handler(query)
-                        self._query_rep_socket.send(pickle.dumps({"result": result}))
+                        self._query_rep_socket.send(self._serializer.dumps({"result": result}))
                     except Exception as e:
                         logger.exception("Query handler failed: %s", e)
-                        self._query_rep_socket.send(pickle.dumps({"error": e}))
+                        self._query_rep_socket.send(self._serializer.dumps({"error": e}))
             except zmq.Again:
                 # No message available, sleep briefly
-                threading.Event().wait(0.001)
+                time.sleep(0.001)
             except Exception as e:
                 # Log error and continue
                 logger.exception("Error in REP loop: %s", e)
@@ -188,22 +257,17 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
     # Dispatch methods
 
     def send(self, query: Query[T]) -> T:
-        # Create temporary REQ socket
-        req_socket: zmq.Socket[Any] = self._context.socket(zmq.REQ)
-        try:
-            req_socket.setsockopt(zmq.RCVTIMEO, 5000)  # 5 second timeout
-            req_socket.connect(self._query_socket_addr)
-            req_socket.send(pickle.dumps(query))
-
-            # Wait for response
+        with self._query_lock:
+            self._query_req_socket.send(self._serializer.dumps(query))
             try:
-                response_data = req_socket.recv()
+                response_data = self._query_req_socket.recv()
             except zmq.Again as e:
-                raise TimeoutError("Query timed out after 5 seconds") from e
+                # Timeout: REQ socket is now in bad state, reset it
+                self._reset_query_socket()
+                raise TimeoutError(f"Query timed out after {self._query_timeout_ms}ms") from e
 
-            response = pickle.loads(response_data)
+            response = self._serializer.loads(response_data)
 
-            # Type validation: ensure response is a dict
             if not isinstance(response, dict):
                 raise TypeError(
                     f"Invalid response format: expected dict, got {type(response).__name__}"
@@ -211,29 +275,31 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
 
             if "error" in response:
                 error = response["error"]
-                allowed_errors = (LookupError, TypeError, TimeoutError, ValueError, RuntimeError)
-                if isinstance(error, allowed_errors):
+                if isinstance(error, Exception):
                     raise error
-                raise RuntimeError(
-                    f"Query failed with unexpected error type: {type(error).__name__}"
-                )
+                raise RuntimeError(f"Query failed: {error!r}")
             if "result" not in response:
                 raise RuntimeError(
                     f"Malformed response: missing 'result' key. Got keys: {list(response.keys())}"
                 )
             return cast(T, response["result"])
-        finally:
-            req_socket.close()
+
+    def _reset_query_socket(self) -> None:
+        """Reset REQ socket after timeout (REQ/REP state machine requires this)."""
+        self._query_req_socket.close()
+        self._query_req_socket = self._context.socket(zmq.REQ)
+        self._query_req_socket.setsockopt(zmq.RCVTIMEO, self._query_timeout_ms)
+        self._query_req_socket.connect(self._query_socket_addr)
 
     def execute(self, command: Command) -> None:
-        self._command_push_socket.send(pickle.dumps(("command", command)))
+        self._command_push_socket.send(self._serializer.dumps(("command", command)))
 
     def publish(self, event: Event) -> None:
         event_type = type(event).__name__
-        self._event_pub_socket.send_multipart([event_type.encode(), pickle.dumps(event)])
+        self._event_pub_socket.send_multipart([event_type.encode(), self._serializer.dumps(event)])
 
     def dispatch(self, task: Task) -> None:
-        self._task_push_socket.send(pickle.dumps(("task", task)))
+        self._task_push_socket.send(self._serializer.dumps(("task", task)))
 
     def close(self) -> None:
         """Close all sockets and terminate context."""
@@ -242,6 +308,7 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
 
         self._task_push_socket.close()
         self._command_push_socket.close()
+        self._query_req_socket.close()
         self._query_rep_socket.close()
         self._event_pub_socket.close()
         self._context.term()
@@ -279,6 +346,7 @@ class ZmqWorker(HandlerRegistry):
         "_command_handlers",
         "_event_subscribers",
         "_running",
+        "_serializer",
     )
 
     def __init__(
@@ -286,6 +354,7 @@ class ZmqWorker(HandlerRegistry):
         task_socket: str | None = None,
         event_socket: str | None = None,
         command_socket: str | None = None,
+        serializer: Serializer | None = None,
     ) -> None:
         if zmq is None:
             raise ImportError("pyzmq is required for ZmqWorker. Install with: pip install pyzmq")
@@ -296,6 +365,13 @@ class ZmqWorker(HandlerRegistry):
         task_addr = task_socket or _default_socket("task", 5555)
         event_addr = event_socket or _default_socket("event", 5557)
         command_addr = command_socket or _default_socket("command", 5558)
+
+        # Validate socket addresses
+        for addr in (task_addr, event_addr, command_addr):
+            _validate_socket_addr(addr)
+
+        # Initialize serializer
+        self._serializer: Serializer = serializer or PickleSerializer()
 
         # PULL sockets for receiving tasks/commands
         self._task_pull_socket: zmq.Socket[Any] = self._context.socket(zmq.PULL)
@@ -353,7 +429,7 @@ class ZmqWorker(HandlerRegistry):
                 if self._task_pull_socket in socks:
                     message = self._task_pull_socket.recv()
                     try:
-                        msg_type, task = pickle.loads(message)
+                        msg_type, task = self._serializer.loads(message)
                     except Exception as e:
                         logger.error("Failed to deserialize task message: %s", e)
                         continue
@@ -370,14 +446,14 @@ class ZmqWorker(HandlerRegistry):
                             logger.error(
                                 "No handler registered for task type: %s. "
                                 "Message will be dropped. Register handler with register_task().",
-                                task_type.__name__
+                                task_type.__name__,
                             )
 
                 # Handle commands
                 if self._command_pull_socket in socks:
                     message = self._command_pull_socket.recv()
                     try:
-                        msg_type, command = pickle.loads(message)
+                        msg_type, command = self._serializer.loads(message)
                     except Exception as e:
                         logger.error("Failed to deserialize command message: %s", e)
                         continue
@@ -404,7 +480,7 @@ class ZmqWorker(HandlerRegistry):
                 if self._event_sub_socket in socks:
                     event_type_name, event_data = self._event_sub_socket.recv_multipart()
                     try:
-                        event = pickle.loads(event_data)
+                        event = self._serializer.loads(event_data)
                     except Exception as e:
                         logger.error("Failed to deserialize event: %s", e)
                         continue
@@ -420,9 +496,7 @@ class ZmqWorker(HandlerRegistry):
                                 event_handler(event)
                             except Exception as e:
                                 logger.exception(
-                                    "Event handler failed for %s: %s",
-                                    event_type.__name__,
-                                    e
+                                    "Event handler failed for %s: %s", event_type.__name__, e
                                 )
                     else:
                         # Events can have no subscribers - this is normal behavior
