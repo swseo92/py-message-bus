@@ -18,6 +18,7 @@ from typing import Any
 from message_bus.middleware import AsyncPassthroughMiddleware, PassthroughMiddleware
 from message_bus.ports import Command, Event, Query, Task
 
+_logger = logging.getLogger(__name__)
 logger = logging.getLogger(__name__)
 
 
@@ -166,6 +167,13 @@ class LatencyStats:
             threshold_ratio: Minimum current/baseline ratio to trigger signal.
                              Default 2.0 (p95 doubled since baseline).
         """
+        import math
+
+        if not math.isfinite(threshold_ratio) or threshold_ratio <= 0:
+            raise ValueError(
+                f"threshold_ratio must be a finite number > 0, got {threshold_ratio!r}"
+            )
+
         with self._lock:
             baselines_copy = dict(self._baselines)
             snapshots: dict[tuple[str, str], list[int]] = {
@@ -177,7 +185,14 @@ class LatencyStats:
         signals: list[SeparationSignal] = []
         for key, snapshot in snapshots.items():
             baseline = baselines_copy.get(key)
-            if baseline is None or baseline == 0:
+            if baseline is None:
+                continue
+            if baseline == 0:
+                _logger.warning(
+                    "Skipping separation signal for %s/%s: zero baseline",
+                    key[0],
+                    key[1],
+                )
                 continue
             snapshot.sort()
             current_p95 = self._percentile_value(snapshot, 95)
@@ -276,12 +291,17 @@ class LatencyMiddleware(PassthroughMiddleware):
         try:
             return next_fn(message)
         finally:
-            duration_ns = time.perf_counter_ns() - t0
-            msg_class = type(message).__name__
-            self._stats.record(msg_class, message_type, duration_ns)
-            if duration_ns > self._threshold_ns:
-                duration_ms = duration_ns / 1_000_000
-                self._on_exceeded(msg_class, message_type, duration_ms)
+            try:
+                duration_ns = time.perf_counter_ns() - t0
+                cls = type(message)
+                msg_class = f"{cls.__module__}.{cls.__qualname__}"
+                self._stats.record(msg_class, message_type, duration_ns)
+                if self._threshold_ns > 0 and duration_ns > self._threshold_ns:
+                    self._on_exceeded(msg_class, message_type, duration_ns / 1_000_000)
+            except Exception:
+                _logger.exception(
+                    "Latency instrumentation failed for %s", type(message).__qualname__
+                )
 
     def on_send(self, query: Query[Any], next_fn: Callable[[Query[Any]], Any]) -> Any:
         return self._measure(query, "query", next_fn)
@@ -333,12 +353,17 @@ class AsyncLatencyMiddleware(AsyncPassthroughMiddleware):
         try:
             return await next_fn(message)
         finally:
-            duration_ns = time.perf_counter_ns() - t0
-            msg_class = type(message).__name__
-            self._stats.record(msg_class, message_type, duration_ns)
-            if duration_ns > self._threshold_ns:
-                duration_ms = duration_ns / 1_000_000
-                self._on_exceeded(msg_class, message_type, duration_ms)
+            try:
+                duration_ns = time.perf_counter_ns() - t0
+                cls = type(message)
+                msg_class = f"{cls.__module__}.{cls.__qualname__}"
+                self._stats.record(msg_class, message_type, duration_ns)
+                if self._threshold_ns > 0 and duration_ns > self._threshold_ns:
+                    self._on_exceeded(msg_class, message_type, duration_ns / 1_000_000)
+            except Exception:
+                _logger.exception(
+                    "Latency instrumentation failed for %s", type(message).__qualname__
+                )
 
     async def on_send(
         self,

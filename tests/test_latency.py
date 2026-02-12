@@ -55,6 +55,13 @@ class SampleTask(Task):
     task_id: int
 
 
+# Fully-qualified class names used by LatencyMiddleware for stats keys.
+_FQ_QUERY = f"{SampleQuery.__module__}.{SampleQuery.__qualname__}"
+_FQ_COMMAND = f"{SampleCommand.__module__}.{SampleCommand.__qualname__}"
+_FQ_EVENT = f"{SampleEvent.__module__}.{SampleEvent.__qualname__}"
+_FQ_TASK = f"{SampleTask.__module__}.{SampleTask.__qualname__}"
+
+
 # ---------------------------------------------------------------------------
 # TestLatencyPercentiles
 # ---------------------------------------------------------------------------
@@ -74,7 +81,7 @@ def test_latency_percentiles_frozen_dataclass() -> None:
     )
 
     with pytest.raises(AttributeError):
-        p.count = 200  # type: ignore
+        p.count = 200
 
 
 def test_latency_percentiles_slots() -> None:
@@ -109,7 +116,7 @@ def test_separation_signal_frozen_dataclass() -> None:
     )
 
     with pytest.raises(AttributeError):
-        s.increase_ratio = 3.0  # type: ignore
+        s.increase_ratio = 3.0
 
 
 def test_separation_signal_slots() -> None:
@@ -385,7 +392,7 @@ def test_measures_query_latency() -> None:
     bus.register_query(SampleQuery, lambda q: f"result-{q.value}")
     bus.send(SampleQuery(value=42))
 
-    p = stats.percentiles("SampleQuery", "query")
+    p = stats.percentiles(_FQ_QUERY, "query")
     assert p is not None
     assert p.count == 1
     assert p.p50_ms > 0
@@ -400,7 +407,7 @@ def test_measures_command_latency() -> None:
     bus.register_command(SampleCommand, lambda c: None)
     bus.execute(SampleCommand(action="test"))
 
-    p = stats.percentiles("SampleCommand", "command")
+    p = stats.percentiles(_FQ_COMMAND, "command")
     assert p is not None
     assert p.count == 1
 
@@ -414,7 +421,7 @@ def test_measures_event_latency() -> None:
     bus.subscribe(SampleEvent, lambda e: None)
     bus.publish(SampleEvent(data="test"))
 
-    p = stats.percentiles("SampleEvent", "event")
+    p = stats.percentiles(_FQ_EVENT, "event")
     assert p is not None
     assert p.count == 1
 
@@ -428,7 +435,7 @@ def test_measures_task_latency() -> None:
     bus.register_task(SampleTask, lambda t: None)
     bus.dispatch(SampleTask(task_id=123))
 
-    p = stats.percentiles("SampleTask", "task")
+    p = stats.percentiles(_FQ_TASK, "task")
     assert p is not None
     assert p.count == 1
 
@@ -452,7 +459,7 @@ def test_threshold_callback_fires_on_slow_handler() -> None:
     bus.send(SampleQuery(value=1))
 
     assert len(calls) == 1
-    assert calls[0][0] == "SampleQuery"
+    assert calls[0][0] == _FQ_QUERY
     assert calls[0][1] == "query"
     assert calls[0][2] >= 10.0
 
@@ -488,7 +495,7 @@ def test_exception_propagation_still_records() -> None:
     with pytest.raises(ValueError, match="Test error"):
         bus.send(SampleQuery(value=1))
 
-    p = stats.percentiles("SampleQuery", "query")
+    p = stats.percentiles(_FQ_QUERY, "query")
     assert p is not None
     assert p.count == 1
 
@@ -525,7 +532,7 @@ def test_default_warning_logs(caplog: pytest.LogCaptureFixture) -> None:
     warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warning_records) == 1
     assert "Slow query handler" in warning_records[0].message
-    assert "SampleQuery" in warning_records[0].message
+    assert _FQ_QUERY in warning_records[0].message
 
 
 # ---------------------------------------------------------------------------
@@ -545,7 +552,7 @@ async def test_measures_async_query_latency() -> None:
     bus.register_query(SampleQuery, handler)
     await bus.send(SampleQuery(value=42))
 
-    p = stats.percentiles("SampleQuery", "query")
+    p = stats.percentiles(_FQ_QUERY, "query")
     assert p is not None
     assert p.count == 1
     assert p.p50_ms > 0
@@ -563,7 +570,7 @@ async def test_measures_async_command_latency() -> None:
     bus.register_command(SampleCommand, handler)
     await bus.execute(SampleCommand(action="test"))
 
-    p = stats.percentiles("SampleCommand", "command")
+    p = stats.percentiles(_FQ_COMMAND, "command")
     assert p is not None
     assert p.count == 1
 
@@ -580,7 +587,7 @@ async def test_measures_async_event_latency() -> None:
     bus.subscribe(SampleEvent, handler)
     await bus.publish(SampleEvent(data="test"))
 
-    p = stats.percentiles("SampleEvent", "event")
+    p = stats.percentiles(_FQ_EVENT, "event")
     assert p is not None
     assert p.count == 1
 
@@ -597,7 +604,7 @@ async def test_measures_async_task_latency() -> None:
     bus.register_task(SampleTask, handler)
     await bus.dispatch(SampleTask(task_id=123))
 
-    p = stats.percentiles("SampleTask", "task")
+    p = stats.percentiles(_FQ_TASK, "task")
     assert p is not None
     assert p.count == 1
 
@@ -623,7 +630,7 @@ async def test_async_threshold_callback_fires_on_slow_handler() -> None:
     await bus.send(SampleQuery(value=1))
 
     assert len(calls) == 1
-    assert calls[0][0] == "SampleQuery"
+    assert calls[0][0] == _FQ_QUERY
     assert calls[0][1] == "query"
     assert calls[0][2] >= 10.0
 
@@ -642,7 +649,7 @@ async def test_async_exception_propagation_still_records() -> None:
     with pytest.raises(ValueError, match="Test error"):
         await bus.send(SampleQuery(value=1))
 
-    p = stats.percentiles("SampleQuery", "query")
+    p = stats.percentiles(_FQ_QUERY, "query")
     assert p is not None
     assert p.count == 1
 
@@ -679,7 +686,7 @@ def test_recording_bus_wrapping_middleware_bus() -> None:
     assert len(store.records) == 1
     assert store.records[0].message_class == "SampleQuery"
 
-    p = stats.percentiles("SampleQuery", "query")
+    p = stats.percentiles(_FQ_QUERY, "query")
     assert p is not None
     assert p.count == 1
 
@@ -700,7 +707,7 @@ def test_middleware_bus_wrapping_recording_bus() -> None:
     assert len(store.records) == 1
     assert store.records[0].message_class == "SampleQuery"
 
-    p = stats.percentiles("SampleQuery", "query")
+    p = stats.percentiles(_FQ_QUERY, "query")
     assert p is not None
     assert p.count == 1
 
@@ -724,7 +731,7 @@ async def test_async_recording_bus_wrapping_middleware_bus() -> None:
     assert len(store.records) == 1
     assert store.records[0].message_class == "SampleQuery"
 
-    p = stats.percentiles("SampleQuery", "query")
+    p = stats.percentiles(_FQ_QUERY, "query")
     assert p is not None
     assert p.count == 1
 
@@ -748,6 +755,6 @@ async def test_async_middleware_bus_wrapping_recording_bus() -> None:
     assert len(store.records) == 1
     assert store.records[0].message_class == "SampleQuery"
 
-    p = stats.percentiles("SampleQuery", "query")
+    p = stats.percentiles(_FQ_QUERY, "query")
     assert p is not None
     assert p.count == 1

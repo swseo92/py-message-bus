@@ -322,16 +322,21 @@ class _MiddlewareMixin:
     Follows the same pattern as _RecordingMixin in recording.py.
     """
 
-    __slots__ = ()
+    __slots__ = ("_closed",)
 
     # These are declared in concrete classes' __slots__
     _inner: Any
     _middlewares: tuple[Middleware, ...] | tuple[AsyncMiddleware, ...]
+    _closed: bool
 
     def close(self) -> None:
         """Close inner bus if it has close(). Idempotent."""
-        if hasattr(self._inner, "close"):
-            self._inner.close()
+        if self._closed:
+            return
+        self._closed = True
+        inner = getattr(self, "_inner", None)
+        if inner is not None and hasattr(inner, "close"):
+            inner.close()
 
     # Introspection delegation (same pattern as _RecordingMixin)
     # Uses explicit typed intermediate variables for mypy strict.
@@ -399,6 +404,7 @@ class MiddlewareBus(_MiddlewareMixin, MessageBus):
         "_execute_chain",
         "_publish_chain",
         "_dispatch_chain",
+        "_closed",
     )
 
     def __init__(self, inner: MessageBus, middlewares: list[Middleware]) -> None:
@@ -406,6 +412,7 @@ class MiddlewareBus(_MiddlewareMixin, MessageBus):
             raise ValueError("middlewares list must not be empty")
         self._inner = inner
         self._middlewares = tuple(middlewares)
+        self._closed = False
 
         # Pre-build chains at init time (zero allocation on hot path)
         self._send_chain: Callable[[Query[Any]], Any] = _build_send_chain(
@@ -481,6 +488,7 @@ class AsyncMiddlewareBus(_MiddlewareMixin, AsyncMessageBus):
         "_execute_chain",
         "_publish_chain",
         "_dispatch_chain",
+        "_closed",
     )
 
     def __init__(self, inner: AsyncMessageBus, middlewares: list[AsyncMiddleware]) -> None:
@@ -488,6 +496,7 @@ class AsyncMiddlewareBus(_MiddlewareMixin, AsyncMessageBus):
             raise ValueError("middlewares list must not be empty")
         self._inner = inner
         self._middlewares = tuple(middlewares)
+        self._closed = False
 
         # Pre-build async chains at init time
         self._send_chain: Callable[[Query[Any]], Awaitable[Any]] = _build_async_send_chain(
