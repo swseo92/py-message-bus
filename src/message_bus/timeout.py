@@ -29,10 +29,16 @@ class TimeoutMiddleware(PassthroughMiddleware):
     Uses ThreadPoolExecutor with Future.result(timeout=) to enforce timeouts.
     Raises TimeoutError when handler execution exceeds the configured timeout.
 
-    WARNING: Sync handlers that timeout will continue running in a background
-    thread even after TimeoutError is raised. future.cancel() only prevents
-    result retrieval but does not stop already-running threads. If you need
-    cancellable timeouts, use AsyncTimeoutMiddleware with async handlers.
+    **CRITICAL WARNING - HANDLERS CONTINUE RUNNING AFTER TIMEOUT:**
+
+    Timed-out sync handlers CONTINUE RUNNING in background threads even after
+    TimeoutError is raised. This is a fundamental ThreadPoolExecutor limitation
+    - Python threads cannot be forcibly cancelled. The handler will complete its
+    work (consuming resources, holding locks, making side effects) even though
+    the caller has moved on.
+
+    For true cancellation with immediate handler termination, use
+    AsyncTimeoutMiddleware with async handlers (asyncio.wait_for cancels tasks).
 
     Args:
         default_timeout: Default timeout in seconds. Default 5.0.
