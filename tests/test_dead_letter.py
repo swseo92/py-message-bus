@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import pytest
@@ -12,10 +13,12 @@ from message_bus import (
     AsyncMiddlewareBus,
     Command,
     DeadLetterMiddleware,
+    DeadLetterStore,
     Event,
     LocalMessageBus,
     MemoryDeadLetterStore,
     MiddlewareBus,
+    Query,
     Task,
 )
 
@@ -33,6 +36,11 @@ class TestCommand(Command):
 
 @dataclass(frozen=True)
 class TestTask(Task):
+    value: int
+
+
+@dataclass(frozen=True)
+class TestQuery(Query[int]):
     value: int
 
 
@@ -62,6 +70,17 @@ def success_task_handler(task: TestTask) -> None:
     pass
 
 
+# FailingDeadLetterStore for testing store.append() failures
+class FailingDeadLetterStore(DeadLetterStore):
+    """Store that always fails on append (for testing error propagation)."""
+
+    def append(self, message: Event | Command | Task, error: Exception, handler_name: str) -> None:
+        raise OSError("DLQ storage failure")
+
+    def close(self) -> None:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Sync tests
 # ---------------------------------------------------------------------------
@@ -88,7 +107,7 @@ class TestDeadLetterMiddleware:
         assert record.message == event
         assert isinstance(record.error, ValueError)
         assert "Event handler failed: 42" in str(record.error)
-        assert "TestEvent" in record.handler_name
+        assert record.handler_name == "TestEvent"
 
     def test_command_failure_recorded(self) -> None:
         """Command failure should be recorded in DLQ and exception propagated."""
@@ -175,6 +194,8 @@ class TestDeadLetterMiddleware:
         assert all(r.message == event for r in store.records)
         assert isinstance(store.records[0].error, ValueError)
         assert isinstance(store.records[1].error, RuntimeError)
+        assert store.records[0].handler_name == "TestEvent_handler_0"
+        assert store.records[1].handler_name == "TestEvent_handler_1"
 
     def test_mixed_success_and_failure(self) -> None:
         """Mixed success/failure handlers should only record failures."""
@@ -216,6 +237,71 @@ class TestDeadLetterMiddleware:
             bus.execute(command)
 
         # Record should be dropped (store is closed)
+        assert len(store.records) == 0
+
+    def test_command_store_append_failure_propagates_original_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """When store.append() fails, original handler error still propagates."""
+        store = FailingDeadLetterStore()
+        inner = LocalMessageBus()
+        middleware = DeadLetterMiddleware(store)
+        bus = MiddlewareBus(inner, [middleware])
+
+        bus.register_command(TestCommand, failing_command_handler)
+
+        command = TestCommand(value=123)
+        with (
+            caplog.at_level(logging.ERROR),
+            pytest.raises(ValueError, match="Command handler failed: 123"),
+        ):
+            bus.execute(command)
+
+        # Verify DLQ failure was logged
+        assert any(
+            "Failed to record command failure to DLQ" in record.message for record in caplog.records
+        )
+
+    def test_event_store_append_failure_propagates_original_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """When store.append() fails for event, original handler error still propagates."""
+        store = FailingDeadLetterStore()
+        inner = LocalMessageBus()
+        middleware = DeadLetterMiddleware(store)
+        bus = MiddlewareBus(inner, [middleware])
+
+        bus.subscribe(TestEvent, failing_event_handler)
+
+        event = TestEvent(value=456)
+        with (
+            caplog.at_level(logging.ERROR),
+            pytest.raises(ValueError, match="Event handler failed: 456"),
+        ):
+            bus.publish(event)
+
+        # Verify DLQ failure was logged
+        assert any(
+            "Failed to record event failure to DLQ" in record.message for record in caplog.records
+        )
+
+    def test_query_failure_not_recorded_in_dlq(self) -> None:
+        """Query failures should not be recorded in DLQ (pass-through behavior)."""
+        store = MemoryDeadLetterStore()
+        inner = LocalMessageBus()
+        middleware = DeadLetterMiddleware(store)
+        bus = MiddlewareBus(inner, [middleware])
+
+        def failing_query_handler(query: TestQuery) -> int:
+            raise ValueError(f"Query failed: {query.value}")
+
+        bus.register_query(TestQuery, failing_query_handler)
+
+        query = TestQuery(value=789)
+        with pytest.raises(ValueError, match="Query failed: 789"):
+            bus.send(query)
+
+        # Query failures should NOT be in DLQ
         assert len(store.records) == 0
 
 
@@ -349,3 +435,77 @@ class TestAsyncDeadLetterMiddleware:
         assert all(r.message == event for r in store.records)
         assert isinstance(store.records[0].error, ValueError)
         assert isinstance(store.records[1].error, RuntimeError)
+
+    @pytest.mark.asyncio
+    async def test_async_command_store_append_failure_propagates_original_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Async: When store.append() fails, original handler error still propagates."""
+        store = FailingDeadLetterStore()
+        inner = AsyncLocalMessageBus()
+        middleware = AsyncDeadLetterMiddleware(store)
+        bus = AsyncMiddlewareBus(inner, [middleware])
+
+        async def failing_handler(command: TestCommand) -> None:
+            raise ValueError(f"Async command failed: {command.value}")
+
+        bus.register_command(TestCommand, failing_handler)
+
+        command = TestCommand(value=321)
+        with (
+            caplog.at_level(logging.ERROR),
+            pytest.raises(ValueError, match="Async command failed: 321"),
+        ):
+            await bus.execute(command)
+
+        # Verify DLQ failure was logged
+        assert any(
+            "Failed to record command failure to DLQ" in record.message for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_event_store_append_failure_propagates_original_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Async: When store.append() fails for event, original handler error still propagates."""
+        store = FailingDeadLetterStore()
+        inner = AsyncLocalMessageBus()
+        middleware = AsyncDeadLetterMiddleware(store)
+        bus = AsyncMiddlewareBus(inner, [middleware])
+
+        async def failing_handler(event: TestEvent) -> None:
+            raise ValueError(f"Async event failed: {event.value}")
+
+        bus.subscribe(TestEvent, failing_handler)
+
+        event = TestEvent(value=654)
+        with (
+            caplog.at_level(logging.ERROR),
+            pytest.raises(ValueError, match="Async event failed: 654"),
+        ):
+            await bus.publish(event)
+
+        # Verify DLQ failure was logged
+        assert any(
+            "Failed to record event failure to DLQ" in record.message for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_async_query_failure_not_recorded_in_dlq(self) -> None:
+        """Async: Query failures should not be recorded in DLQ (pass-through behavior)."""
+        store = MemoryDeadLetterStore()
+        inner = AsyncLocalMessageBus()
+        middleware = AsyncDeadLetterMiddleware(store)
+        bus = AsyncMiddlewareBus(inner, [middleware])
+
+        async def failing_query_handler(query: TestQuery) -> int:
+            raise ValueError(f"Async query failed: {query.value}")
+
+        bus.register_query(TestQuery, failing_query_handler)
+
+        query = TestQuery(value=987)
+        with pytest.raises(ValueError, match="Async query failed: 987"):
+            await bus.send(query)
+
+        # Query failures should NOT be in DLQ
+        assert len(store.records) == 0
