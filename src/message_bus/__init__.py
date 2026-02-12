@@ -1,5 +1,12 @@
 """Lightweight message bus for modular monolith architecture."""
 
+from message_bus.dead_letter import (
+    AsyncDeadLetterMiddleware,
+    DeadLetterMiddleware,
+    DeadLetterRecord,
+    DeadLetterStore,
+    MemoryDeadLetterStore,
+)
 from message_bus.latency import (
     AsyncLatencyMiddleware,
     LatencyMiddleware,
@@ -90,6 +97,12 @@ __all__ = [
     # Timeout
     "TimeoutMiddleware",
     "AsyncTimeoutMiddleware",
+    # Dead Letter
+    "DeadLetterStore",
+    "DeadLetterRecord",
+    "MemoryDeadLetterStore",
+    "DeadLetterMiddleware",
+    "AsyncDeadLetterMiddleware",
 ]
 
 # Optional ZMQ support
