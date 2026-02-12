@@ -14,11 +14,13 @@ from message_bus import (
     AsyncMiddlewareBus,
     AsyncTimeoutMiddleware,
     Command,
+    Event,
     LatencyMiddleware,
     LatencyStats,
     LocalMessageBus,
     MiddlewareBus,
     Query,
+    Task,
     TimeoutMiddleware,
 )
 
@@ -51,6 +53,34 @@ class FastCommand(Command):
 @dataclass(frozen=True)
 class SlowCommand(Command):
     """Command that takes longer than timeout."""
+
+    delay_seconds: float
+
+
+@dataclass(frozen=True)
+class FastEvent(Event):
+    """Event that completes quickly."""
+
+    value: str
+
+
+@dataclass(frozen=True)
+class SlowEvent(Event):
+    """Event that takes longer than timeout."""
+
+    delay_seconds: float
+
+
+@dataclass(frozen=True)
+class FastTask(Task):
+    """Task that completes quickly."""
+
+    value: str
+
+
+@dataclass(frozen=True)
+class SlowTask(Task):
+    """Task that takes longer than timeout."""
 
     delay_seconds: float
 
@@ -129,6 +159,66 @@ class TestSyncTimeoutMiddleware:
 
         with pytest.raises(TimeoutError, match="SlowCommand exceeded timeout of 0.1s"):
             wrapped_bus.execute(SlowCommand(delay_seconds=1.0))
+
+    def test_fast_event_completes_successfully(self) -> None:
+        """Fast event completes without error."""
+        bus = LocalMessageBus()
+        timeout_mw = TimeoutMiddleware(default_timeout=1.0)
+        wrapped_bus = MiddlewareBus(bus, [timeout_mw])
+
+        received = []
+
+        def handle_fast(e: FastEvent) -> None:
+            received.append(e.value)
+
+        wrapped_bus.subscribe(FastEvent, handle_fast)
+        wrapped_bus.publish(FastEvent(value="test"))
+
+        assert received == ["test"]
+
+    def test_slow_event_raises_timeout_error(self) -> None:
+        """Slow event exceeding timeout raises TimeoutError."""
+        bus = LocalMessageBus()
+        timeout_mw = TimeoutMiddleware(default_timeout=0.1)
+        wrapped_bus = MiddlewareBus(bus, [timeout_mw])
+
+        def handle_slow(e: SlowEvent) -> None:
+            time.sleep(e.delay_seconds)
+
+        wrapped_bus.subscribe(SlowEvent, handle_slow)
+
+        with pytest.raises(TimeoutError, match="SlowEvent exceeded timeout of 0.1s"):
+            wrapped_bus.publish(SlowEvent(delay_seconds=1.0))
+
+    def test_fast_task_completes_successfully(self) -> None:
+        """Fast task completes without error."""
+        bus = LocalMessageBus()
+        timeout_mw = TimeoutMiddleware(default_timeout=1.0)
+        wrapped_bus = MiddlewareBus(bus, [timeout_mw])
+
+        dispatched = []
+
+        def handle_fast(t: FastTask) -> None:
+            dispatched.append(t.value)
+
+        wrapped_bus.register_task(FastTask, handle_fast)
+        wrapped_bus.dispatch(FastTask(value="test"))
+
+        assert dispatched == ["test"]
+
+    def test_slow_task_raises_timeout_error(self) -> None:
+        """Slow task exceeding timeout raises TimeoutError."""
+        bus = LocalMessageBus()
+        timeout_mw = TimeoutMiddleware(default_timeout=0.1)
+        wrapped_bus = MiddlewareBus(bus, [timeout_mw])
+
+        def handle_slow(t: SlowTask) -> None:
+            time.sleep(t.delay_seconds)
+
+        wrapped_bus.register_task(SlowTask, handle_slow)
+
+        with pytest.raises(TimeoutError, match="SlowTask exceeded timeout of 0.1s"):
+            wrapped_bus.dispatch(SlowTask(delay_seconds=1.0))
 
     def test_composition_with_latency_middleware(self) -> None:
         """TimeoutMiddleware composes with LatencyMiddleware."""
@@ -227,6 +317,66 @@ class TestAsyncTimeoutMiddleware:
 
         with pytest.raises(TimeoutError, match="SlowCommand exceeded timeout of 0.1s"):
             await wrapped_bus.execute(SlowCommand(delay_seconds=1.0))
+
+    async def test_fast_event_completes_successfully(self) -> None:
+        """Fast async event completes without error."""
+        bus = AsyncLocalMessageBus()
+        timeout_mw = AsyncTimeoutMiddleware(default_timeout=1.0)
+        wrapped_bus = AsyncMiddlewareBus(bus, [timeout_mw])
+
+        received = []
+
+        async def handle_fast(e: FastEvent) -> None:
+            received.append(e.value)
+
+        wrapped_bus.subscribe(FastEvent, handle_fast)
+        await wrapped_bus.publish(FastEvent(value="test"))
+
+        assert received == ["test"]
+
+    async def test_slow_event_raises_timeout_error(self) -> None:
+        """Slow async event exceeding timeout raises asyncio.TimeoutError."""
+        bus = AsyncLocalMessageBus()
+        timeout_mw = AsyncTimeoutMiddleware(default_timeout=0.1)
+        wrapped_bus = AsyncMiddlewareBus(bus, [timeout_mw])
+
+        async def handle_slow(e: SlowEvent) -> None:
+            await asyncio.sleep(e.delay_seconds)
+
+        wrapped_bus.subscribe(SlowEvent, handle_slow)
+
+        with pytest.raises(TimeoutError, match="SlowEvent exceeded timeout of 0.1s"):
+            await wrapped_bus.publish(SlowEvent(delay_seconds=1.0))
+
+    async def test_fast_task_completes_successfully(self) -> None:
+        """Fast async task completes without error."""
+        bus = AsyncLocalMessageBus()
+        timeout_mw = AsyncTimeoutMiddleware(default_timeout=1.0)
+        wrapped_bus = AsyncMiddlewareBus(bus, [timeout_mw])
+
+        dispatched = []
+
+        async def handle_fast(t: FastTask) -> None:
+            dispatched.append(t.value)
+
+        wrapped_bus.register_task(FastTask, handle_fast)
+        await wrapped_bus.dispatch(FastTask(value="test"))
+
+        assert dispatched == ["test"]
+
+    async def test_slow_task_raises_timeout_error(self) -> None:
+        """Slow async task exceeding timeout raises asyncio.TimeoutError."""
+        bus = AsyncLocalMessageBus()
+        timeout_mw = AsyncTimeoutMiddleware(default_timeout=0.1)
+        wrapped_bus = AsyncMiddlewareBus(bus, [timeout_mw])
+
+        async def handle_slow(t: SlowTask) -> None:
+            await asyncio.sleep(t.delay_seconds)
+
+        wrapped_bus.register_task(SlowTask, handle_slow)
+
+        with pytest.raises(TimeoutError, match="SlowTask exceeded timeout of 0.1s"):
+            await wrapped_bus.dispatch(SlowTask(delay_seconds=1.0))
 
     async def test_composition_with_latency_middleware(self) -> None:
         """AsyncTimeoutMiddleware composes with AsyncLatencyMiddleware."""

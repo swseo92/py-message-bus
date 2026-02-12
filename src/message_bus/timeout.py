@@ -7,6 +7,7 @@ enforcing timeout limits on handler execution.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -14,6 +15,8 @@ from typing import Any
 
 from message_bus.middleware import AsyncPassthroughMiddleware, PassthroughMiddleware
 from message_bus.ports import Command, Event, Query, Task
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # TimeoutMiddleware (sync)
@@ -25,6 +28,11 @@ class TimeoutMiddleware(PassthroughMiddleware):
 
     Uses ThreadPoolExecutor with Future.result(timeout=) to enforce timeouts.
     Raises TimeoutError when handler execution exceeds the configured timeout.
+
+    WARNING: Sync handlers that timeout will continue running in a background
+    thread even after TimeoutError is raised. future.cancel() only prevents
+    result retrieval but does not stop already-running threads. If you need
+    cancellable timeouts, use AsyncTimeoutMiddleware with async handlers.
 
     Args:
         default_timeout: Default timeout in seconds. Default 5.0.
@@ -41,7 +49,7 @@ class TimeoutMiddleware(PassthroughMiddleware):
         if default_timeout <= 0:
             raise ValueError(f"default_timeout must be > 0, got {default_timeout}")
         self._default_timeout = default_timeout
-        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._executor = ThreadPoolExecutor(max_workers=None)
 
     def _with_timeout(
         self,
@@ -55,6 +63,7 @@ class TimeoutMiddleware(PassthroughMiddleware):
         except FuturesTimeoutError as e:
             future.cancel()
             msg_type = type(message).__qualname__
+            logger.warning("Handler for %s timed out after %.1fs", msg_type, self._default_timeout)
             raise TimeoutError(
                 f"Handler for {msg_type} exceeded timeout of {self._default_timeout}s"
             ) from e
@@ -70,6 +79,10 @@ class TimeoutMiddleware(PassthroughMiddleware):
 
     def on_dispatch(self, task: Task, next_fn: Callable[[Task], None]) -> None:
         self._with_timeout(task, next_fn)
+
+    def close(self) -> None:
+        """Shutdown the thread pool executor."""
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
 
 # ---------------------------------------------------------------------------
@@ -109,6 +122,7 @@ class AsyncTimeoutMiddleware(AsyncPassthroughMiddleware):
             return await asyncio.wait_for(next_fn(message), timeout=self._default_timeout)
         except TimeoutError as e:
             msg_type = type(message).__qualname__
+            logger.warning("Handler for %s timed out after %.1fs", msg_type, self._default_timeout)
             raise TimeoutError(
                 f"Handler for {msg_type} exceeded timeout of {self._default_timeout}s"
             ) from e
