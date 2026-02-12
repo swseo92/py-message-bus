@@ -385,8 +385,12 @@ def test_jsonline_store_writer_thread_timeout_warns(
     assert "records may be lost" in caplog.text
 
 
-def test_jsonline_store_append_after_writer_error_drops_records(tmp_path: Path) -> None:
-    """After writer error, append() silently drops records."""
+def test_jsonline_store_append_after_writer_error_drops_records(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """After writer error, append() drops records and logs warning."""
+    import logging
+
     store = JsonLineStore(tmp_path, max_runs=10)
 
     # Simulate writer error
@@ -402,10 +406,43 @@ def test_jsonline_store_append_after_writer_error_drops_records(tmp_path: Path) 
         error=None,
     )
 
-    # Append should be silently dropped (writer is dead)
-    store.append(record)
+    # Append should be dropped and logged
+    with caplog.at_level(logging.WARNING, logger="message_bus.recording"):
+        store.append(record)
 
     # Queue should be empty (record wasn't queued)
     assert store._queue.qsize() == 0
 
+    # Verify warning log
+    assert "writer thread failed" in caplog.text
+    assert "disk full" in caplog.text
+    assert "TestQuery" in caplog.text
+
     store.close()
+
+
+def test_jsonline_store_append_after_close_warns_jsonl(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """JsonLineStore logs warning when append() called after close."""
+    import logging
+
+    store = JsonLineStore(tmp_path, max_runs=10)
+    store.close()
+    time.sleep(0.1)
+
+    record = Record(
+        timestamp=time.time(),
+        message_type="query",
+        message_class="TestQuery",
+        payload=DummyQuery(value=1),
+        duration_ns=100,
+        result=None,
+        error=None,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="message_bus.recording"):
+        store.append(record)
+
+    assert "append() called after close" in caplog.text
+    assert "record dropped" in caplog.text

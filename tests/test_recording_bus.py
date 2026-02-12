@@ -374,6 +374,36 @@ def test_record_mode_errors_records_failed_event() -> None:
     assert "Event handler failed" in store.records[0].error
 
 
+def test_recording_bus_records_task_error() -> None:
+    """Failed task handler creates Record with error field."""
+    inner = LocalMessageBus()
+    store = MemoryStore()
+    bus = RecordingBus(inner, store)
+
+    def failing_handler(t: Task) -> None:
+        raise RuntimeError("Task failed")
+
+    bus.register_task(SampleTask, failing_handler)
+
+    with pytest.raises(RuntimeError, match="Task failed"):
+        bus.dispatch(SampleTask(task_id=1))
+
+    assert len(store.records) == 1
+    assert store.records[0].message_type == "task"
+    assert store.records[0].error is not None
+    assert "RuntimeError" in store.records[0].error
+    assert "Task failed" in store.records[0].error
+
+
+def test_recording_bus_store_property() -> None:
+    """store property returns the underlying store instance."""
+    inner = LocalMessageBus()
+    store = MemoryStore()
+    bus = RecordingBus(inner, store)
+
+    assert bus.store is store
+
+
 def test_recording_bus_swallows_store_append_exception(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -394,4 +424,10 @@ def test_recording_bus_swallows_store_append_exception(
         result = bus.send(SampleQuery(value=42))
 
     assert result == "result-42"  # Dispatch succeeded despite store failure
-    assert "Failed to record query dispatch" in caplog.text
+
+    # Verify log level and message class
+    assert len(caplog.records) >= 1
+    error_records = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(error_records) == 1
+    assert "Failed to record query dispatch" in error_records[0].message
+    assert "SampleQuery" in error_records[0].message

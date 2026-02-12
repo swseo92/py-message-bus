@@ -223,16 +223,24 @@ class JsonLineStore(RecordStore):
                     if item is None:  # Sentinel found in batch
                         break
         except OSError as exc:
-            # Writer thread error: log but don't crash (continue draining to prevent memory leak)
             self._writer_error = exc
-            logger.error("JsonLineStore writer thread error: %s", exc)
+            logger.error("JsonLineStore writer I/O error: %s", exc)
+        except Exception as exc:
+            self._writer_error = exc
+            logger.exception("JsonLineStore writer unexpected error")
 
     def append(self, record: Record) -> None:
         """Enqueue a record for background writing (non-blocking)."""
         if self._closed:
+            logger.warning("JsonLineStore.append() called after close, record dropped")
             return
         if self._writer_error is not None:
-            return  # Writer thread failed; records would be lost
+            logger.warning(
+                "JsonLineStore writer thread failed (%s), dropping record: %s",
+                self._writer_error,
+                record.message_class,
+            )
+            return
         self._queue.put_nowait(record)
 
     def close(self) -> None:
@@ -333,7 +341,11 @@ class RecordingBus(MessageBus):
                     )
                 )
             except Exception:
-                logger.exception("Failed to record %s dispatch", message_type)
+                logger.exception(
+                    "Failed to record %s dispatch for %s",
+                    message_type,
+                    type(message).__name__,
+                )
 
     def send(self, query: Query[T]) -> T:
         """Dispatch a query and record the result."""
@@ -499,7 +511,11 @@ class AsyncRecordingBus(AsyncMessageBus):
                     )
                 )
             except Exception:
-                logger.exception("Failed to record %s dispatch", message_type)
+                logger.exception(
+                    "Failed to record %s dispatch for %s",
+                    message_type,
+                    type(message).__name__,
+                )
 
     async def send(self, query: Query[T]) -> T:
         """Dispatch a query and record the result."""
