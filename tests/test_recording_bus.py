@@ -1,5 +1,7 @@
 """Tests for sync RecordingBus."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 import pytest
@@ -297,3 +299,75 @@ def test_recording_bus_payload_is_raw_object() -> None:
     # Payload should be the same object instance
     assert store.records[0].payload is query
     assert isinstance(store.records[0].payload, SampleQuery)
+
+
+def test_record_mode_errors_skips_successful_command() -> None:
+    """record_mode='errors' should NOT record successful commands."""
+    inner = LocalMessageBus()
+    store = MemoryStore()
+    bus = RecordingBus(inner, store, record_mode="errors")
+
+    executed = []
+    bus.register_command(SampleCommand, lambda c: executed.append(c.action))
+
+    bus.execute(SampleCommand(action="test"))
+
+    assert executed == ["test"]
+    assert len(store.records) == 0  # No record for successful command
+
+
+def test_record_mode_errors_records_failed_command() -> None:
+    """record_mode='errors' should record failed commands."""
+    inner = LocalMessageBus()
+    store = MemoryStore()
+    bus = RecordingBus(inner, store, record_mode="errors")
+
+    def failing_handler(c: Command) -> None:
+        raise ValueError("Command failed")
+
+    bus.register_command(SampleCommand, failing_handler)
+
+    with pytest.raises(ValueError, match="Command failed"):
+        bus.execute(SampleCommand(action="test"))
+
+    assert len(store.records) == 1
+    assert store.records[0].message_type == "command"
+    assert store.records[0].error is not None
+    assert "ValueError" in store.records[0].error
+    assert "Command failed" in store.records[0].error
+
+
+def test_record_mode_errors_skips_successful_event() -> None:
+    """record_mode='errors' should NOT record successful events."""
+    inner = LocalMessageBus()
+    store = MemoryStore()
+    bus = RecordingBus(inner, store, record_mode="errors")
+
+    received = []
+    bus.subscribe(SampleEvent, lambda e: received.append(e.data))
+
+    bus.publish(SampleEvent(data="test-data"))
+
+    assert received == ["test-data"]
+    assert len(store.records) == 0  # No record for successful event
+
+
+def test_record_mode_errors_records_failed_event() -> None:
+    """record_mode='errors' should record failed events."""
+    inner = LocalMessageBus()
+    store = MemoryStore()
+    bus = RecordingBus(inner, store, record_mode="errors")
+
+    def failing_handler(e: Event) -> None:
+        raise RuntimeError("Event handler failed")
+
+    bus.subscribe(SampleEvent, failing_handler)
+
+    with pytest.raises(RuntimeError, match="Event handler failed"):
+        bus.publish(SampleEvent(data="test-data"))
+
+    assert len(store.records) == 1
+    assert store.records[0].message_type == "event"
+    assert store.records[0].error is not None
+    assert "RuntimeError" in store.records[0].error
+    assert "Event handler failed" in store.records[0].error

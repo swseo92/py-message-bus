@@ -1,5 +1,7 @@
 """Tests for async RecordingBus."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 import pytest

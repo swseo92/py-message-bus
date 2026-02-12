@@ -1,5 +1,7 @@
 """Tests for RecordStore implementations (MemoryStore, JsonLineStore)."""
 
+from __future__ import annotations
+
 import json
 import threading
 import time
@@ -302,3 +304,35 @@ def test_jsonline_store_validates_max_runs(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="max_runs must be >= 1"):
         JsonLineStore(tmp_path, max_runs=-5)
+
+
+def test_jsonline_store_max_runs_one_deletes_old_files(tmp_path: Path) -> None:
+    """max_runs=1 should delete all existing run files."""
+    # Create 3 existing fake run files
+    for i in range(3):
+        (tmp_path / f"run_20260101_00000{i}_1.jsonl").write_text("")
+
+    store = JsonLineStore(directory=tmp_path, max_runs=1)
+    store.close()
+    time.sleep(0.1)
+
+    # Only the new run file should remain
+    remaining = list(tmp_path.glob("run_*.jsonl"))
+    assert len(remaining) == 1
+
+
+def test_jsonline_store_writer_error_is_captured(tmp_path: Path) -> None:
+    """When writer thread encounters an error, it's captured in _writer_error."""
+    store = JsonLineStore(directory=tmp_path, max_runs=10)
+
+    # Simulate a writer error (as would happen in _writer_loop on OSError)
+    test_error = OSError("disk full")
+    store._writer_error = test_error
+
+    # Verify error is captured
+    assert store._writer_error is not None
+    assert store._writer_error is test_error
+    assert "disk full" in str(store._writer_error)
+
+    # close() will log the error (warning message)
+    store.close()

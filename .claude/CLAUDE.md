@@ -40,9 +40,10 @@ pip install -e ".[zmq]"
 
 ```
 src/message_bus/
-├── ports.py    # 인터페이스: 분리된 Dispatcher/Registry ABC들
-├── local.py    # 구현체: LocalMessageBus, AsyncLocalMessageBus
-└── zmq_bus.py  # 구현체: ZmqMessageBus, ZmqWorker (optional, pyzmq 필요)
+├── ports.py      # 인터페이스: 분리된 Dispatcher/Registry ABC들
+├── local.py      # 구현체: LocalMessageBus, AsyncLocalMessageBus
+├── recording.py  # 미들웨어: RecordingBus, AsyncRecordingBus (dispatch 녹화)
+└── zmq_bus.py    # 구현체: ZmqMessageBus, ZmqWorker (optional, pyzmq 필요)
 ```
 
 ### Interface Segregation (ports.py)
@@ -81,6 +82,8 @@ class OrderService:
 | ------ | ---- | ---- |
 | `LocalMessageBus` | 단일 프로세스 | dict 조회 + 직접 함수 호출, ~80ns 오버헤드 |
 | `AsyncLocalMessageBus` | 단일 프로세스 (async) | asyncio.gather로 이벤트 병렬 처리 |
+| `RecordingBus` | 디스패치 녹화 (sync) | 데코레이터 패턴, MemoryStore/JsonLineStore |
+| `AsyncRecordingBus` | 디스패치 녹화 (async) | 동일 RecordStore 사용, async context manager |
 | `ZmqMessageBus` + `ZmqWorker` | 멀티프로세스 | PUSH/PULL, REQ/REP, PUB/SUB 패턴, pickle 직렬화 |
 
 ### 에러 규칙
@@ -88,6 +91,41 @@ class OrderService:
 - Query/Command/Task 중복 등록 시 `ValueError`
 - 미등록 Query/Command/Task 호출 시 `LookupError`
 - Event는 구독자 없어도 예외 없음 (silent)
+
+### Recording (recording.py)
+
+메시지 디스패치를 녹화하는 데코레이터/미들웨어. 에러 추적 및 디버깅 용도.
+
+**컴포넌트:**
+
+| 클래스 | 역할 |
+| ------ | ---- |
+| `Record` | 단일 디스패치 기록 (frozen dataclass) |
+| `RecordStore` | 저장소 ABC (append + close) |
+| `MemoryStore` | 인메모리 저장소 (테스트용) |
+| `JsonLineStore` | JSONL 파일 저장소 (백그라운드 스레드, run별 파일 관리) |
+| `RecordingBus` | sync MessageBus 데코레이터 |
+| `AsyncRecordingBus` | async AsyncMessageBus 데코레이터 |
+
+**사용 예시:**
+```python
+from message_bus import LocalMessageBus, RecordingBus, MemoryStore
+
+inner = LocalMessageBus()
+store = MemoryStore()
+bus = RecordingBus(inner, store, record_mode="all")
+# bus를 MessageBus처럼 사용 — 모든 디스패치가 store에 기록됨
+```
+
+**JsonLineStore (프로덕션):**
+```python
+from message_bus import LocalMessageBus, RecordingBus, JsonLineStore
+from pathlib import Path
+
+store = JsonLineStore(directory=Path("./logs/bus"), max_runs=10)
+bus = RecordingBus(LocalMessageBus(), store)
+# 앱 종료 시 bus.close() 또는 context manager 사용
+```
 
 ## 확장 계획
 
