@@ -149,6 +149,7 @@ class JsonLineStore(RecordStore):
         "_shutdown",
         "_dropped_count",
         "_state_lock",
+        "_writer_ready",
         "_restart_attempted",
     )
 
@@ -194,6 +195,7 @@ class JsonLineStore(RecordStore):
         self._shutdown = threading.Event()
         self._dropped_count = 0
         self._state_lock = threading.Lock()
+        self._writer_ready = threading.Event()
         self._restart_attempted = False
 
         # Cleanup old runs before starting
@@ -227,6 +229,7 @@ class JsonLineStore(RecordStore):
         file_mode = "a" if append_mode else "w"
         try:
             with open(self._file_path, file_mode) as f:
+                self._writer_ready.set()
                 while True:
                     batch: list[Record] = []
 
@@ -282,7 +285,14 @@ class JsonLineStore(RecordStore):
             logger.exception("JsonLineStore writer unexpected error")
 
     def _attempt_writer_restart(self) -> None:
-        """Attempt to restart the writer thread once after failure."""
+        """Attempt to restart the writer thread once after failure.
+
+        Drains stale records from the queue before restarting to avoid
+        processing pre-failure data that may be inconsistent.
+        Error state is only cleared after the new writer confirms readiness
+        (file opened successfully), eliminating the race window where
+        append() could enqueue records before the writer is ready.
+        """
         if self._closed:
             logger.warning("Writer restart skipped: store is closed")
             return
@@ -295,6 +305,29 @@ class JsonLineStore(RecordStore):
         logger.info("Attempting writer thread restart after failure...")
         time.sleep(1.0)  # Brief wait before restart
 
+        # Drain stale records from queue to avoid processing pre-failure data
+        drained = 0
+        sentinel_found = False
+        while True:
+            try:
+                item = self._queue.get_nowait()
+                if item is None:
+                    sentinel_found = True
+                    break
+                drained += 1
+            except queue.Empty:
+                break
+        if drained > 0:
+            logger.info("Drained %d stale records from queue before restart", drained)
+            with self._state_lock:
+                self._dropped_count += drained
+        if sentinel_found:
+            logger.warning("Restart aborted: shutdown sentinel found during drain")
+            return
+
+        # Reset ready event so we can wait for the new thread
+        self._writer_ready.clear()
+
         # Start new writer thread
         pid = os.getpid()
         self._writer_thread = threading.Thread(
@@ -305,10 +338,17 @@ class JsonLineStore(RecordStore):
         )
         try:
             self._writer_thread.start()
-            # Only clear error AFTER successful start
-            with self._state_lock:
-                self._writer_error = None
-            logger.info("Writer thread restarted successfully")
+            # Wait for writer to confirm readiness (file opened successfully)
+            if self._writer_ready.wait(timeout=5.0):
+                with self._state_lock:
+                    self._writer_error = None
+                logger.info("Writer thread restarted successfully")
+            else:
+                # Thread started but didn't become ready - set explicit error
+                timeout_error = TimeoutError("Writer thread did not become ready within 5.0s")
+                with self._state_lock:
+                    self._writer_error = timeout_error
+                logger.error("Writer thread started but did not become ready in time")
         except Exception as exc:
             with self._state_lock:
                 self._writer_error = exc

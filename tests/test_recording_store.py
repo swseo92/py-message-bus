@@ -923,3 +923,178 @@ def test_jsonline_store_closed_prevents_restart(
     # Verify restart was blocked
     assert "store is closed" in caplog.text
     assert store._restart_attempted is False  # Should not be set
+
+
+# --- Real I/O error tests (writer loop) ---
+
+
+def test_writer_loop_real_oserror_on_open(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Writer loop captures real OSError when file open() fails."""
+    import builtins
+
+    original_open = builtins.open
+    fail_dir = tmp_path / "fail_open"
+
+    def patched_open(file: str | Path, mode: str = "r", **kwargs: object) -> object:
+        if str(file).startswith(str(fail_dir)) and str(file).endswith(".jsonl"):
+            raise OSError("permission denied")
+        return original_open(file, mode, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr("builtins.open", patched_open)
+
+    store = JsonLineStore(fail_dir, max_runs=10)
+    time.sleep(0.5)  # Wait for writer thread to fail on open()
+
+    with store._state_lock:
+        error = store._writer_error
+    assert error is not None
+    assert isinstance(error, OSError)
+    assert "permission denied" in str(error)
+
+    store.close()
+
+
+def test_writer_loop_real_oserror_on_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Writer loop captures real OSError when file.write() fails."""
+    import builtins
+
+    original_open = builtins.open
+    fail_dir = tmp_path / "fail_write"
+
+    class _FailOnWrite:
+        def write(self, data: str) -> None:
+            raise OSError("disk full")
+
+        def flush(self) -> None:
+            pass
+
+        def __enter__(self) -> _FailOnWrite:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+    def patched_open(file: str | Path, mode: str = "r", **kwargs: object) -> object:
+        if str(file).startswith(str(fail_dir)) and str(file).endswith(".jsonl"):
+            return _FailOnWrite()
+        return original_open(file, mode, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr("builtins.open", patched_open)
+
+    store = JsonLineStore(fail_dir, max_runs=10)
+
+    record = Record(
+        timestamp=time.time(),
+        message_type="query",
+        message_class="TestQuery",
+        payload=DummyQuery(value=1),
+        duration_ns=100,
+        result=None,
+        error=None,
+    )
+    store.append(record)
+    time.sleep(0.5)  # Wait for writer to process and fail
+
+    with store._state_lock:
+        error = store._writer_error
+    assert error is not None
+    assert isinstance(error, OSError)
+    assert "disk full" in str(error)
+
+    store.close()
+
+
+def test_writer_loop_real_oserror_on_flush(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Writer loop captures real OSError when file.flush() fails."""
+    import builtins
+
+    original_open = builtins.open
+    fail_dir = tmp_path / "fail_flush"
+
+    class _FailOnFlush:
+        def write(self, data: str) -> None:
+            pass
+
+        def flush(self) -> None:
+            raise OSError("I/O error on flush")
+
+        def __enter__(self) -> _FailOnFlush:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            pass
+
+    def patched_open(file: str | Path, mode: str = "r", **kwargs: object) -> object:
+        if str(file).startswith(str(fail_dir)) and str(file).endswith(".jsonl"):
+            return _FailOnFlush()
+        return original_open(file, mode, **kwargs)  # type: ignore[call-overload]
+
+    monkeypatch.setattr("builtins.open", patched_open)
+
+    store = JsonLineStore(fail_dir, max_runs=10)
+
+    record = Record(
+        timestamp=time.time(),
+        message_type="query",
+        message_class="TestQuery",
+        payload=DummyQuery(value=1),
+        duration_ns=100,
+        result=None,
+        error=None,
+    )
+    store.append(record)
+    time.sleep(0.5)
+
+    with store._state_lock:
+        error = store._writer_error
+    assert error is not None
+    assert isinstance(error, OSError)
+    assert "I/O error on flush" in str(error)
+
+    store.close()
+
+
+def test_writer_restart_drains_stale_queue(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Stale records in queue are drained and counted before writer restart."""
+    store = JsonLineStore(tmp_path, max_runs=10)
+
+    # Stop the initial writer via shutdown event (no sentinel in queue)
+    store._shutdown.set()
+    store._writer_thread.join(timeout=2.0)
+    assert not store._writer_thread.is_alive()
+    store._shutdown.clear()
+
+    # Simulate crash state
+    with store._state_lock:
+        store._writer_error = OSError("disk full")
+
+    # Put stale records in the now-unattended queue
+    stale_count = 3
+    for i in range(stale_count):
+        store._queue.put_nowait(
+            Record(
+                timestamp=time.time(),
+                message_type="query",
+                message_class=f"Stale{i}",
+                payload=DummyQuery(value=i),
+                duration_ns=100,
+                result=None,
+                error=None,
+            )
+        )
+
+    # Verify records are actually in the queue
+    assert store._queue.qsize() == stale_count
+    initial_dropped = store.dropped_count
+
+    with caplog.at_level(logging.INFO, logger="message_bus.recording"):
+        store._attempt_writer_restart()
+        time.sleep(0.5)
+
+    # Drained records should be counted as dropped
+    assert store.dropped_count >= initial_dropped + stale_count
+    assert "Drained" in caplog.text
+
+    store.close()
