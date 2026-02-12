@@ -429,3 +429,32 @@ async def test_async_recording_bus_swallows_store_append_exception(
     assert len(error_records) == 1
     assert "Failed to record query dispatch" in error_records[0].message
     assert "SampleQuery" in error_records[0].message
+
+
+async def test_async_recording_bus_delegates_introspection() -> None:
+    """AsyncRecordingBus delegates introspection to inner AsyncLocalMessageBus."""
+    inner = AsyncLocalMessageBus()
+    store = MemoryStore()
+    bus = AsyncRecordingBus(inner, store)
+
+    async def query_handler(q: Query[str]) -> str:
+        return "result"
+
+    async def command_handler(c: Command) -> None:
+        pass
+
+    async def event_handler(e: Event) -> None:
+        pass
+
+    async def task_handler(t: Task) -> None:
+        pass
+
+    bus.register_query(SampleQuery, query_handler)
+    bus.register_command(SampleCommand, command_handler)
+    bus.subscribe(SampleEvent, event_handler)
+    bus.register_task(SampleTask, task_handler)
+
+    assert "SampleQuery" in bus.registered_queries()
+    assert "SampleCommand" in bus.registered_commands()
+    assert "SampleEvent" in bus.registered_events()
+    assert "SampleTask" in bus.registered_tasks()

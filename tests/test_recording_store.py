@@ -446,3 +446,179 @@ def test_jsonline_store_append_after_close_warns_jsonl(
 
     assert "append() called after close" in caplog.text
     assert "record dropped" in caplog.text
+
+
+def test_jsonline_store_cleanup_skips_symlinks(tmp_path: Path) -> None:
+    """Symlinked run files are NOT deleted during cleanup."""
+    # Create a real file and a symlink
+    real_file = tmp_path / "target.txt"
+    real_file.write_text("important data")
+
+    symlink = tmp_path / "run_20250101_000000_1.jsonl"
+    symlink.symlink_to(real_file)
+
+    # Create store with max_runs=1 (should delete old files)
+    store = JsonLineStore(directory=tmp_path, max_runs=1)
+    store.close()
+    time.sleep(0.1)
+
+    # Symlink should NOT have been deleted (skipped because is_symlink)
+    assert real_file.exists(), "Target file should not be deleted"
+
+
+def test_jsonline_store_queue_full_drops_record(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When queue is full, append drops record and logs warning."""
+    import logging
+
+    store = JsonLineStore(tmp_path, max_runs=10, max_queue_size=1)
+
+    # Fill the queue by pausing the writer temporarily
+    # We'll create many records quickly - some should be dropped
+    records_to_send = 100
+    for i in range(records_to_send):
+        record = Record(
+            timestamp=time.time(),
+            message_type="command",
+            message_class=f"Command{i}",
+            payload=DummyQuery(value=i),
+            duration_ns=100,
+            result=None,
+            error=None,
+        )
+        with caplog.at_level(logging.WARNING, logger="message_bus.recording"):
+            store.append(record)
+
+    store.close()
+    time.sleep(0.2)
+
+    # Some records should have been dropped (queue full warnings)
+    queue_full_warnings = [r for r in caplog.records if "queue full" in r.message]
+    assert len(queue_full_warnings) > 0, "Expected queue full warnings"
+
+
+def test_jsonline_store_validates_max_queue_size(tmp_path: Path) -> None:
+    """ValueError for max_queue_size < 1."""
+    with pytest.raises(ValueError, match="max_queue_size must be >= 1"):
+        JsonLineStore(tmp_path, max_runs=10, max_queue_size=0)
+
+    with pytest.raises(ValueError, match="max_queue_size must be >= 1"):
+        JsonLineStore(tmp_path, max_runs=10, max_queue_size=-5)
+
+
+def test_jsonline_store_custom_close_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Custom close_timeout is used for writer thread join."""
+    store = JsonLineStore(tmp_path, max_runs=10, close_timeout=10.0)
+
+    join_timeouts: list[float | None] = []
+    original_join = store._writer_thread.join
+
+    def tracking_join(timeout: float | None = None) -> None:
+        join_timeouts.append(timeout)
+        original_join(timeout=timeout)
+
+    monkeypatch.setattr(store._writer_thread, "join", tracking_join)
+
+    store.close()
+
+    assert any(t == 10.0 for t in join_timeouts)
+
+
+def test_jsonline_store_validates_close_timeout(tmp_path: Path) -> None:
+    """ValueError for close_timeout <= 0."""
+    with pytest.raises(ValueError, match="close_timeout must be > 0"):
+        JsonLineStore(tmp_path, max_runs=10, close_timeout=0)
+
+    with pytest.raises(ValueError, match="close_timeout must be > 0"):
+        JsonLineStore(tmp_path, max_runs=10, close_timeout=-1.0)
+
+
+def test_jsonline_store_redacts_sensitive_fields(tmp_path: Path) -> None:
+    """Specified fields are redacted in JSONL output."""
+
+    @dataclass(frozen=True)
+    class SecretMessage:
+        username: str
+        password: str
+        token: str
+
+    store = JsonLineStore(
+        tmp_path,
+        max_runs=10,
+        redact_fields=frozenset({"password", "token"}),
+    )
+
+    record = Record(
+        timestamp=1234567890.0,
+        message_type="command",
+        message_class="SecretMessage",
+        payload=SecretMessage(username="alice", password="s3cret", token="tok123"),
+        duration_ns=100,
+        result=None,
+        error=None,
+    )
+
+    store.append(record)
+    store.close()
+    time.sleep(0.1)
+
+    jsonl_files = list(tmp_path.glob("run_*.jsonl"))
+    assert len(jsonl_files) == 1
+
+    with open(jsonl_files[0]) as f:
+        data = json.loads(f.readline())
+
+    assert data["payload"]["username"] == "alice"
+    assert data["payload"]["password"] == "[REDACTED]"
+    assert data["payload"]["token"] == "[REDACTED]"
+
+
+def test_jsonline_store_redaction_nested(tmp_path: Path) -> None:
+    """Redaction works on nested dicts."""
+    from message_bus.recording import _redact
+
+    data = {
+        "user": "alice",
+        "credentials": {
+            "password": "secret",
+            "api_key": "key123",
+        },
+        "token": "tok456",
+    }
+
+    result = _redact(data, frozenset({"password", "token"}))
+
+    assert result["user"] == "alice"
+    assert result["credentials"]["password"] == "[REDACTED]"
+    assert result["credentials"]["api_key"] == "key123"
+    assert result["token"] == "[REDACTED]"
+
+
+def test_jsonline_store_no_redaction_by_default(tmp_path: Path) -> None:
+    """Default: no fields redacted."""
+    store = JsonLineStore(tmp_path, max_runs=10)
+
+    record = Record(
+        timestamp=1234567890.0,
+        message_type="query",
+        message_class="TestQuery",
+        payload=DummyQuery(value=42),
+        duration_ns=100,
+        result=None,
+        error=None,
+    )
+
+    store.append(record)
+    store.close()
+    time.sleep(0.1)
+
+    jsonl_files = list(tmp_path.glob("run_*.jsonl"))
+    assert len(jsonl_files) == 1
+
+    with open(jsonl_files[0]) as f:
+        data = json.loads(f.readline())
+
+    assert data["payload"]["value"] == 42  # Not redacted

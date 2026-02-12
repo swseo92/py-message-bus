@@ -17,7 +17,6 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from queue import SimpleQueue
 from typing import Any, Literal, TypeVar, cast
 
 from message_bus.ports import AsyncMessageBus, Command, Event, MessageBus, Query, Task
@@ -58,6 +57,17 @@ def _format_timestamp(timestamp: float) -> str:
     base_time = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(timestamp))
     microseconds = int((timestamp % 1) * 1e6)
     return f"{base_time}.{microseconds:06d}"
+
+
+_REDACTED = "[REDACTED]"
+
+
+def _redact(data: dict[str, Any], fields: frozenset[str]) -> dict[str, Any]:
+    """Recursively redact sensitive fields from a dict."""
+    return {
+        k: _REDACTED if k in fields else _redact(v, fields) if isinstance(v, dict) else v
+        for k, v in data.items()
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,24 +137,36 @@ class JsonLineStore(RecordStore):
         "_writer_thread",
         "_writer_error",
         "_closed",
+        "_close_timeout",
+        "_redact_fields",
     )
 
     def __init__(
         self,
         directory: Path,
         max_runs: int = 10,
+        max_queue_size: int = 10_000,
+        close_timeout: float = 5.0,
+        redact_fields: frozenset[str] = frozenset(),
     ) -> None:
         """Create a new JsonLineStore.
 
         Args:
             directory: Directory to store JSONL files
             max_runs: Maximum number of run files to keep (oldest deleted)
+            max_queue_size: Maximum queue size (records dropped when full)
+            close_timeout: Timeout in seconds for writer thread join on close()
+            redact_fields: Field names to redact from JSONL payloads (recursive)
 
         Raises:
-            ValueError: If max_runs < 1
+            ValueError: If max_runs < 1 or max_queue_size < 1
         """
         if max_runs < 1:
             raise ValueError(f"max_runs must be >= 1, got {max_runs}")
+        if max_queue_size < 1:
+            raise ValueError(f"max_queue_size must be >= 1, got {max_queue_size}")
+        if close_timeout <= 0:
+            raise ValueError(f"close_timeout must be > 0, got {close_timeout}")
 
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -153,9 +175,11 @@ class JsonLineStore(RecordStore):
         pid = os.getpid()
         self._file_path = directory / f"run_{timestamp_str}_{pid}.jsonl"
 
-        self._queue: SimpleQueue[Record | None] = SimpleQueue()
+        self._queue: queue.Queue[Record | None] = queue.Queue(maxsize=max_queue_size)
         self._writer_error: Exception | None = None
         self._closed = False
+        self._close_timeout = close_timeout
+        self._redact_fields = redact_fields
 
         # Cleanup old runs before starting
         self._cleanup_old_runs(directory, max_runs)
@@ -173,11 +197,15 @@ class JsonLineStore(RecordStore):
 
     def _cleanup_old_runs(self, directory: Path, max_runs: int) -> None:
         """Delete oldest run files when count exceeds max_runs."""
-        run_files = sorted(directory.glob("run_*.jsonl"), key=lambda p: p.stat().st_mtime)
+        run_files = sorted(
+            (p for p in directory.glob("run_*.jsonl") if p.is_file() and not p.is_symlink()),
+            key=lambda p: p.stat().st_mtime,
+        )
         files_to_keep = max_runs - 1  # Reserve slot for new file
         files_to_delete = run_files if files_to_keep <= 0 else run_files[:-files_to_keep]
         for old_file in files_to_delete:
-            old_file.unlink(missing_ok=True)
+            if old_file.parent.resolve() == directory.resolve():
+                old_file.unlink(missing_ok=True)
 
     def _writer_loop(self) -> None:
         """Background thread: drain queue and write to file in batches."""
@@ -204,13 +232,14 @@ class JsonLineStore(RecordStore):
 
                     # Write batch
                     for record in batch:
+                        payload = _safe_asdict(record.payload)
+                        if self._redact_fields:
+                            payload = _redact(payload, self._redact_fields)
                         record_dict = {
                             "ts": _format_timestamp(record.timestamp),
                             "type": record.message_type,
                             "class": record.message_class,
-                            "payload": _safe_asdict(
-                                record.payload
-                            ),  # Serialize here (background thread)
+                            "payload": payload,
                             "duration_ns": record.duration_ns,
                             "result": record.result,
                             "error": record.error,
@@ -241,7 +270,14 @@ class JsonLineStore(RecordStore):
                 record.message_class,
             )
             return
-        self._queue.put_nowait(record)
+        try:
+            self._queue.put_nowait(record)
+        except queue.Full:
+            logger.warning(
+                "JsonLineStore queue full (%d), dropping record: %s",
+                self._queue.maxsize,
+                record.message_class,
+            )
 
     def close(self) -> None:
         """Flush remaining records and stop writer thread. Idempotent."""
@@ -250,11 +286,14 @@ class JsonLineStore(RecordStore):
 
         self._closed = True
 
-        # Signal writer thread
-        self._queue.put_nowait(None)
+        # Signal writer thread (blocking put if queue is full)
+        try:
+            self._queue.put(None, timeout=self._close_timeout)
+        except queue.Full:
+            logger.warning("JsonLineStore queue full at close, forcing writer shutdown")
 
         # Join with timeout
-        self._writer_thread.join(timeout=2.0)
+        self._writer_thread.join(timeout=self._close_timeout)
 
         # If thread still alive, records may be lost
         if self._writer_thread.is_alive():
@@ -267,7 +306,94 @@ class JsonLineStore(RecordStore):
             )
 
 
-class RecordingBus(MessageBus):
+class _RecordingMixin:
+    """Shared logic for sync and async recording buses."""
+
+    __slots__ = ()  # CRITICAL: empty slots to not break concrete class slots
+
+    # These are declared in concrete classes' __slots__
+    _inner: Any
+    _store: RecordStore
+    _record_mode: Literal["all", "errors"]
+    _closed: bool
+
+    @staticmethod
+    def _validate_record_mode(record_mode: str) -> None:
+        if record_mode not in ("all", "errors"):
+            raise ValueError(f"Invalid record_mode: {record_mode!r}. Must be 'all' or 'errors'.")
+
+    def _record_dispatch(
+        self,
+        message: Query[Any] | Command | Event | Task,
+        message_type: str,
+        duration_ns: int,
+        timestamp: float,
+        result: Any = None,
+        error_str: str | None = None,
+    ) -> None:
+        """Record a dispatch if mode allows."""
+        if self._record_mode == "all" or error_str is not None:
+            try:
+                self._store.append(
+                    Record(
+                        timestamp=timestamp,
+                        message_type=message_type,
+                        message_class=type(message).__name__,
+                        payload=message,
+                        duration_ns=duration_ns,
+                        result=result if error_str is None else None,
+                        error=error_str,
+                    )
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to record %s dispatch for %s",
+                    message_type,
+                    type(message).__name__,
+                )
+
+    @property
+    def store(self) -> RecordStore:
+        """Access the underlying store (for testing)."""
+        return self._store
+
+    def close(self) -> None:
+        """Close the store and flush records. Idempotent."""
+        if self._closed:
+            return
+        self._closed = True  # type: ignore[misc]
+        self._store.close()
+
+    def registered_queries(self) -> list[str]:
+        """Delegate to inner bus if it supports introspection."""
+        if hasattr(self._inner, "registered_queries"):
+            result: list[str] = self._inner.registered_queries()
+            return result
+        raise AttributeError("Inner bus does not support introspection")
+
+    def registered_commands(self) -> list[str]:
+        """Delegate to inner bus if it supports introspection."""
+        if hasattr(self._inner, "registered_commands"):
+            result: list[str] = self._inner.registered_commands()
+            return result
+        raise AttributeError("Inner bus does not support introspection")
+
+    def registered_events(self) -> dict[str, int]:
+        """Delegate to inner bus if it supports introspection."""
+        if hasattr(self._inner, "registered_events"):
+            result: dict[str, int] = self._inner.registered_events()
+            return result
+        raise AttributeError("Inner bus does not support introspection")
+
+    def registered_tasks(self) -> list[str]:
+        """Delegate to inner bus if it supports introspection."""
+        if hasattr(self._inner, "registered_tasks"):
+            result: list[str] = self._inner.registered_tasks()
+            return result
+        raise AttributeError("Inner bus does not support introspection")
+
+
+class RecordingBus(_RecordingMixin, MessageBus):
     """Decorator/middleware bus that records message dispatches.
 
     Wraps any MessageBus implementation and records all dispatches to a store.
@@ -302,53 +428,16 @@ class RecordingBus(MessageBus):
         Raises:
             ValueError: If record_mode is invalid
         """
-        if record_mode not in ("all", "errors"):
-            raise ValueError(f"Invalid record_mode: {record_mode!r}. Must be 'all' or 'errors'.")
+        self._validate_record_mode(record_mode)
 
         self._inner = inner
         self._store = store
         self._record_mode = record_mode
         self._closed = False
 
-    def _record_dispatch(
-        self,
-        message: Query[Any] | Command | Event | Task,
-        message_type: str,
-        duration_ns: int,
-        result: Any = None,
-        error_str: str | None = None,
-    ) -> None:
-        """Record a dispatch if mode allows.
-
-        Args:
-            message: The dispatched message
-            message_type: "query", "command", "event", or "task"
-            duration_ns: Dispatch duration in nanoseconds
-            result: Query result (None for others)
-            error_str: Error repr if handler failed
-        """
-        if self._record_mode == "all" or error_str is not None:
-            try:
-                self._store.append(
-                    Record(
-                        timestamp=time.time(),
-                        message_type=message_type,
-                        message_class=type(message).__name__,
-                        payload=message,
-                        duration_ns=duration_ns,
-                        result=result if error_str is None else None,
-                        error=error_str,
-                    )
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to record %s dispatch for %s",
-                    message_type,
-                    type(message).__name__,
-                )
-
     def send(self, query: Query[T]) -> T:
         """Dispatch a query and record the result."""
+        wall_time = time.time()
         t0 = time.perf_counter_ns()
         error_str: str | None = None
         result: Any = None
@@ -360,10 +449,11 @@ class RecordingBus(MessageBus):
             raise
         finally:
             duration = time.perf_counter_ns() - t0
-            self._record_dispatch(query, "query", duration, result, error_str)
+            self._record_dispatch(query, "query", duration, wall_time, result, error_str)
 
     def execute(self, command: Command) -> None:
         """Dispatch a command and record execution."""
+        wall_time = time.time()
         t0 = time.perf_counter_ns()
         error_str: str | None = None
         try:
@@ -373,10 +463,11 @@ class RecordingBus(MessageBus):
             raise
         finally:
             duration = time.perf_counter_ns() - t0
-            self._record_dispatch(command, "command", duration, None, error_str)
+            self._record_dispatch(command, "command", duration, wall_time, None, error_str)
 
     def publish(self, event: Event) -> None:
         """Dispatch an event and record publication."""
+        wall_time = time.time()
         t0 = time.perf_counter_ns()
         error_str: str | None = None
         try:
@@ -386,10 +477,11 @@ class RecordingBus(MessageBus):
             raise
         finally:
             duration = time.perf_counter_ns() - t0
-            self._record_dispatch(event, "event", duration, None, error_str)
+            self._record_dispatch(event, "event", duration, wall_time, None, error_str)
 
     def dispatch(self, task: Task) -> None:
         """Dispatch a task and record execution."""
+        wall_time = time.time()
         t0 = time.perf_counter_ns()
         error_str: str | None = None
         try:
@@ -399,7 +491,7 @@ class RecordingBus(MessageBus):
             raise
         finally:
             duration = time.perf_counter_ns() - t0
-            self._record_dispatch(task, "task", duration, None, error_str)
+            self._record_dispatch(task, "task", duration, wall_time, None, error_str)
 
     # Registration methods: pure delegation (no recording)
 
@@ -423,18 +515,6 @@ class RecordingBus(MessageBus):
 
     # Additional methods (NOT in MessageBus ABC)
 
-    @property
-    def store(self) -> RecordStore:
-        """Access the underlying store (for testing)."""
-        return self._store
-
-    def close(self) -> None:
-        """Close the store and flush records. Idempotent."""
-        if self._closed:
-            return
-        self._closed = True
-        self._store.close()
-
     def __enter__(self) -> RecordingBus:
         """Context manager entry."""
         return self
@@ -444,7 +524,7 @@ class RecordingBus(MessageBus):
         self.close()
 
 
-class AsyncRecordingBus(AsyncMessageBus):
+class AsyncRecordingBus(_RecordingMixin, AsyncMessageBus):
     """Async decorator/middleware bus that records message dispatches.
 
     Same recording behavior as RecordingBus but for async handlers.
@@ -472,53 +552,16 @@ class AsyncRecordingBus(AsyncMessageBus):
         Raises:
             ValueError: If record_mode is invalid
         """
-        if record_mode not in ("all", "errors"):
-            raise ValueError(f"Invalid record_mode: {record_mode!r}. Must be 'all' or 'errors'.")
+        self._validate_record_mode(record_mode)
 
         self._inner = inner
         self._store = store
         self._record_mode = record_mode
         self._closed = False
 
-    def _record_dispatch(
-        self,
-        message: Query[Any] | Command | Event | Task,
-        message_type: str,
-        duration_ns: int,
-        result: Any = None,
-        error_str: str | None = None,
-    ) -> None:
-        """Record a dispatch if mode allows.
-
-        Args:
-            message: The dispatched message
-            message_type: "query", "command", "event", or "task"
-            duration_ns: Dispatch duration in nanoseconds
-            result: Query result (None for others)
-            error_str: Error repr if handler failed
-        """
-        if self._record_mode == "all" or error_str is not None:
-            try:
-                self._store.append(
-                    Record(
-                        timestamp=time.time(),
-                        message_type=message_type,
-                        message_class=type(message).__name__,
-                        payload=message,
-                        duration_ns=duration_ns,
-                        result=result if error_str is None else None,
-                        error=error_str,
-                    )
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to record %s dispatch for %s",
-                    message_type,
-                    type(message).__name__,
-                )
-
     async def send(self, query: Query[T]) -> T:
         """Dispatch a query and record the result."""
+        wall_time = time.time()
         t0 = time.perf_counter_ns()
         error_str: str | None = None
         result: Any = None
@@ -530,10 +573,11 @@ class AsyncRecordingBus(AsyncMessageBus):
             raise
         finally:
             duration = time.perf_counter_ns() - t0
-            self._record_dispatch(query, "query", duration, result, error_str)
+            self._record_dispatch(query, "query", duration, wall_time, result, error_str)
 
     async def execute(self, command: Command) -> None:
         """Dispatch a command and record execution."""
+        wall_time = time.time()
         t0 = time.perf_counter_ns()
         error_str: str | None = None
         try:
@@ -543,10 +587,11 @@ class AsyncRecordingBus(AsyncMessageBus):
             raise
         finally:
             duration = time.perf_counter_ns() - t0
-            self._record_dispatch(command, "command", duration, None, error_str)
+            self._record_dispatch(command, "command", duration, wall_time, None, error_str)
 
     async def publish(self, event: Event) -> None:
         """Dispatch an event and record publication."""
+        wall_time = time.time()
         t0 = time.perf_counter_ns()
         error_str: str | None = None
         try:
@@ -556,10 +601,11 @@ class AsyncRecordingBus(AsyncMessageBus):
             raise
         finally:
             duration = time.perf_counter_ns() - t0
-            self._record_dispatch(event, "event", duration, None, error_str)
+            self._record_dispatch(event, "event", duration, wall_time, None, error_str)
 
     async def dispatch(self, task: Task) -> None:
         """Dispatch a task and record execution."""
+        wall_time = time.time()
         t0 = time.perf_counter_ns()
         error_str: str | None = None
         try:
@@ -569,7 +615,7 @@ class AsyncRecordingBus(AsyncMessageBus):
             raise
         finally:
             duration = time.perf_counter_ns() - t0
-            self._record_dispatch(task, "task", duration, None, error_str)
+            self._record_dispatch(task, "task", duration, wall_time, None, error_str)
 
     # Registration methods: sync delegation (these are sync in AsyncMessageBus too)
 
@@ -598,22 +644,6 @@ class AsyncRecordingBus(AsyncMessageBus):
         self._inner.register_task(task_type, handler)
 
     # Additional methods (NOT in AsyncMessageBus ABC)
-
-    @property
-    def store(self) -> RecordStore:
-        """Access the underlying store (for testing)."""
-        return self._store
-
-    def close(self) -> None:
-        """Close the store and flush records. Synchronous. Idempotent.
-
-        NOTE: This is sync to avoid async contamination of the store hierarchy.
-        Use `async with` as the primary interface.
-        """
-        if self._closed:
-            return
-        self._closed = True
-        self._store.close()
 
     async def __aenter__(self) -> AsyncRecordingBus:
         """Async context manager entry."""
