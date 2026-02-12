@@ -399,6 +399,131 @@ for s in signals:
 - Memory: `max_samples * num_unique_message_types * 8 bytes` (default ~1.6MB worst case)
 - Thread-safe: Protected by single lock held briefly for append
 
+## Retry Middleware
+
+Automatic retry with exponential backoff for transient failures.
+
+```python
+from message_bus import (
+    LocalMessageBus, MiddlewareBus,
+    RetryMiddleware,
+)
+
+retry = RetryMiddleware(
+    max_attempts=3,        # Initial + 2 retries
+    backoff_base=2.0,      # Exponential base (seconds)
+    retryable=(ConnectionError, TimeoutError),  # Which exceptions to retry
+)
+bus = MiddlewareBus(LocalMessageBus(), [retry])
+
+# Handler failures trigger retry: 2^1=2s, 2^2=4s delays
+bus.register_command(CreateOrder, flaky_handler)
+bus.execute(CreateOrder(user_id="123"))
+# On ConnectionError: retries at t=0, t=2s, t=6s (cumulative)
+```
+
+### Backoff Strategy
+
+Exponential backoff with formula: `delay = backoff_base ** attempt`
+
+| Attempt | Delay (backoff_base=2.0) | Cumulative Time |
+|---------|-------------------------|-----------------|
+| 1 (initial) | 0s | 0s |
+| 2 | 2^1 = 2s | 2s |
+| 3 | 2^2 = 4s | 6s |
+
+### Configuration
+
+- `max_attempts` - Maximum attempts (initial + retries), default 3, must be >= 1
+- `backoff_base` - Exponential backoff base in seconds, default 2.0, must be > 0
+- `retryable` - Tuple of exception types that trigger retry, default `(ConnectionError, TimeoutError)`
+
+Only exceptions in the `retryable` whitelist trigger retry. All others propagate immediately.
+
+### Event Exclusion
+
+Events (publish) use passthrough with no retry due to multicast semantics and ExceptionGroup complexity.
+
+### Async Variant
+
+```python
+from message_bus import AsyncLocalMessageBus, AsyncMiddlewareBus, AsyncRetryMiddleware
+
+retry = AsyncRetryMiddleware(max_attempts=3, backoff_base=2.0)
+bus = AsyncMiddlewareBus(AsyncLocalMessageBus(), [retry])
+# Uses asyncio.sleep() for backoff
+```
+
+## Dead Letter Middleware
+
+Capture failed messages for replay or analysis without altering error propagation behavior.
+
+```python
+from message_bus import (
+    LocalMessageBus, MiddlewareBus,
+    DeadLetterMiddleware, MemoryDeadLetterStore,
+)
+
+store = MemoryDeadLetterStore()
+dlq = DeadLetterMiddleware(store)
+bus = MiddlewareBus(LocalMessageBus(), [dlq])
+
+# Register handlers
+bus.register_command(CreateOrder, handler_that_fails)
+
+# Failed dispatch is captured
+try:
+    bus.execute(CreateOrder(user_id="123"))
+except Exception:
+    pass  # Error still propagates
+
+# Inspect failures
+for record in store.records:
+    print(f"Failed: {record.message}, Error: {record.error}, Handler: {record.handler_name}")
+```
+
+### DeadLetterStore ABC
+
+Abstract base class for storing failed messages. Implementations must provide:
+
+- `append(message, error, handler_name)` - Non-blocking append for middleware use
+- `close()` - Flush and close, must be idempotent
+
+### MemoryDeadLetterStore
+
+In-memory store for testing. Stores records in a list accessible via `.records`.
+
+### DeadLetterRecord
+
+Frozen dataclass with fields:
+- `message: Event | Command | Task` - The failed message
+- `error: Exception` - The exception raised
+- `handler_name: str` - Handler identifier
+
+### Middleware Composition
+
+Combine with other middleware for comprehensive error handling:
+
+```python
+retry = RetryMiddleware(max_attempts=3)
+dlq = DeadLetterMiddleware(MemoryDeadLetterStore())
+timeout = TimeoutMiddleware(default_timeout=5.0)
+
+# Retry → DLQ → Timeout → Inner bus
+bus = MiddlewareBus(LocalMessageBus(), [retry, dlq, timeout])
+# Order: outermost first (retry wraps DLQ wraps timeout)
+```
+
+### Async Variant
+
+```python
+from message_bus import AsyncLocalMessageBus, AsyncMiddlewareBus, AsyncDeadLetterMiddleware
+
+store = MemoryDeadLetterStore()  # Same store works for async
+dlq = AsyncDeadLetterMiddleware(store)
+bus = AsyncMiddlewareBus(AsyncLocalMessageBus(), [dlq])
+```
+
 ## Architecture
 
 ```
@@ -409,6 +534,10 @@ src/message_bus/
 ├── recording.py    # RecordingBus, AsyncRecordingBus, JsonLineStore, MemoryStore
 ├── middleware.py   # MiddlewareBus, AsyncMiddlewareBus, Middleware ABCs
 ├── latency.py      # LatencyMiddleware, LatencyStats, SeparationSignal
+├── retry.py        # RetryMiddleware, AsyncRetryMiddleware (exponential backoff)
+├── timeout.py      # TimeoutMiddleware, AsyncTimeoutMiddleware (handler timeout enforcement)
+├── dead_letter.py  # DeadLetterMiddleware, AsyncDeadLetterMiddleware, DeadLetterStore
+├── testing.py      # FakeMessageBus, AsyncFakeMessageBus (test utilities)
 └── zmq_bus.py      # ZmqMessageBus, ZmqWorker (optional, requires pyzmq)
 ```
 

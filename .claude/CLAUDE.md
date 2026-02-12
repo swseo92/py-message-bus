@@ -40,10 +40,16 @@ pip install -e ".[zmq]"
 
 ```
 src/message_bus/
-├── ports.py      # 인터페이스: 분리된 Dispatcher/Registry ABC들
-├── local.py      # 구현체: LocalMessageBus, AsyncLocalMessageBus
-├── recording.py  # 미들웨어: RecordingBus, AsyncRecordingBus (dispatch 녹화)
-└── zmq_bus.py    # 구현체: ZmqMessageBus, ZmqWorker (optional, pyzmq 필요)
+├── ports.py         # 인터페이스: 분리된 Dispatcher/Registry ABC들
+├── local.py         # 구현체: LocalMessageBus, AsyncLocalMessageBus
+├── recording.py     # 미들웨어: RecordingBus, AsyncRecordingBus (dispatch 녹화)
+├── middleware.py    # 미들웨어: MiddlewareBus, AsyncMiddlewareBus, Middleware ABCs
+├── latency.py       # 미들웨어: LatencyMiddleware (지연 측정, separation signal)
+├── retry.py         # 미들웨어: RetryMiddleware (exponential backoff retry)
+├── timeout.py       # 미들웨어: TimeoutMiddleware (handler timeout enforcement)
+├── dead_letter.py   # 미들웨어: DeadLetterMiddleware (실패 메시지 캡처)
+├── testing.py       # 테스팅: FakeMessageBus, AsyncFakeMessageBus
+└── zmq_bus.py       # 구현체: ZmqMessageBus, ZmqWorker (optional, pyzmq 필요)
 ```
 
 ### Interface Segregation (ports.py)
@@ -84,6 +90,13 @@ class OrderService:
 | `AsyncLocalMessageBus` | 단일 프로세스 (async) | asyncio.gather로 이벤트 병렬 처리 |
 | `RecordingBus` | 디스패치 녹화 (sync) | 데코레이터 패턴, MemoryStore/JsonLineStore |
 | `AsyncRecordingBus` | 디스패치 녹화 (async) | 동일 RecordStore 사용, async context manager |
+| `MiddlewareBus` | 미들웨어 체인 (sync) | 조합 가능한 미들웨어 (logging, auth, 등) |
+| `AsyncMiddlewareBus` | 미들웨어 체인 (async) | async 미들웨어 지원 |
+| `LatencyMiddleware` | 지연 측정 | 백분위수 통계, separation signal 감지 |
+| `RetryMiddleware` | 재시도 | exponential backoff, 일시적 실패 복구 |
+| `TimeoutMiddleware` | 타임아웃 | 핸들러 실행 시간 제한 |
+| `DeadLetterMiddleware` | 실패 추적 | 실패한 메시지 캡처, DeadLetterStore에 저장 |
+| `FakeMessageBus` | 테스팅 유틸리티 | 핸들러 없이 메시지 녹화, assertion 헬퍼 |
 | `ZmqMessageBus` + `ZmqWorker` | 멀티프로세스 | PUSH/PULL, REQ/REP, PUB/SUB 패턴, pickle 직렬화 |
 
 ### 에러 규칙
