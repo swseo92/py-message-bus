@@ -69,6 +69,13 @@ class TestRetryMiddlewareValidation:
         with pytest.raises(ValueError, match="retryable tuple must not be empty"):
             RetryMiddleware(retryable=())
 
+    def test_max_backoff_must_be_positive(self) -> None:
+        with pytest.raises(ValueError, match="max_backoff must be > 0"):
+            RetryMiddleware(max_backoff=0.0)
+
+        with pytest.raises(ValueError, match="max_backoff must be > 0"):
+            RetryMiddleware(max_backoff=-1.0)
+
 
 class TestRetryMiddlewareQuery:
     """Test retry logic for queries (send)."""
@@ -156,6 +163,57 @@ class TestRetryMiddlewareCommand:
         mock_sleep.assert_called_once_with(2.0)
 
 
+class TestRetryMiddlewareMaxBackoff:
+    """Test max_backoff capping behavior."""
+
+    def test_backoff_capped_at_max_backoff(self) -> None:
+        """Verify delay is capped when exponential backoff exceeds max_backoff."""
+        bus = LocalMessageBus()
+        # backoff_base=10, max_backoff=50: delays 10, 100->50, 1000->50
+        retry = RetryMiddleware(max_attempts=4, backoff_base=10.0, max_backoff=50.0)
+        wrapped = MiddlewareBus(bus, [retry])
+
+        # Fail 3 times, succeed on 4th
+        handler = Mock(
+            side_effect=[
+                TimeoutError("Retry 1"),
+                TimeoutError("Retry 2"),
+                TimeoutError("Retry 3"),
+                42,
+            ]
+        )
+        wrapped.register_query(GetValueQuery, handler)
+
+        with patch("time.sleep") as mock_sleep:
+            result = wrapped.send(GetValueQuery(key="test"))
+
+        assert result == 42
+        assert handler.call_count == 4
+        # Delays: 10^1=10 (not capped), 10^2=100 (capped to 50), 10^3=1000 (capped to 50)
+        assert mock_sleep.call_count == 3
+        assert mock_sleep.call_args_list[0][0][0] == 10.0
+        assert mock_sleep.call_args_list[1][0][0] == 50.0  # Capped
+        assert mock_sleep.call_args_list[2][0][0] == 50.0  # Capped
+
+    def test_custom_max_backoff(self) -> None:
+        """Verify custom max_backoff value works correctly."""
+        bus = LocalMessageBus()
+        retry = RetryMiddleware(max_attempts=3, backoff_base=5.0, max_backoff=15.0)
+        wrapped = MiddlewareBus(bus, [retry])
+
+        handler = Mock(side_effect=[ConnectionError("Fail 1"), ConnectionError("Fail 2"), 99])
+        wrapped.register_query(GetValueQuery, handler)
+
+        with patch("time.sleep") as mock_sleep:
+            result = wrapped.send(GetValueQuery(key="test"))
+
+        assert result == 99
+        # Delays: 5^1=5 (not capped), 5^2=25 (capped to 15)
+        assert mock_sleep.call_count == 2
+        assert mock_sleep.call_args_list[0][0][0] == 5.0
+        assert mock_sleep.call_args_list[1][0][0] == 15.0  # Capped
+
+
 class TestRetryMiddlewareTask:
     """Test retry logic for tasks (dispatch)."""
 
@@ -233,6 +291,13 @@ class TestAsyncRetryMiddlewareValidation:
     def test_retryable_must_not_be_empty(self) -> None:
         with pytest.raises(ValueError, match="retryable tuple must not be empty"):
             AsyncRetryMiddleware(retryable=())
+
+    def test_max_backoff_must_be_positive(self) -> None:
+        with pytest.raises(ValueError, match="max_backoff must be > 0"):
+            AsyncRetryMiddleware(max_backoff=0.0)
+
+        with pytest.raises(ValueError, match="max_backoff must be > 0"):
+            AsyncRetryMiddleware(max_backoff=-1.0)
 
 
 class TestAsyncRetryMiddlewareQuery:
@@ -323,6 +388,65 @@ class TestAsyncRetryMiddlewareCommand:
         assert mock_sleep.call_count == 2
         assert mock_sleep.call_args_list[0][0][0] == 2.0
         assert mock_sleep.call_args_list[1][0][0] == 4.0
+
+
+class TestAsyncRetryMiddlewareMaxBackoff:
+    """Test async max_backoff capping behavior."""
+
+    @pytest.mark.asyncio
+    async def test_backoff_capped_at_max_backoff(self) -> None:
+        """Verify async delay is capped when exponential backoff exceeds max_backoff."""
+        bus = AsyncLocalMessageBus()
+        retry = AsyncRetryMiddleware(max_attempts=4, backoff_base=10.0, max_backoff=50.0)
+        wrapped = AsyncMiddlewareBus(bus, [retry])
+
+        attempt = 0
+
+        async def handler(q: GetValueQuery) -> int:
+            nonlocal attempt
+            attempt += 1
+            if attempt < 4:
+                raise TimeoutError(f"Retry {attempt}")
+            return 42
+
+        wrapped.register_query(GetValueQuery, handler)
+
+        with patch("asyncio.sleep") as mock_sleep:
+            result = await wrapped.send(GetValueQuery(key="test"))
+
+        assert result == 42
+        assert attempt == 4
+        # Delays: 10^1=10, 10^2=100 (capped to 50), 10^3=1000 (capped to 50)
+        assert mock_sleep.call_count == 3
+        assert mock_sleep.call_args_list[0][0][0] == 10.0
+        assert mock_sleep.call_args_list[1][0][0] == 50.0  # Capped
+        assert mock_sleep.call_args_list[2][0][0] == 50.0  # Capped
+
+    @pytest.mark.asyncio
+    async def test_custom_max_backoff(self) -> None:
+        """Verify custom max_backoff value works in async context."""
+        bus = AsyncLocalMessageBus()
+        retry = AsyncRetryMiddleware(max_attempts=3, backoff_base=5.0, max_backoff=15.0)
+        wrapped = AsyncMiddlewareBus(bus, [retry])
+
+        attempt = 0
+
+        async def handler(c: UpdateCommand) -> None:
+            nonlocal attempt
+            attempt += 1
+            if attempt < 3:
+                raise ConnectionError(f"Attempt {attempt}")
+
+        wrapped.register_command(UpdateCommand, handler)
+
+        with patch("asyncio.sleep") as mock_sleep:
+            await wrapped.execute(UpdateCommand(value=100))
+
+        assert attempt == 3
+        # Delays: 5^1=5, 5^2=25 (capped to 15)
+        assert mock_sleep.call_count == 2
+        assert mock_sleep.call_args_list[0][0][0] == 5.0
+        assert mock_sleep.call_args_list[1][0][0] == 15.0  # Capped
 
 
 class TestAsyncRetryMiddlewareTask:

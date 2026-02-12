@@ -35,6 +35,8 @@ class RetryMiddleware(PassthroughMiddleware):
                       Must be >= 1. Default 3.
         backoff_base: Exponential backoff base in seconds. Must be > 0.
                       Default 2.0 (2s, 4s, 8s...).
+        max_backoff: Maximum backoff delay in seconds. Must be > 0.
+                     Default 60.0. Caps exponential growth.
         retryable: Tuple of exception types that trigger retry.
                    Must be non-empty. Default (ConnectionError, TimeoutError).
 
@@ -44,22 +46,26 @@ class RetryMiddleware(PassthroughMiddleware):
         # First failure at t=0, retry at t=2, retry at t=6 (2^1 + 2^2)
     """
 
-    __slots__ = ("_max_attempts", "_backoff_base", "_retryable")
+    __slots__ = ("_max_attempts", "_backoff_base", "_max_backoff", "_retryable")
 
     def __init__(
         self,
         max_attempts: int = 3,
         backoff_base: float = 2.0,
+        max_backoff: float = 60.0,
         retryable: tuple[type[Exception], ...] = (ConnectionError, TimeoutError),
     ) -> None:
         if max_attempts < 1:
             raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
         if backoff_base <= 0:
             raise ValueError(f"backoff_base must be > 0, got {backoff_base}")
+        if max_backoff <= 0:
+            raise ValueError(f"max_backoff must be > 0, got {max_backoff}")
         if not retryable:
             raise ValueError("retryable tuple must not be empty")
         self._max_attempts = max_attempts
         self._backoff_base = backoff_base
+        self._max_backoff = max_backoff
         self._retryable = retryable
 
     def _retry(
@@ -80,8 +86,8 @@ class RetryMiddleware(PassthroughMiddleware):
             except self._retryable as exc:
                 last_exception = exc
                 if attempt < self._max_attempts:
-                    # Backoff: 2^1, 2^2, 2^3, ...
-                    delay = self._backoff_base**attempt
+                    # Backoff: 2^1, 2^2, 2^3, ... capped at max_backoff
+                    delay = min(self._backoff_base**attempt, self._max_backoff)
                     time.sleep(delay)
                 # else: last attempt failed, raise after loop
 
@@ -115,22 +121,26 @@ class AsyncRetryMiddleware(AsyncPassthroughMiddleware):
     Events (publish) use passthrough (no retry).
     """
 
-    __slots__ = ("_max_attempts", "_backoff_base", "_retryable")
+    __slots__ = ("_max_attempts", "_backoff_base", "_max_backoff", "_retryable")
 
     def __init__(
         self,
         max_attempts: int = 3,
         backoff_base: float = 2.0,
+        max_backoff: float = 60.0,
         retryable: tuple[type[Exception], ...] = (ConnectionError, TimeoutError),
     ) -> None:
         if max_attempts < 1:
             raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
         if backoff_base <= 0:
             raise ValueError(f"backoff_base must be > 0, got {backoff_base}")
+        if max_backoff <= 0:
+            raise ValueError(f"max_backoff must be > 0, got {max_backoff}")
         if not retryable:
             raise ValueError("retryable tuple must not be empty")
         self._max_attempts = max_attempts
         self._backoff_base = backoff_base
+        self._max_backoff = max_backoff
         self._retryable = retryable
 
     async def _retry(
@@ -147,7 +157,7 @@ class AsyncRetryMiddleware(AsyncPassthroughMiddleware):
             except self._retryable as exc:
                 last_exception = exc
                 if attempt < self._max_attempts:
-                    delay = self._backoff_base**attempt
+                    delay = min(self._backoff_base**attempt, self._max_backoff)
                     await asyncio.sleep(delay)
 
         if last_exception is not None:
