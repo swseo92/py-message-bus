@@ -50,6 +50,9 @@ from message_bus.recording import (
 from message_bus.retry import AsyncRetryMiddleware, RetryMiddleware
 from message_bus.timeout import AsyncTimeoutMiddleware, TimeoutMiddleware
 
+# Testing utilities - separate import path
+# from message_bus.testing import FakeMessageBus, AsyncFakeMessageBus
+
 __all__ = [
     # Core message types
     "Query",
