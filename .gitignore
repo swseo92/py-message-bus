@@ -62,3 +62,14 @@ yarn-error.log*
 .claude-review/
 /.jbeval/
 uv.lock
+
+# --- Added by gitignore-init ---
+# State / Generated
+.omc/
+.swseo_adk/
+.wt-session.json
+prd.md
+
+# Environment
+.env.*
+!.env.example
