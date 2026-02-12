@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from dataclasses import dataclass
@@ -17,6 +18,8 @@ from message_bus.recording import (
     _safe_asdict,
     _safe_json,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -670,3 +673,142 @@ def test_jsonline_store_close_with_full_queue_uses_shutdown_event(
 
     # Writer thread should have stopped
     assert not store._writer_thread.is_alive()
+
+
+def test_jsonline_store_writer_restart_on_failure(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Writer restart is attempted after failure."""
+    import logging
+
+    # Create store
+    store = JsonLineStore(tmp_path, max_runs=10)
+
+    # Simulate a writer error and trigger restart
+    store._writer_error = OSError("simulated disk error")
+    initial_thread = store._writer_thread
+
+    with caplog.at_level(logging.INFO, logger="message_bus.recording"):
+        store._attempt_writer_restart()
+        time.sleep(0.2)  # Give restart time to complete
+
+    # Verify restart was attempted
+    assert "Attempting writer thread restart" in caplog.text
+    assert store._restart_attempted is True
+    # New thread should have been created
+    assert store._writer_thread != initial_thread
+
+    store.close()
+
+
+def test_jsonline_store_writer_restart_failure_increments_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """When writer restart also fails, dropped_count increases."""
+    import logging
+
+    store = JsonLineStore(tmp_path, max_runs=10)
+
+    # Simulate writer failure
+    store._writer_error = OSError("disk full")
+    store._restart_attempted = True  # Prevent actual restart
+
+    record = Record(
+        timestamp=time.time(),
+        message_type="query",
+        message_class="TestQuery",
+        payload=DummyQuery(value=1),
+        duration_ns=100,
+        result=None,
+        error=None,
+    )
+
+    initial_dropped = store.dropped_count
+    assert initial_dropped == 0
+
+    with caplog.at_level(logging.WARNING, logger="message_bus.recording"):
+        store.append(record)
+
+    # Dropped count should increment
+    assert store.dropped_count == 1
+    assert "writer thread failed" in caplog.text
+
+    store.close()
+
+
+def test_jsonline_store_queue_full_increments_dropped(tmp_path: Path) -> None:
+    """Queue full condition increments dropped_count."""
+    store = JsonLineStore(tmp_path, max_runs=10, max_queue_size=1)
+
+    record = Record(
+        timestamp=time.time(),
+        message_type="command",
+        message_class="TestCommand",
+        payload=DummyQuery(value=1),
+        duration_ns=100,
+        result=None,
+        error=None,
+    )
+
+    # Fill queue rapidly to trigger drops
+    for _ in range(100):
+        store.append(record)
+
+    # Some records should have been dropped
+    assert store.dropped_count > 0
+
+    store.close()
+
+
+def test_jsonline_store_dropped_count_thread_safe(tmp_path: Path) -> None:
+    """dropped_count property is thread-safe."""
+    store = JsonLineStore(tmp_path, max_runs=10, max_queue_size=1)
+
+    record = Record(
+        timestamp=time.time(),
+        message_type="command",
+        message_class="TestCommand",
+        payload=DummyQuery(value=1),
+        duration_ns=100,
+        result=None,
+        error=None,
+    )
+
+    def append_many() -> None:
+        for _ in range(50):
+            store.append(record)
+
+    threads = [threading.Thread(target=append_many) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Should not crash - just verify it's accessible
+    final_count = store.dropped_count
+    assert isinstance(final_count, int)
+    assert final_count >= 0
+
+    store.close()
+
+
+def test_jsonline_store_append_after_close_increments_dropped(tmp_path: Path) -> None:
+    """Appending after close increments dropped_count."""
+    store = JsonLineStore(tmp_path, max_runs=10)
+    store.close()
+    time.sleep(0.1)
+
+    initial_dropped = store.dropped_count
+    record = Record(
+        timestamp=time.time(),
+        message_type="query",
+        message_class="TestQuery",
+        payload=DummyQuery(value=1),
+        duration_ns=100,
+        result=None,
+        error=None,
+    )
+
+    store.append(record)
+
+    assert store.dropped_count == initial_dropped + 1

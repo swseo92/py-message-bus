@@ -147,6 +147,9 @@ class JsonLineStore(RecordStore):
         "_close_timeout",
         "_redact_fields",
         "_shutdown",
+        "_dropped_count",
+        "_dropped_lock",
+        "_restart_attempted",
     )
 
     def __init__(
@@ -189,6 +192,9 @@ class JsonLineStore(RecordStore):
         self._close_timeout = close_timeout
         self._redact_fields = redact_fields
         self._shutdown = threading.Event()
+        self._dropped_count = 0
+        self._dropped_lock = threading.Lock()
+        self._restart_attempted = False
 
         # Cleanup old runs before starting
         self._cleanup_old_runs(directory, max_runs)
@@ -267,15 +273,45 @@ class JsonLineStore(RecordStore):
                         break
         except OSError as exc:
             self._writer_error = exc
-            logger.error("JsonLineStore writer I/O error: %s", exc)
+            logger.error("JsonLineStore writer I/O error (disk full?): %s", exc)
+            self._attempt_writer_restart()
         except Exception as exc:
             self._writer_error = exc
             logger.exception("JsonLineStore writer unexpected error")
+            self._attempt_writer_restart()
+
+    def _attempt_writer_restart(self) -> None:
+        """Attempt to restart the writer thread once after failure."""
+        if self._restart_attempted or self._closed:
+            logger.warning("Writer restart already attempted or store closed, not retrying")
+            return
+
+        self._restart_attempted = True
+        logger.info("Attempting writer thread restart after failure...")
+        time.sleep(1.0)  # Brief wait before restart
+
+        # Clear error flag for restart attempt
+        self._writer_error = None
+
+        # Start new writer thread
+        pid = os.getpid()
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop,
+            daemon=True,
+            name=f"JsonLineStore-writer-{pid}-restart",
+        )
+        try:
+            self._writer_thread.start()
+            logger.info("Writer thread restarted successfully")
+        except Exception as exc:
+            self._writer_error = exc
+            logger.error("Writer thread restart failed: %s", exc)
 
     def append(self, record: Record) -> None:
         """Enqueue a record for background writing (non-blocking)."""
         if self._closed:
             logger.warning("JsonLineStore.append() called after close, record dropped")
+            self._increment_dropped()
             return
         if self._writer_error is not None:
             logger.warning(
@@ -283,6 +319,7 @@ class JsonLineStore(RecordStore):
                 self._writer_error,
                 record.message_class,
             )
+            self._increment_dropped()
             return
         try:
             self._queue.put_nowait(record)
@@ -292,6 +329,18 @@ class JsonLineStore(RecordStore):
                 self._queue.maxsize,
                 record.message_class,
             )
+            self._increment_dropped()
+
+    def _increment_dropped(self) -> None:
+        """Thread-safe increment of dropped record counter."""
+        with self._dropped_lock:
+            self._dropped_count += 1
+
+    @property
+    def dropped_count(self) -> int:
+        """Number of records dropped due to writer failure or queue full."""
+        with self._dropped_lock:
+            return self._dropped_count
 
     def close(self) -> None:
         """Flush remaining records and stop writer thread. Idempotent."""
