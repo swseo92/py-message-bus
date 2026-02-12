@@ -41,6 +41,7 @@ from message_bus.recording import (
     RecordStore,
 )
 from message_bus.retry import AsyncRetryMiddleware, RetryMiddleware
+from message_bus.timeout import AsyncTimeoutMiddleware, TimeoutMiddleware
 
 __all__ = [
     # Core message types
@@ -86,6 +87,9 @@ __all__ = [
     # Retry
     "RetryMiddleware",
     "AsyncRetryMiddleware",
+    # Timeout
+    "TimeoutMiddleware",
+    "AsyncTimeoutMiddleware",
 ]
 
 # Optional ZMQ support
