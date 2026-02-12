@@ -336,3 +336,76 @@ def test_jsonline_store_writer_error_is_captured(tmp_path: Path) -> None:
 
     # close() will log the error (warning message)
     store.close()
+
+
+def test_memory_store_append_after_close_warns(caplog: pytest.LogCaptureFixture) -> None:
+    """Appending to closed MemoryStore logs warning and drops record."""
+    import logging
+
+    store = MemoryStore()
+    record = Record(
+        timestamp=time.time(),
+        message_type="query",
+        message_class="TestQuery",
+        payload=DummyQuery(value=1),
+        duration_ns=100,
+        result=None,
+        error=None,
+    )
+
+    store.close()
+
+    with caplog.at_level(logging.WARNING, logger="message_bus.recording"):
+        store.append(record)
+
+    assert len(store.records) == 0  # Record was dropped
+    assert "append() called after close" in caplog.text
+    assert "record dropped" in caplog.text
+
+
+def test_jsonline_store_writer_thread_timeout_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If writer thread doesn't stop in time, warning is logged."""
+    import logging
+
+    store = JsonLineStore(tmp_path, max_runs=10)
+
+    # Patch join to simulate timeout (thread appears still alive after join)
+    def fake_join(timeout: float | None = None) -> None:
+        pass  # Don't actually join
+
+    monkeypatch.setattr(store._writer_thread, "join", fake_join)
+    monkeypatch.setattr(store._writer_thread, "is_alive", lambda: True)
+
+    with caplog.at_level(logging.WARNING, logger="message_bus.recording"):
+        store.close()
+
+    assert "writer thread did not stop in time" in caplog.text
+    assert "records may be lost" in caplog.text
+
+
+def test_jsonline_store_append_after_writer_error_drops_records(tmp_path: Path) -> None:
+    """After writer error, append() silently drops records."""
+    store = JsonLineStore(tmp_path, max_runs=10)
+
+    # Simulate writer error
+    store._writer_error = OSError("disk full")
+
+    record = Record(
+        timestamp=time.time(),
+        message_type="query",
+        message_class="TestQuery",
+        payload=DummyQuery(value=1),
+        duration_ns=100,
+        result=None,
+        error=None,
+    )
+
+    # Append should be silently dropped (writer is dead)
+    store.append(record)
+
+    # Queue should be empty (record wasn't queued)
+    assert store._queue.qsize() == 0
+
+    store.close()

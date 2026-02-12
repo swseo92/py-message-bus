@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 import pytest
 
 from message_bus import LocalMessageBus
 from message_bus.ports import Command, Event, Query, Task
-from message_bus.recording import MemoryStore, RecordingBus
+from message_bus.recording import MemoryStore, Record, RecordingBus, RecordStore
 
 
 # Test message types
@@ -371,3 +372,26 @@ def test_record_mode_errors_records_failed_event() -> None:
     assert store.records[0].error is not None
     assert "RuntimeError" in store.records[0].error
     assert "Event handler failed" in store.records[0].error
+
+
+def test_recording_bus_swallows_store_append_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """When store.append() raises, dispatch succeeds and error is logged."""
+
+    class BrokenStore(RecordStore):
+        def append(self, record: Record) -> None:
+            raise RuntimeError("Store is broken")
+
+        def close(self) -> None:
+            pass
+
+    inner = LocalMessageBus()
+    bus = RecordingBus(inner, BrokenStore())
+    bus.register_query(SampleQuery, lambda q: f"result-{q.value}")
+
+    with caplog.at_level(logging.ERROR, logger="message_bus.recording"):
+        result = bus.send(SampleQuery(value=42))
+
+    assert result == "result-42"  # Dispatch succeeded despite store failure
+    assert "Failed to record query dispatch" in caplog.text
