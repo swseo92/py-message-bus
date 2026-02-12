@@ -140,6 +140,7 @@ class TestMessageBusExceptionPropagation:
 
     def test_query_handler_exception_propagates(self, bus):
         """Query handler exception is propagated to caller."""
+
         def handler(q):
             raise ValueError("Query failed")
 
@@ -150,6 +151,7 @@ class TestMessageBusExceptionPropagation:
 
     def test_command_handler_exception_propagates(self, bus_full_contract):
         """Command handler exception is propagated to caller."""
+
         def handler(c):
             raise RuntimeError("Command failed")
 
@@ -160,6 +162,7 @@ class TestMessageBusExceptionPropagation:
 
     def test_task_handler_exception_propagates(self, bus_full_contract):
         """Task handler exception is propagated to caller."""
+
         def handler(t):
             raise OSError("Task failed")
 
@@ -193,6 +196,7 @@ class TestMessageBusNoneReturn:
 
     def test_query_handler_returns_none(self, bus):
         """Query handler can return None."""
+
         def handler(q):
             return None
 
@@ -207,6 +211,7 @@ class TestMessageBusStateManagement:
 
     def test_same_handler_different_query_types(self, bus):
         """Same handler function can be registered for different query types."""
+
         def generic_handler(q):
             return {"type": type(q).__name__}
 

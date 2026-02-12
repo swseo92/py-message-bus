@@ -220,8 +220,7 @@ class AsyncLocalMessageBus(AsyncMessageBus, IntrospectionMixin):
         handlers = self._event_subscribers.get(event_type)
         if handlers:
             results = await asyncio.gather(
-                *[handler(event) for handler in handlers],
-                return_exceptions=True
+                *[handler(event) for handler in handlers], return_exceptions=True
             )
             errors = [r for r in results if isinstance(r, Exception)]
             if errors:
