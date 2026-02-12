@@ -40,6 +40,7 @@ from message_bus.recording import (
     RecordingBus,
     RecordStore,
 )
+from message_bus.retry import AsyncRetryMiddleware, RetryMiddleware
 
 __all__ = [
     # Core message types
@@ -82,6 +83,9 @@ __all__ = [
     "LatencyStats",
     "LatencyPercentiles",
     "SeparationSignal",
+    # Retry
+    "RetryMiddleware",
+    "AsyncRetryMiddleware",
 ]
 
 # Optional ZMQ support
