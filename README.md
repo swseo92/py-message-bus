@@ -557,9 +557,102 @@ Contributions welcome! Please ensure:
 3. Linting passes: `ruff check src tests`
 4. Code formatted: `ruff format src tests`
 
+## Testing Utilities
+
+FakeMessageBus and AsyncFakeMessageBus for unit testing without real handlers.
+
+```python
+from message_bus.testing import FakeMessageBus
+
+def test_order_service_publishes_event():
+    bus = FakeMessageBus()
+    service = OrderService(bus)
+
+    service.create_order(user_id="123", items=["item1"])
+
+    bus.assert_published(OrderCreatedEvent, count=1)
+    bus.assert_executed(CreateOrderCommand, count=1)
+
+def test_order_service_queries_user():
+    bus = FakeMessageBus()
+    bus.given_query_result(GetUserQuery, {"id": "123", "name": "Alice"})
+    service = OrderService(bus)
+
+    service.create_order(user_id="123", items=["item1"])
+
+    # Verify query was sent
+    assert len(bus.sent_queries) == 1
+    assert bus.sent_queries[0].user_id == "123"
+```
+
+### Features
+
+- **Recording** - All dispatched messages are recorded in lists
+- **Query Stubbing** - `given_query_result(query_type, result)` stubs query responses
+- **Assertions** - `assert_published()`, `assert_executed()`, `assert_nothing_published()`
+- **Reset** - `reset()` clears all recorded messages and stubs between tests
+
+### API Reference
+
+```python
+class FakeMessageBus:
+    # Recorded messages
+    sent_queries: list[Query]
+    executed_commands: list[Command]
+    published_events: list[Event]
+    dispatched_tasks: list[Task]
+
+    # Stubbing
+    def given_query_result(self, query_type: type[Query[T]], result: T) -> None: ...
+
+    # Assertions
+    def assert_published(self, event_type: type[Event], *, count: int = 1) -> None: ...
+    def assert_executed(self, command_type: type[Command], *, count: int = 1) -> None: ...
+    def assert_nothing_published(self) -> None: ...
+
+    # Cleanup
+    def reset(self) -> None: ...
+```
+
+### Async Testing
+
+```python
+from message_bus.testing import AsyncFakeMessageBus
+
+@pytest.mark.asyncio
+async def test_async_order_service():
+    bus = AsyncFakeMessageBus()
+    bus.given_query_result(GetUserQuery, {"id": "123"})
+    service = AsyncOrderService(bus)
+
+    await service.create_order(user_id="123", items=["item1"])
+
+    bus.assert_published(OrderCreatedEvent, count=1)
+```
+
+### Why Use FakeMessageBus?
+
+- **Fast** - No real handler execution, just recording
+- **Simple** - No need to register handlers for tests
+- **Clear Assertions** - Explicit assertion methods with good error messages
+- **Isolation** - Test your service without dependencies
+
+### Import Path
+
+Testing utilities have a separate import path to keep them out of production code:
+
+```python
+# Production code - normal imports
+from message_bus import MessageBus, LocalMessageBus
+
+# Test code - testing imports
+from message_bus.testing import FakeMessageBus, AsyncFakeMessageBus
+```
+
 ## Roadmap
 
 - [x] Latency instrumentation and separation signal detection
+- [x] Testing utilities (FakeMessageBus, AsyncFakeMessageBus)
 - [ ] KafkaMessageBus for production-grade distributed messaging
 - [ ] Message persistence and replay
 - [ ] Dead letter queue support

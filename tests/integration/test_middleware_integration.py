@@ -130,7 +130,8 @@ class TestMiddlewareIntegration:
         all_p = stats.all_percentiles()
         tracked_types = {(p.message_class, p.message_type) for p in all_p}
 
-        # Should have tracked: GetUserQuery/query, CreateOrderCommand/command, OrderCreatedEvent/event
+        # Should have tracked: GetUserQuery/query, CreateOrderCommand/command,
+        # OrderCreatedEvent/event
         fq_user = f"{GetUserQuery.__module__}.{GetUserQuery.__qualname__}"
         fq_order_cmd = f"{CreateOrderCommand.__module__}.{CreateOrderCommand.__qualname__}"
         fq_order_evt = f"{OrderCreatedEvent.__module__}.{OrderCreatedEvent.__qualname__}"

@@ -41,6 +41,9 @@ from message_bus.recording import (
     RecordStore,
 )
 
+# Testing utilities - separate import path
+# from message_bus.testing import FakeMessageBus, AsyncFakeMessageBus
+
 __all__ = [
     # Core message types
     "Query",
