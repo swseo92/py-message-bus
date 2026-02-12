@@ -19,8 +19,6 @@ from message_bus.recording import (
     _safe_json,
 )
 
-logger = logging.getLogger(__name__)
-
 
 @dataclass(frozen=True)
 class DummyQuery:
@@ -343,7 +341,6 @@ def test_jsonline_store_writer_error_is_captured(tmp_path: Path) -> None:
 
 def test_memory_store_append_after_close_warns(caplog: pytest.LogCaptureFixture) -> None:
     """Appending to closed MemoryStore logs warning and drops record."""
-    import logging
 
     store = MemoryStore()
     record = Record(
@@ -370,7 +367,6 @@ def test_jsonline_store_writer_thread_timeout_warns(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """If writer thread doesn't stop in time, warning is logged."""
-    import logging
 
     store = JsonLineStore(tmp_path, max_runs=10)
 
@@ -391,13 +387,13 @@ def test_jsonline_store_writer_thread_timeout_warns(
 def test_jsonline_store_append_after_writer_error_drops_records(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """After writer error, append() drops records and logs warning."""
-    import logging
+    """After writer error, append() attempts restart for OSError, drops for non-OSError."""
 
     store = JsonLineStore(tmp_path, max_runs=10)
 
-    # Simulate writer error
-    store._writer_error = OSError("disk full")
+    # Simulate non-OSError (should drop without restart)
+    with store._state_lock:
+        store._writer_error = ValueError("some other error")
 
     record = Record(
         timestamp=time.time(),
@@ -418,7 +414,6 @@ def test_jsonline_store_append_after_writer_error_drops_records(
 
     # Verify warning log
     assert "writer thread failed" in caplog.text
-    assert "disk full" in caplog.text
     assert "TestQuery" in caplog.text
 
     store.close()
@@ -428,7 +423,6 @@ def test_jsonline_store_append_after_close_warns_jsonl(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """JsonLineStore logs warning when append() called after close."""
-    import logging
 
     store = JsonLineStore(tmp_path, max_runs=10)
     store.close()
@@ -473,7 +467,6 @@ def test_jsonline_store_queue_full_drops_record(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """When queue is full, append drops record and logs warning."""
-    import logging
 
     store = JsonLineStore(tmp_path, max_runs=10, max_queue_size=1)
 
@@ -679,7 +672,6 @@ def test_jsonline_store_writer_restart_on_failure(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Writer restart is attempted after failure."""
-    import logging
 
     # Create store
     store = JsonLineStore(tmp_path, max_runs=10)
@@ -702,10 +694,9 @@ def test_jsonline_store_writer_restart_on_failure(
 
 
 def test_jsonline_store_writer_restart_failure_increments_dropped(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """When writer restart also fails, dropped_count increases."""
-    import logging
 
     store = JsonLineStore(tmp_path, max_runs=10)
 
@@ -812,3 +803,123 @@ def test_jsonline_store_append_after_close_increments_dropped(tmp_path: Path) ->
     store.append(record)
 
     assert store.dropped_count == initial_dropped + 1
+
+
+def test_jsonline_store_writer_oserror_restart_via_append(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When writer thread dies from OSError, append() triggers restart."""
+    store = JsonLineStore(tmp_path, max_runs=10)
+
+    # Simulate OSError in writer thread
+    with store._state_lock:
+        store._writer_error = OSError("simulated I/O error")
+
+    initial_thread = store._writer_thread
+
+    # append() should detect OSError and trigger restart
+    record = Record(
+        timestamp=time.time(),
+        message_type="query",
+        message_class="TestQuery",
+        payload=DummyQuery(value=1),
+        duration_ns=100,
+        result=None,
+        error=None,
+    )
+
+    with caplog.at_level(logging.INFO, logger="message_bus.recording"):
+        store.append(record)
+        time.sleep(0.2)  # Give restart time to complete
+
+    # Verify restart was triggered
+    assert "Attempting writer thread restart" in caplog.text
+    assert store._restart_attempted is True
+    assert store._writer_thread != initial_thread
+
+    store.close()
+
+
+def test_jsonline_store_restarted_writer_writes_to_disk(tmp_path: Path) -> None:
+    """Restarted writer actually writes records to disk."""
+    store = JsonLineStore(tmp_path, max_runs=10)
+
+    # Write initial record
+    record1 = Record(
+        timestamp=time.time(),
+        message_type="query",
+        message_class="Query1",
+        payload=DummyQuery(value=1),
+        duration_ns=100,
+        result=None,
+        error=None,
+    )
+    store.append(record1)
+    time.sleep(0.1)  # Let writer write it
+
+    # Simulate writer error
+    with store._state_lock:
+        store._writer_error = OSError("simulated I/O error")
+
+    # Trigger restart via append
+    record2 = Record(
+        timestamp=time.time(),
+        message_type="query",
+        message_class="Query2",
+        payload=DummyQuery(value=2),
+        duration_ns=100,
+        result=None,
+        error=None,
+    )
+    store.append(record2)
+    time.sleep(0.2)  # Give restart time
+
+    # Append another record after restart
+    record3 = Record(
+        timestamp=time.time(),
+        message_type="query",
+        message_class="Query3",
+        payload=DummyQuery(value=3),
+        duration_ns=100,
+        result=None,
+        error=None,
+    )
+    store.append(record3)
+
+    store.close()
+    time.sleep(0.2)
+
+    # Verify records exist in JSONL file
+    jsonl_files = list(tmp_path.glob("run_*.jsonl"))
+    assert len(jsonl_files) == 1
+
+    with open(jsonl_files[0]) as f:
+        lines = f.readlines()
+
+    # Should have at least record1 and record3 (record2 might be dropped during restart)
+    assert len(lines) >= 2
+    classes = [json.loads(line)["class"] for line in lines]
+    assert "Query1" in classes
+    assert "Query3" in classes
+
+
+def test_jsonline_store_closed_prevents_restart(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """_closed=True prevents restart."""
+    store = JsonLineStore(tmp_path, max_runs=10)
+    store.close()
+    time.sleep(0.1)
+
+    # Manually set error and reset restart flag (simulating restart condition)
+    with store._state_lock:
+        store._writer_error = OSError("test error")
+    store._restart_attempted = False
+
+    # Attempt restart should be blocked
+    with caplog.at_level(logging.WARNING, logger="message_bus.recording"):
+        store._attempt_writer_restart()
+
+    # Verify restart was blocked
+    assert "store is closed" in caplog.text
+    assert store._restart_attempted is False  # Should not be set
