@@ -75,4 +75,4 @@ include_external_packages = true
 name = "ports should not depend on implementations"
 type = "forbidden"
 source_modules = ["message_bus.ports"]
-forbidden_modules = ["message_bus.local", "message_bus.zmq_bus"]
+forbidden_modules = ["message_bus.local", "message_bus.zmq_bus", "message_bus.recording"]

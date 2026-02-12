@@ -17,6 +17,14 @@ from message_bus.ports import (
     QueryRegistry,
     Task,
 )
+from message_bus.recording import (
+    AsyncRecordingBus,
+    JsonLineStore,
+    MemoryStore,
+    Record,
+    RecordingBus,
+    RecordStore,
+)
 
 __all__ = [
     # Core message types
@@ -39,6 +47,13 @@ __all__ = [
     # Implementations
     "LocalMessageBus",
     "AsyncLocalMessageBus",
+    # Recording
+    "Record",
+    "RecordStore",
+    "MemoryStore",
+    "JsonLineStore",
+    "RecordingBus",
+    "AsyncRecordingBus",
 ]
 
 # Optional ZMQ support
