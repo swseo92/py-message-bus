@@ -46,6 +46,20 @@ def _safe_json(obj: Any) -> Any:
     return repr(obj)
 
 
+def _format_timestamp(timestamp: float) -> str:
+    """Format timestamp as ISO-8601 with microseconds.
+
+    Args:
+        timestamp: Unix timestamp from time.time()
+
+    Returns:
+        Formatted string like "2026-02-12T14:30:45.123456"
+    """
+    base_time = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(timestamp))
+    microseconds = int((timestamp % 1) * 1e6)
+    return f"{base_time}.{microseconds:06d}"
+
+
 @dataclass(frozen=True, slots=True)
 class Record:
     """A single message dispatch record.
@@ -191,10 +205,7 @@ class JsonLineStore(RecordStore):
                     # Write batch
                     for record in batch:
                         record_dict = {
-                            "ts": time.strftime(
-                                "%Y-%m-%dT%H:%M:%S", time.localtime(record.timestamp)
-                            )
-                            + f".{int((record.timestamp % 1) * 1e6):06d}",
+                            "ts": _format_timestamp(record.timestamp),
                             "type": record.message_type,
                             "class": record.message_class,
                             "payload": _safe_asdict(
@@ -291,9 +302,41 @@ class RecordingBus(MessageBus):
         self._record_mode = record_mode
         self._closed = False
 
+    def _record_dispatch(
+        self,
+        message: Query[Any] | Command | Event | Task,
+        message_type: str,
+        duration_ns: int,
+        result: Any = None,
+        error_str: str | None = None,
+    ) -> None:
+        """Record a dispatch if mode allows.
+
+        Args:
+            message: The dispatched message
+            message_type: "query", "command", "event", or "task"
+            duration_ns: Dispatch duration in nanoseconds
+            result: Query result (None for others)
+            error_str: Error repr if handler failed
+        """
+        if self._record_mode == "all" or error_str is not None:
+            try:
+                self._store.append(
+                    Record(
+                        timestamp=time.time(),
+                        message_type=message_type,
+                        message_class=type(message).__name__,
+                        payload=message,
+                        duration_ns=duration_ns,
+                        result=result if error_str is None else None,
+                        error=error_str,
+                    )
+                )
+            except Exception:
+                logger.exception("Failed to record %s dispatch", message_type)
+
     def send(self, query: Query[T]) -> T:
         """Dispatch a query and record the result."""
-
         t0 = time.perf_counter_ns()
         error_str: str | None = None
         result: Any = None
@@ -305,21 +348,7 @@ class RecordingBus(MessageBus):
             raise
         finally:
             duration = time.perf_counter_ns() - t0
-            if self._record_mode == "all" or error_str is not None:
-                try:
-                    self._store.append(
-                        Record(
-                            timestamp=time.time(),
-                            message_type="query",
-                            message_class=type(query).__name__,
-                            payload=query,  # Store raw object (NOT dict)
-                            duration_ns=duration,
-                            result=result if error_str is None else None,
-                            error=error_str,
-                        )
-                    )
-                except Exception:
-                    logger.exception("Failed to record %s dispatch", "query")
+            self._record_dispatch(query, "query", duration, result, error_str)
 
     def execute(self, command: Command) -> None:
         """Dispatch a command and record execution."""
@@ -332,21 +361,7 @@ class RecordingBus(MessageBus):
             raise
         finally:
             duration = time.perf_counter_ns() - t0
-            if self._record_mode == "all" or error_str is not None:
-                try:
-                    self._store.append(
-                        Record(
-                            timestamp=time.time(),
-                            message_type="command",
-                            message_class=type(command).__name__,
-                            payload=command,
-                            duration_ns=duration,
-                            result=None,
-                            error=error_str,
-                        )
-                    )
-                except Exception:
-                    logger.exception("Failed to record %s dispatch", "command")
+            self._record_dispatch(command, "command", duration, None, error_str)
 
     def publish(self, event: Event) -> None:
         """Dispatch an event and record publication."""
@@ -359,21 +374,7 @@ class RecordingBus(MessageBus):
             raise
         finally:
             duration = time.perf_counter_ns() - t0
-            if self._record_mode == "all" or error_str is not None:
-                try:
-                    self._store.append(
-                        Record(
-                            timestamp=time.time(),
-                            message_type="event",
-                            message_class=type(event).__name__,
-                            payload=event,
-                            duration_ns=duration,
-                            result=None,
-                            error=error_str,
-                        )
-                    )
-                except Exception:
-                    logger.exception("Failed to record %s dispatch", "event")
+            self._record_dispatch(event, "event", duration, None, error_str)
 
     def dispatch(self, task: Task) -> None:
         """Dispatch a task and record execution."""
@@ -386,21 +387,7 @@ class RecordingBus(MessageBus):
             raise
         finally:
             duration = time.perf_counter_ns() - t0
-            if self._record_mode == "all" or error_str is not None:
-                try:
-                    self._store.append(
-                        Record(
-                            timestamp=time.time(),
-                            message_type="task",
-                            message_class=type(task).__name__,
-                            payload=task,
-                            duration_ns=duration,
-                            result=None,
-                            error=error_str,
-                        )
-                    )
-                except Exception:
-                    logger.exception("Failed to record %s dispatch", "task")
+            self._record_dispatch(task, "task", duration, None, error_str)
 
     # Registration methods: pure delegation (no recording)
 
@@ -481,9 +468,41 @@ class AsyncRecordingBus(AsyncMessageBus):
         self._record_mode = record_mode
         self._closed = False
 
+    def _record_dispatch(
+        self,
+        message: Query[Any] | Command | Event | Task,
+        message_type: str,
+        duration_ns: int,
+        result: Any = None,
+        error_str: str | None = None,
+    ) -> None:
+        """Record a dispatch if mode allows.
+
+        Args:
+            message: The dispatched message
+            message_type: "query", "command", "event", or "task"
+            duration_ns: Dispatch duration in nanoseconds
+            result: Query result (None for others)
+            error_str: Error repr if handler failed
+        """
+        if self._record_mode == "all" or error_str is not None:
+            try:
+                self._store.append(
+                    Record(
+                        timestamp=time.time(),
+                        message_type=message_type,
+                        message_class=type(message).__name__,
+                        payload=message,
+                        duration_ns=duration_ns,
+                        result=result if error_str is None else None,
+                        error=error_str,
+                    )
+                )
+            except Exception:
+                logger.exception("Failed to record %s dispatch", message_type)
+
     async def send(self, query: Query[T]) -> T:
         """Dispatch a query and record the result."""
-
         t0 = time.perf_counter_ns()
         error_str: str | None = None
         result: Any = None
@@ -495,21 +514,7 @@ class AsyncRecordingBus(AsyncMessageBus):
             raise
         finally:
             duration = time.perf_counter_ns() - t0
-            if self._record_mode == "all" or error_str is not None:
-                try:
-                    self._store.append(
-                        Record(
-                            timestamp=time.time(),
-                            message_type="query",
-                            message_class=type(query).__name__,
-                            payload=query,
-                            duration_ns=duration,
-                            result=result if error_str is None else None,
-                            error=error_str,
-                        )
-                    )
-                except Exception:
-                    logger.exception("Failed to record %s dispatch", "query")
+            self._record_dispatch(query, "query", duration, result, error_str)
 
     async def execute(self, command: Command) -> None:
         """Dispatch a command and record execution."""
@@ -522,21 +527,7 @@ class AsyncRecordingBus(AsyncMessageBus):
             raise
         finally:
             duration = time.perf_counter_ns() - t0
-            if self._record_mode == "all" or error_str is not None:
-                try:
-                    self._store.append(
-                        Record(
-                            timestamp=time.time(),
-                            message_type="command",
-                            message_class=type(command).__name__,
-                            payload=command,
-                            duration_ns=duration,
-                            result=None,
-                            error=error_str,
-                        )
-                    )
-                except Exception:
-                    logger.exception("Failed to record %s dispatch", "command")
+            self._record_dispatch(command, "command", duration, None, error_str)
 
     async def publish(self, event: Event) -> None:
         """Dispatch an event and record publication."""
@@ -549,21 +540,7 @@ class AsyncRecordingBus(AsyncMessageBus):
             raise
         finally:
             duration = time.perf_counter_ns() - t0
-            if self._record_mode == "all" or error_str is not None:
-                try:
-                    self._store.append(
-                        Record(
-                            timestamp=time.time(),
-                            message_type="event",
-                            message_class=type(event).__name__,
-                            payload=event,
-                            duration_ns=duration,
-                            result=None,
-                            error=error_str,
-                        )
-                    )
-                except Exception:
-                    logger.exception("Failed to record %s dispatch", "event")
+            self._record_dispatch(event, "event", duration, None, error_str)
 
     async def dispatch(self, task: Task) -> None:
         """Dispatch a task and record execution."""
@@ -576,21 +553,7 @@ class AsyncRecordingBus(AsyncMessageBus):
             raise
         finally:
             duration = time.perf_counter_ns() - t0
-            if self._record_mode == "all" or error_str is not None:
-                try:
-                    self._store.append(
-                        Record(
-                            timestamp=time.time(),
-                            message_type="task",
-                            message_class=type(task).__name__,
-                            payload=task,
-                            duration_ns=duration,
-                            result=None,
-                            error=error_str,
-                        )
-                    )
-                except Exception:
-                    logger.exception("Failed to record %s dispatch", "task")
+            self._record_dispatch(task, "task", duration, None, error_str)
 
     # Registration methods: sync delegation (these are sync in AsyncMessageBus too)
 
