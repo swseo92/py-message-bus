@@ -622,3 +622,51 @@ def test_jsonline_store_no_redaction_by_default(tmp_path: Path) -> None:
         data = json.loads(f.readline())
 
     assert data["payload"]["value"] == 42  # Not redacted
+
+
+def test_jsonline_store_redaction_handles_list_of_dicts(tmp_path: Path) -> None:
+    """Redaction works on lists containing dicts."""
+    from message_bus.recording import _redact
+
+    data = {
+        "users": [
+            {"name": "alice", "password": "secret1"},
+            {"name": "bob", "password": "secret2"},
+        ],
+        "metadata": "public",
+    }
+
+    result = _redact(data, frozenset({"password"}))
+
+    assert result["users"][0]["name"] == "alice"
+    assert result["users"][0]["password"] == "[REDACTED]"
+    assert result["users"][1]["name"] == "bob"
+    assert result["users"][1]["password"] == "[REDACTED]"
+    assert result["metadata"] == "public"
+
+
+def test_jsonline_store_close_with_full_queue_uses_shutdown_event(
+    tmp_path: Path,
+) -> None:
+    """Writer thread stops via shutdown event when queue is full at close."""
+    store = JsonLineStore(tmp_path, max_runs=10, max_queue_size=1, close_timeout=2.0)
+
+    # Fill the queue so sentinel can't be enqueued
+    record = Record(
+        timestamp=time.time(),
+        message_type="command",
+        message_class="TestCommand",
+        payload=DummyQuery(value=1),
+        duration_ns=100,
+        result=None,
+        error=None,
+    )
+    # Rapidly fill queue
+    for _ in range(100):
+        store.append(record)
+
+    # close() should succeed even with full queue (shutdown event as fallback)
+    store.close()
+
+    # Writer thread should have stopped
+    assert not store._writer_thread.is_alive()

@@ -63,11 +63,18 @@ _REDACTED = "[REDACTED]"
 
 
 def _redact(data: dict[str, Any], fields: frozenset[str]) -> dict[str, Any]:
-    """Recursively redact sensitive fields from a dict."""
-    return {
-        k: _REDACTED if k in fields else _redact(v, fields) if isinstance(v, dict) else v
-        for k, v in data.items()
-    }
+    """Recursively redact sensitive fields from a dict (handles nested lists)."""
+    result: dict[str, Any] = {}
+    for k, v in data.items():
+        if k in fields:
+            result[k] = _REDACTED
+        elif isinstance(v, dict):
+            result[k] = _redact(v, fields)
+        elif isinstance(v, list):
+            result[k] = [_redact(item, fields) if isinstance(item, dict) else item for item in v]
+        else:
+            result[k] = v
+    return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +146,7 @@ class JsonLineStore(RecordStore):
         "_closed",
         "_close_timeout",
         "_redact_fields",
+        "_shutdown",
     )
 
     def __init__(
@@ -180,6 +188,7 @@ class JsonLineStore(RecordStore):
         self._closed = False
         self._close_timeout = close_timeout
         self._redact_fields = redact_fields
+        self._shutdown = threading.Event()
 
         # Cleanup old runs before starting
         self._cleanup_old_runs(directory, max_runs)
@@ -214,8 +223,13 @@ class JsonLineStore(RecordStore):
                 while True:
                     batch: list[Record] = []
 
-                    # Blocking get for first item
-                    item = self._queue.get()
+                    # Blocking get with timeout to check shutdown event
+                    try:
+                        item = self._queue.get(timeout=0.1)
+                    except queue.Empty:
+                        if self._shutdown.is_set():
+                            break
+                        continue
                     if item is None:  # Sentinel: shutdown signal
                         break
                     batch.append(item)
@@ -291,6 +305,7 @@ class JsonLineStore(RecordStore):
             self._queue.put(None, timeout=self._close_timeout)
         except queue.Full:
             logger.warning("JsonLineStore queue full at close, forcing writer shutdown")
+        self._shutdown.set()
 
         # Join with timeout
         self._writer_thread.join(timeout=self._close_timeout)
