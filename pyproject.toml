@@ -76,3 +76,15 @@ name = "ports should not depend on implementations"
 type = "forbidden"
 source_modules = ["message_bus.ports"]
 forbidden_modules = ["message_bus.local", "message_bus.zmq_bus", "message_bus.recording"]
+
+[[tool.importlinter.contracts]]
+name = "middleware should only depend on ports"
+type = "forbidden"
+source_modules = ["message_bus.middleware"]
+forbidden_modules = ["message_bus.local", "message_bus.zmq_bus", "message_bus.recording", "message_bus.latency"]
+
+[[tool.importlinter.contracts]]
+name = "latency should only depend on ports and middleware"
+type = "forbidden"
+source_modules = ["message_bus.latency"]
+forbidden_modules = ["message_bus.local", "message_bus.zmq_bus", "message_bus.recording"]

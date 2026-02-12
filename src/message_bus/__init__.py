@@ -1,6 +1,21 @@
 """Lightweight message bus for modular monolith architecture."""
 
+from message_bus.latency import (
+    AsyncLatencyMiddleware,
+    LatencyMiddleware,
+    LatencyPercentiles,
+    LatencyStats,
+    SeparationSignal,
+)
 from message_bus.local import AsyncLocalMessageBus, LocalMessageBus
+from message_bus.middleware import (
+    AsyncMiddleware,
+    AsyncMiddlewareBus,
+    AsyncPassthroughMiddleware,
+    Middleware,
+    MiddlewareBus,
+    PassthroughMiddleware,
+)
 from message_bus.ports import (
     AsyncHandlerRegistry,
     AsyncMessageBus,
@@ -54,6 +69,19 @@ __all__ = [
     "JsonLineStore",
     "RecordingBus",
     "AsyncRecordingBus",
+    # Middleware
+    "Middleware",
+    "AsyncMiddleware",
+    "PassthroughMiddleware",
+    "AsyncPassthroughMiddleware",
+    "MiddlewareBus",
+    "AsyncMiddlewareBus",
+    # Latency
+    "LatencyMiddleware",
+    "AsyncLatencyMiddleware",
+    "LatencyStats",
+    "LatencyPercentiles",
+    "SeparationSignal",
 ]
 
 # Optional ZMQ support
