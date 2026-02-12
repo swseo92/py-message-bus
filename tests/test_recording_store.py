@@ -1,0 +1,304 @@
+"""Tests for RecordStore implementations (MemoryStore, JsonLineStore)."""
+
+import json
+import threading
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import pytest
+
+from message_bus.recording import (
+    JsonLineStore,
+    MemoryStore,
+    Record,
+    _safe_asdict,
+    _safe_json,
+)
+
+
+@dataclass(frozen=True)
+class DummyQuery:
+    """Test message for creating records."""
+
+    value: int
+
+
+# MemoryStore tests
+
+
+def test_memory_store_append_and_retrieve() -> None:
+    """MemoryStore stores records in list."""
+    store = MemoryStore()
+
+    record = Record(
+        timestamp=time.time(),
+        message_type="query",
+        message_class="TestQuery",
+        payload=DummyQuery(value=42),
+        duration_ns=100,
+        result={"data": "test"},
+        error=None,
+    )
+
+    store.append(record)
+
+    assert len(store.records) == 1
+    assert store.records[0] == record
+    assert store.records[0].payload == DummyQuery(value=42)
+
+
+def test_memory_store_close_is_idempotent() -> None:
+    """Multiple close() calls are safe."""
+    store = MemoryStore()
+
+    record = Record(
+        timestamp=time.time(),
+        message_type="command",
+        message_class="TestCommand",
+        payload=DummyQuery(value=1),
+        duration_ns=50,
+        result=None,
+        error=None,
+    )
+
+    store.append(record)
+    store.close()
+    store.close()  # Second close should be safe
+
+    # Appends after close should be no-op
+    store.append(record)
+    assert len(store.records) == 1
+
+
+# JsonLineStore tests
+
+
+def test_jsonline_store_writes_to_file(tmp_path: Path) -> None:
+    """JSONL file created with correct content."""
+    store = JsonLineStore(tmp_path, max_runs=10)
+
+    record = Record(
+        timestamp=1234567890.123456,
+        message_type="query",
+        message_class="GetUserQuery",
+        payload=DummyQuery(value=123),
+        duration_ns=450,
+        result={"id": "123", "name": "Test"},
+        error=None,
+    )
+
+    store.append(record)
+    store.close()
+
+    # Give background thread time to write
+    time.sleep(0.1)
+
+    # Find the created file
+    jsonl_files = list(tmp_path.glob("run_*.jsonl"))
+    assert len(jsonl_files) == 1
+
+    # Verify content
+    with open(jsonl_files[0]) as f:
+        line = f.readline()
+        data = json.loads(line)
+
+    assert data["type"] == "query"
+    assert data["class"] == "GetUserQuery"
+    assert data["payload"] == {"value": 123}
+    assert data["duration_ns"] == 450
+    assert data["result"] == {"id": "123", "name": "Test"}
+    assert data["error"] is None
+
+
+def test_jsonline_store_close_drains_queue(tmp_path: Path) -> None:
+    """All records written after close()."""
+    store = JsonLineStore(tmp_path, max_runs=10)
+
+    # Append multiple records quickly
+    for i in range(10):
+        record = Record(
+            timestamp=time.time(),
+            message_type="command",
+            message_class=f"Command{i}",
+            payload=DummyQuery(value=i),
+            duration_ns=i * 100,
+            result=None,
+            error=None,
+        )
+        store.append(record)
+
+    store.close()
+    time.sleep(0.1)
+
+    # Verify all records written
+    jsonl_files = list(tmp_path.glob("run_*.jsonl"))
+    assert len(jsonl_files) == 1
+
+    with open(jsonl_files[0]) as f:
+        lines = f.readlines()
+
+    assert len(lines) == 10
+
+    # Verify each record
+    for i, line in enumerate(lines):
+        data = json.loads(line)
+        assert data["class"] == f"Command{i}"
+        assert data["payload"] == {"value": i}
+
+
+def test_jsonline_store_close_is_idempotent(tmp_path: Path) -> None:
+    """Multiple close() calls are safe."""
+    store = JsonLineStore(tmp_path, max_runs=10)
+
+    record = Record(
+        timestamp=time.time(),
+        message_type="event",
+        message_class="TestEvent",
+        payload=DummyQuery(value=1),
+        duration_ns=50,
+        result=None,
+        error=None,
+    )
+
+    store.append(record)
+    store.close()
+    store.close()  # Second close should be safe
+
+    time.sleep(0.1)
+
+    # Verify only one record written
+    jsonl_files = list(tmp_path.glob("run_*.jsonl"))
+    assert len(jsonl_files) == 1
+
+    with open(jsonl_files[0]) as f:
+        lines = f.readlines()
+
+    assert len(lines) == 1
+
+
+def test_jsonline_store_max_runs_cleanup(tmp_path: Path) -> None:
+    """Old run files deleted when > max_runs."""
+    max_runs = 3
+
+    # Create multiple stores sequentially, ensuring different filenames
+    # by waiting at least 1 second between creations (timestamp has 1s granularity)
+    stores = []
+    for i in range(5):
+        # Wait to ensure different timestamp in filename
+        if i > 0:
+            time.sleep(1.1)
+
+        store = JsonLineStore(tmp_path, max_runs=max_runs)
+        record = Record(
+            timestamp=time.time(),
+            message_type="query",
+            message_class=f"Query{i}",
+            payload=DummyQuery(value=i),
+            duration_ns=100,
+            result=None,
+            error=None,
+        )
+        store.append(record)
+        store.close()
+        stores.append(store)
+        time.sleep(0.1)  # Give writer thread time to finish
+
+    # Should only have max_runs files
+    jsonl_files = list(tmp_path.glob("run_*.jsonl"))
+    assert len(jsonl_files) == max_runs
+
+
+def test_jsonline_store_file_naming(tmp_path: Path) -> None:
+    """File name format includes timestamp and PID."""
+    import os
+    import re
+
+    store = JsonLineStore(tmp_path, max_runs=10)
+    store.close()
+
+    jsonl_files = list(tmp_path.glob("run_*.jsonl"))
+    assert len(jsonl_files) == 1
+
+    filename = jsonl_files[0].name
+    # Format: run_{YYYYMMDD_HHMMSS}_{pid}.jsonl
+    pattern = r"run_\d{8}_\d{6}_\d+\.jsonl"
+    assert re.match(pattern, filename)
+
+    # Extract and verify PID
+    pid_str = filename.split("_")[-1].replace(".jsonl", "")
+    assert int(pid_str) == os.getpid()
+
+
+def test_safe_json_handles_non_serializable() -> None:
+    """Non-JSON-serializable objects use repr() fallback."""
+
+    class NonSerializable:
+        def __repr__(self) -> str:
+            return "<NonSerializable object>"
+
+    obj = NonSerializable()
+    result = _safe_json(obj)
+
+    assert result == "<NonSerializable object>"
+
+
+def test_safe_asdict_handles_non_dataclass() -> None:
+    """Non-dataclass messages use repr() fallback."""
+
+    class NotADataclass:
+        def __repr__(self) -> str:
+            return "<NotADataclass>"
+
+    message = NotADataclass()
+    result = _safe_asdict(message)
+
+    assert result == {"__repr__": "<NotADataclass>"}
+
+
+def test_jsonline_store_concurrent_writes(tmp_path: Path) -> None:
+    """Thread-safe: multiple threads can append simultaneously."""
+    store = JsonLineStore(tmp_path, max_runs=10)
+    num_threads = 5
+    records_per_thread = 10
+
+    def append_records(thread_id: int) -> None:
+        for i in range(records_per_thread):
+            record = Record(
+                timestamp=time.time(),
+                message_type="command",
+                message_class=f"Thread{thread_id}Command{i}",
+                payload=DummyQuery(value=thread_id * 100 + i),
+                duration_ns=100,
+                result=None,
+                error=None,
+            )
+            store.append(record)
+
+    threads = [threading.Thread(target=append_records, args=(i,)) for i in range(num_threads)]
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    store.close()
+    time.sleep(0.2)
+
+    # Verify all records written
+    jsonl_files = list(tmp_path.glob("run_*.jsonl"))
+    assert len(jsonl_files) == 1
+
+    with open(jsonl_files[0]) as f:
+        lines = f.readlines()
+
+    assert len(lines) == num_threads * records_per_thread
+
+
+def test_jsonline_store_validates_max_runs(tmp_path: Path) -> None:
+    """ValueError for max_runs < 1."""
+    with pytest.raises(ValueError, match="max_runs must be >= 1"):
+        JsonLineStore(tmp_path, max_runs=0)
+
+    with pytest.raises(ValueError, match="max_runs must be >= 1"):
+        JsonLineStore(tmp_path, max_runs=-5)
