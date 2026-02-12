@@ -412,6 +412,7 @@ from message_bus import (
 retry = RetryMiddleware(
     max_attempts=3,        # Initial + 2 retries
     backoff_base=2.0,      # Exponential base (seconds)
+    max_backoff=60.0,      # Maximum backoff delay (seconds)
     retryable=(ConnectionError, TimeoutError),  # Which exceptions to retry
 )
 bus = MiddlewareBus(LocalMessageBus(), [retry])
@@ -436,6 +437,7 @@ Exponential backoff with formula: `delay = backoff_base ** attempt`
 
 - `max_attempts` - Maximum attempts (initial + retries), default 3, must be >= 1
 - `backoff_base` - Exponential backoff base in seconds, default 2.0, must be > 0
+- `max_backoff` - Maximum backoff delay in seconds, default 60.0, must be > 0. Caps exponential growth.
 - `retryable` - Tuple of exception types that trigger retry, default `(ConnectionError, TimeoutError)`
 
 Only exceptions in the `retryable` whitelist trigger retry. All others propagate immediately.

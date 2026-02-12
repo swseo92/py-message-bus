@@ -213,6 +213,33 @@ class TestRetryMiddlewareMaxBackoff:
         assert mock_sleep.call_args_list[0][0][0] == 5.0
         assert mock_sleep.call_args_list[1][0][0] == 15.0  # Capped
 
+    def test_max_backoff_equals_computed_delay(self) -> None:
+        """Boundary: max_backoff exactly equals computed delay."""
+        bus = LocalMessageBus()
+        # 2^1 = 2.0, max_backoff = 2.0 -> delay should be exactly 2.0
+        retry = RetryMiddleware(max_attempts=2, backoff_base=2.0, max_backoff=2.0)
+        wrapped = MiddlewareBus(bus, [retry])
+        handler = Mock(side_effect=[TimeoutError("fail"), 42])
+        wrapped.register_query(GetValueQuery, handler)
+        with patch("time.sleep") as mock_sleep:
+            result = wrapped.send(GetValueQuery(key="test"))
+        assert result == 42
+        mock_sleep.assert_called_once_with(2.0)
+
+    def test_very_small_max_backoff(self) -> None:
+        """Very small max_backoff caps all delays."""
+        bus = LocalMessageBus()
+        retry = RetryMiddleware(max_attempts=3, backoff_base=2.0, max_backoff=0.001)
+        wrapped = MiddlewareBus(bus, [retry])
+        handler = Mock(side_effect=[TimeoutError("1"), TimeoutError("2"), 42])
+        wrapped.register_query(GetValueQuery, handler)
+        with patch("time.sleep") as mock_sleep:
+            result = wrapped.send(GetValueQuery(key="test"))
+        assert result == 42
+        assert mock_sleep.call_count == 2
+        for call in mock_sleep.call_args_list:
+            assert call[0][0] == 0.001
+
 
 class TestRetryMiddlewareTask:
     """Test retry logic for tasks (dispatch)."""
@@ -447,6 +474,53 @@ class TestAsyncRetryMiddlewareMaxBackoff:
         assert mock_sleep.call_count == 2
         assert mock_sleep.call_args_list[0][0][0] == 5.0
         assert mock_sleep.call_args_list[1][0][0] == 15.0  # Capped
+
+    @pytest.mark.asyncio
+    async def test_max_backoff_equals_computed_delay(self) -> None:
+        """Boundary: max_backoff exactly equals computed delay (async)."""
+        bus = AsyncLocalMessageBus()
+        # 2^1 = 2.0, max_backoff = 2.0 -> delay should be exactly 2.0
+        retry = AsyncRetryMiddleware(max_attempts=2, backoff_base=2.0, max_backoff=2.0)
+        wrapped = AsyncMiddlewareBus(bus, [retry])
+
+        attempt = 0
+
+        async def handler(q: GetValueQuery) -> int:
+            nonlocal attempt
+            attempt += 1
+            if attempt == 1:
+                raise TimeoutError("fail")
+            return 42
+
+        wrapped.register_query(GetValueQuery, handler)
+        with patch("asyncio.sleep") as mock_sleep:
+            result = await wrapped.send(GetValueQuery(key="test"))
+        assert result == 42
+        mock_sleep.assert_called_once_with(2.0)
+
+    @pytest.mark.asyncio
+    async def test_very_small_max_backoff(self) -> None:
+        """Very small max_backoff caps all delays (async)."""
+        bus = AsyncLocalMessageBus()
+        retry = AsyncRetryMiddleware(max_attempts=3, backoff_base=2.0, max_backoff=0.001)
+        wrapped = AsyncMiddlewareBus(bus, [retry])
+
+        attempt = 0
+
+        async def handler(q: GetValueQuery) -> int:
+            nonlocal attempt
+            attempt += 1
+            if attempt < 3:
+                raise TimeoutError(f"fail {attempt}")
+            return 42
+
+        wrapped.register_query(GetValueQuery, handler)
+        with patch("asyncio.sleep") as mock_sleep:
+            result = await wrapped.send(GetValueQuery(key="test"))
+        assert result == 42
+        assert mock_sleep.call_count == 2
+        for call in mock_sleep.call_args_list:
+            assert call[0][0] == 0.001
 
 
 class TestAsyncRetryMiddlewareTask:
