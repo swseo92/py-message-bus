@@ -307,10 +307,12 @@ class JsonLineStore(RecordStore):
 
         # Drain stale records from queue to avoid processing pre-failure data
         drained = 0
+        sentinel_found = False
         while True:
             try:
                 item = self._queue.get_nowait()
                 if item is None:
+                    sentinel_found = True
                     break
                 drained += 1
             except queue.Empty:
@@ -319,6 +321,9 @@ class JsonLineStore(RecordStore):
             logger.info("Drained %d stale records from queue before restart", drained)
             with self._state_lock:
                 self._dropped_count += drained
+        if sentinel_found:
+            logger.warning("Restart aborted: shutdown sentinel found during drain")
+            return
 
         # Reset ready event so we can wait for the new thread
         self._writer_ready.clear()
@@ -339,7 +344,10 @@ class JsonLineStore(RecordStore):
                     self._writer_error = None
                 logger.info("Writer thread restarted successfully")
             else:
-                # Thread started but didn't become ready - may have failed
+                # Thread started but didn't become ready - set explicit error
+                timeout_error = TimeoutError("Writer thread did not become ready within 5.0s")
+                with self._state_lock:
+                    self._writer_error = timeout_error
                 logger.error("Writer thread started but did not become ready in time")
         except Exception as exc:
             with self._state_lock:
