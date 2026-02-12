@@ -6,6 +6,7 @@ middleware chains to dispatches. Registration methods are pure delegation.
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar, cast
@@ -20,6 +21,8 @@ from message_bus.ports import (
 )
 
 T = TypeVar("T")
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -337,11 +340,17 @@ class _MiddlewareMixin:
         # Close all middleware first (outer to inner)
         for mw in self._middlewares:
             if hasattr(mw, "close"):
-                mw.close()
+                try:
+                    mw.close()
+                except Exception:
+                    logger.exception("Error closing middleware %s", type(mw).__name__)
         # Then close inner bus
         inner = getattr(self, "_inner", None)
         if inner is not None and hasattr(inner, "close"):
-            inner.close()
+            try:
+                inner.close()
+            except Exception:
+                logger.exception("Error closing inner bus %s", type(inner).__name__)
 
     # Introspection delegation (same pattern as _RecordingMixin)
     # Uses explicit typed intermediate variables for mypy strict.

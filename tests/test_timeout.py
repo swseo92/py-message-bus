@@ -246,7 +246,8 @@ class TestSyncTimeoutMiddleware:
         """close() properly shuts down the ThreadPoolExecutor."""
         timeout_mw = TimeoutMiddleware(default_timeout=1.0)
         timeout_mw.close()
-        assert timeout_mw._executor._shutdown
+        with pytest.raises(RuntimeError):
+            timeout_mw._executor.submit(lambda: None)
 
     def test_context_manager_calls_close(self) -> None:
         """Context manager automatically calls close() on middleware."""
@@ -255,7 +256,8 @@ class TestSyncTimeoutMiddleware:
         wrapped = MiddlewareBus(bus, [timeout_mw])
         with wrapped:
             pass
-        assert timeout_mw._executor._shutdown
+        with pytest.raises(RuntimeError):
+            timeout_mw._executor.submit(lambda: None)
 
 
 # ---------------------------------------------------------------------------
