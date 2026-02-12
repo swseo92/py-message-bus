@@ -9,6 +9,8 @@ Lightweight message bus for modular monolith architecture with zero core depende
 - **Interface Segregation** - Inject only the interfaces you need (QueryDispatcher, MessageDispatcher, etc.)
 - **Four message types** - Query, Command, Event, Task with clear semantics
 - **Recording/Observability** - Built-in middleware for dispatch logging to JSONL or memory
+- **Composable Middleware** - Chain middleware for cross-cutting concerns (latency, logging, auth)
+- **Latency Instrumentation** - Built-in middleware for percentile statistics and separation signal detection
 - **Async support** - First-class async/await support with concurrent event handling
 - **Multi-process ready** - Optional ZMQ-based distributed implementation
 
@@ -201,8 +203,25 @@ worker.start()  # Blocks and processes messages
 - CPU-bound task distribution
 - Legacy systems transitioning to distributed architecture
 
+**Custom Serializer:**
+
+```python
+from message_bus import ZmqMessageBus, Serializer, PickleSerializer
+
+# Default: PickleSerializer (backward compatible)
+bus = ZmqMessageBus(query_port=5555, ...)
+
+# Custom serializer (implement Serializer protocol)
+class JsonSerializer:
+    def dumps(self, obj: object) -> bytes: ...
+    def loads(self, data: bytes) -> object: ...
+
+bus = ZmqMessageBus(query_port=5555, serializer=JsonSerializer(), ...)
+```
+
 **Limitations:**
-- Uses pickle for serialization (security considerations apply)
+- Pluggable serializer (defaults to pickle - security considerations apply)
+- Configurable query timeout (`query_timeout_ms`, default 5000ms)
 - No message persistence or delivery guarantees
 
 ## Recording (Observability)
@@ -244,6 +263,41 @@ RecordingBus(bus, store, record_mode="errors")
 - `JsonLineStore(directory, max_runs=10)` - Write to JSONL files with background thread, auto-cleanup old runs
 - `MemoryStore()` - In-memory list for testing
 
+### Payload Redaction
+
+Sensitive fields can be automatically redacted from JSONL files:
+
+```python
+store = JsonLineStore(
+    Path("./recordings"),
+    max_runs=10,
+    redact_fields=frozenset({"password", "token", "secret"}),
+)
+# Payloads will have matching fields replaced with "***REDACTED***"
+# Works recursively on nested dicts and list[dict]
+```
+
+### Bounded Queue (Backpressure)
+
+Prevent memory issues when dispatch rate exceeds writer throughput:
+
+```python
+store = JsonLineStore(
+    Path("./recordings"),
+    max_queue_size=50_000,  # Default: 10_000
+)
+# When queue is full, oldest records are dropped with a warning log
+```
+
+### Configurable Close Timeout
+
+```python
+store = JsonLineStore(
+    Path("./recordings"),
+    close_timeout=10.0,  # Default: 5.0 seconds
+)
+```
+
 ### Async Recording
 
 ```python
@@ -258,6 +312,93 @@ async with AsyncRecordingBus(inner, store) as bus:
 # Store flushed on exit
 ```
 
+## Middleware
+
+Composable middleware for cross-cutting concerns (latency instrumentation, logging, authorization, etc.). Middleware chains are pre-built at initialization time with zero per-dispatch overhead.
+
+```python
+from message_bus import (
+    LocalMessageBus, MiddlewareBus, PassthroughMiddleware,
+    Query, Command, Event,
+)
+
+class LoggingMiddleware(PassthroughMiddleware):
+    def on_send(self, query, next_fn):
+        print(f"Query: {type(query).__name__}")
+        return next_fn(query)
+
+    def on_execute(self, command, next_fn):
+        print(f"Command: {type(command).__name__}")
+        next_fn(command)
+
+inner = LocalMessageBus()
+bus = MiddlewareBus(inner, [LoggingMiddleware()])
+# Registration delegates to inner bus
+# Dispatch goes through middleware chain
+```
+
+### Middleware Classes
+
+- `Middleware` (abstract) - Base class with hooks: `on_send`, `on_execute`, `on_publish`, `on_dispatch`
+- `PassthroughMiddleware` - Extend and override only what you need
+- `MiddlewareBus(inner, middlewares)` - Wraps any MessageBus, pre-builds chains at init
+- Async variants: `AsyncMiddleware`, `AsyncPassthroughMiddleware`, `AsyncMiddlewareBus`
+
+### Design Notes
+
+- Chains pre-built at `__init__` time (zero per-dispatch allocation)
+- First middleware in the list is outermost (first to intercept, last to complete)
+- Registration methods are pure delegation (no middleware applied)
+- Composable with RecordingBus: `RecordingBus(MiddlewareBus(inner, [mw]), store)`
+
+## Latency Instrumentation
+
+Built-in middleware for measuring handler execution latency with bounded-memory percentile statistics and module separation signal detection.
+
+```python
+from message_bus import (
+    LocalMessageBus, MiddlewareBus,
+    LatencyMiddleware, LatencyStats,
+)
+
+stats = LatencyStats(max_samples=10_000)
+middleware = LatencyMiddleware(stats, threshold_ms=50.0)
+bus = MiddlewareBus(LocalMessageBus(), [middleware])
+
+# After dispatches, query statistics
+percs = stats.all_percentiles()
+for p in percs:
+    print(f"{p.message_class}: p50={p.p50_ms:.2f}ms p95={p.p95_ms:.2f}ms p99={p.p99_ms:.2f}ms")
+```
+
+### Separation Signal Detection
+
+Detect module coupling via latency spikes (handlers whose latency increased significantly):
+
+```python
+# Set baseline after warm-up period
+stats.set_baseline()
+
+# ... later, check for latency increases
+signals = stats.check_separation_signals(threshold_ratio=2.0)
+for s in signals:
+    print(f"{s.message_class}: p95 {s.baseline_p95_ms:.1f}ms -> {s.current_p95_ms:.1f}ms ({s.increase_ratio}x)")
+```
+
+### Classes
+
+- `LatencyStats(max_samples=10_000)` - Thread-safe collector using bounded deque per message type
+- `LatencyPercentiles` - Frozen dataclass with p50/p95/p99/min/max in ms
+- `SeparationSignal` - Signal that a handler may be coupled to another module's load
+- `LatencyMiddleware(stats, threshold_ms=100.0)` - ~50ns overhead, logs warning when threshold exceeded
+- `AsyncLatencyMiddleware` - Async variant using same LatencyStats
+
+### Performance
+
+- Overhead: ~50ns per dispatch (one `time.perf_counter_ns()` call pair)
+- Memory: `max_samples * num_unique_message_types * 8 bytes` (default ~1.6MB worst case)
+- Thread-safe: Protected by single lock held briefly for append
+
 ## Architecture
 
 ```
@@ -266,6 +407,8 @@ src/message_bus/
 ├── ports.py        # ABCs: Query, Command, Event, Task + segregated interfaces
 ├── local.py        # LocalMessageBus, AsyncLocalMessageBus
 ├── recording.py    # RecordingBus, AsyncRecordingBus, JsonLineStore, MemoryStore
+├── middleware.py   # MiddlewareBus, AsyncMiddlewareBus, Middleware ABCs
+├── latency.py      # LatencyMiddleware, LatencyStats, SeparationSignal
 └── zmq_bus.py      # ZmqMessageBus, ZmqWorker (optional, requires pyzmq)
 ```
 
@@ -275,6 +418,8 @@ src/message_bus/
 2. **Interface Segregation** - Components depend on minimal interfaces, not full MessageBus
 3. **Direct Function Calls** - LocalMessageBus is a registry/router, not a real queue (minimal overhead)
 4. **Decorator Pattern** - RecordingBus wraps any MessageBus without modifying it
+5. **Composable Middleware** - MiddlewareBus chains middleware at init time with zero per-dispatch overhead
+6. **Bounded Resources** - All buffers (deque, queue) have configurable size limits
 
 ## Use Cases
 
@@ -414,7 +559,7 @@ Contributions welcome! Please ensure:
 
 ## Roadmap
 
+- [x] Latency instrumentation and separation signal detection
 - [ ] KafkaMessageBus for production-grade distributed messaging
 - [ ] Message persistence and replay
 - [ ] Dead letter queue support
-- [ ] Metrics and monitoring integration
