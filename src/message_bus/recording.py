@@ -147,6 +147,9 @@ class JsonLineStore(RecordStore):
         "_close_timeout",
         "_redact_fields",
         "_shutdown",
+        "_dropped_count",
+        "_state_lock",
+        "_restart_attempted",
     )
 
     def __init__(
@@ -189,6 +192,9 @@ class JsonLineStore(RecordStore):
         self._close_timeout = close_timeout
         self._redact_fields = redact_fields
         self._shutdown = threading.Event()
+        self._dropped_count = 0
+        self._state_lock = threading.Lock()
+        self._restart_attempted = False
 
         # Cleanup old runs before starting
         self._cleanup_old_runs(directory, max_runs)
@@ -216,10 +222,11 @@ class JsonLineStore(RecordStore):
             if old_file.parent.resolve() == directory.resolve():
                 old_file.unlink(missing_ok=True)
 
-    def _writer_loop(self) -> None:
+    def _writer_loop(self, *, append_mode: bool = False) -> None:
         """Background thread: drain queue and write to file in batches."""
+        file_mode = "a" if append_mode else "w"
         try:
-            with open(self._file_path, "w") as f:
+            with open(self._file_path, file_mode) as f:
                 while True:
                     batch: list[Record] = []
 
@@ -266,24 +273,77 @@ class JsonLineStore(RecordStore):
                     if item is None:  # Sentinel found in batch
                         break
         except OSError as exc:
-            self._writer_error = exc
+            with self._state_lock:
+                self._writer_error = exc
             logger.error("JsonLineStore writer I/O error: %s", exc)
         except Exception as exc:
-            self._writer_error = exc
+            with self._state_lock:
+                self._writer_error = exc
             logger.exception("JsonLineStore writer unexpected error")
+
+    def _attempt_writer_restart(self) -> None:
+        """Attempt to restart the writer thread once after failure."""
+        if self._closed:
+            logger.warning("Writer restart skipped: store is closed")
+            return
+
+        if self._restart_attempted:
+            logger.warning("Writer restart already attempted, not retrying")
+            return
+
+        self._restart_attempted = True
+        logger.info("Attempting writer thread restart after failure...")
+        time.sleep(1.0)  # Brief wait before restart
+
+        # Start new writer thread
+        pid = os.getpid()
+        self._writer_thread = threading.Thread(
+            target=self._writer_loop,
+            kwargs={"append_mode": True},
+            daemon=True,
+            name=f"JsonLineStore-writer-{pid}-restart",
+        )
+        try:
+            self._writer_thread.start()
+            # Only clear error AFTER successful start
+            with self._state_lock:
+                self._writer_error = None
+            logger.info("Writer thread restarted successfully")
+        except Exception as exc:
+            with self._state_lock:
+                self._writer_error = exc
+            logger.error("Writer thread restart failed: %s", exc)
 
     def append(self, record: Record) -> None:
         """Enqueue a record for background writing (non-blocking)."""
         if self._closed:
             logger.warning("JsonLineStore.append() called after close, record dropped")
+            self._increment_dropped()
             return
-        if self._writer_error is not None:
-            logger.warning(
-                "JsonLineStore writer thread failed (%s), dropping record: %s",
-                self._writer_error,
-                record.message_class,
-            )
-            return
+
+        # Check for writer error and attempt restart if needed
+        with self._state_lock:
+            writer_error = self._writer_error
+            restart_attempted = self._restart_attempted
+
+        if writer_error is not None:
+            # Attempt restart for OSError (transient I/O errors)
+            if isinstance(writer_error, OSError) and not restart_attempted:
+                self._attempt_writer_restart()
+                # After restart attempt, re-check error state
+                with self._state_lock:
+                    writer_error = self._writer_error
+
+            # If still errored, drop the record
+            if writer_error is not None:
+                logger.warning(
+                    "JsonLineStore writer thread failed (%s), dropping record: %s",
+                    writer_error,
+                    record.message_class,
+                )
+                self._increment_dropped()
+                return
+
         try:
             self._queue.put_nowait(record)
         except queue.Full:
@@ -292,6 +352,18 @@ class JsonLineStore(RecordStore):
                 self._queue.maxsize,
                 record.message_class,
             )
+            self._increment_dropped()
+
+    def _increment_dropped(self) -> None:
+        """Thread-safe increment of dropped record counter."""
+        with self._state_lock:
+            self._dropped_count += 1
+
+    @property
+    def dropped_count(self) -> int:
+        """Number of records dropped due to writer failure or queue full."""
+        with self._state_lock:
+            return self._dropped_count
 
     def close(self) -> None:
         """Flush remaining records and stop writer thread. Idempotent."""
@@ -319,6 +391,11 @@ class JsonLineStore(RecordStore):
             logger.warning(
                 "JsonLineStore had writer errors during operation: %s", self._writer_error
             )
+
+        # Log dropped records
+        dropped = self.dropped_count
+        if dropped > 0:
+            logger.warning("JsonLineStore closed with %d dropped records", dropped)
 
 
 class _RecordingMixin:
