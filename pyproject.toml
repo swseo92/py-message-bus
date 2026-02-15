@@ -91,5 +91,6 @@ forbidden_modules = ["message_bus.local", "message_bus.zmq_bus", "message_bus.re
 
 [dependency-groups]
 dev = [
+    "pytest>=9.0.2",
     "pyzmq>=27.1.0",
 ]
