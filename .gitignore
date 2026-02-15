@@ -74,3 +74,4 @@ prd.md
 # Environment
 .env.*
 !.env.example
+.claude/linear.json
