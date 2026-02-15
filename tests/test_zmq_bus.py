@@ -39,10 +39,10 @@ def unique_sockets():
     """Generate unique socket addresses for each test to avoid conflicts."""
     timestamp = str(time.time()).replace(".", "")
     return {
-        "task": f"ipc:///tmp/message_bus_task_{timestamp}",
-        "query": f"ipc:///tmp/message_bus_query_{timestamp}",
-        "event": f"ipc:///tmp/message_bus_event_{timestamp}",
-        "command": f"ipc:///tmp/message_bus_command_{timestamp}",
+        "task_socket": f"ipc:///tmp/message_bus_task_{timestamp}",
+        "query_socket": f"ipc:///tmp/message_bus_query_{timestamp}",
+        "event_socket": f"ipc:///tmp/message_bus_event_{timestamp}",
+        "command_socket": f"ipc:///tmp/message_bus_command_{timestamp}",
     }
 
 
