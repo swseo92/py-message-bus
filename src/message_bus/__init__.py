@@ -121,4 +121,16 @@ try:
 except ImportError:
     pass
 
+# Optional Redis support
+try:
+    from message_bus.redis_bus import (  # noqa: F401
+        JsonSerializer,
+        RedisMessageBus,
+        RedisWorker,
+    )
+
+    __all__.extend(["RedisMessageBus", "RedisWorker", "JsonSerializer"])
+except ImportError:
+    pass
+
 __version__ = "0.1.0"
