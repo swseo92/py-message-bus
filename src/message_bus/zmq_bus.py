@@ -84,12 +84,11 @@ def _validate_socket_addr(addr: str) -> None:
         raise ValueError(f"Unsupported socket protocol: {addr!r}. Use 'ipc://' or 'tcp://'")
 
 
-class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
+class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher, HandlerRegistry):
     """
     ZeroMQ-based message bus for local multi-process communication.
 
-    Implements QueryDispatcher, QueryRegistry, MessageDispatcher.
-    Does NOT implement HandlerRegistry - use ZmqWorker for handler registration.
+    Implements all MessageBus interfaces for drop-in compatibility with LocalMessageBus.
 
     WARNING: This implementation uses pickle for serialization.
     Only use between trusted processes. Pickle deserialization can execute arbitrary code.
@@ -98,12 +97,14 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
     - Task/Command: PUSH/PULL pattern (load-balanced across workers)
     - Query: REQ/REP pattern (synchronous request-response)
     - Event: PUB/SUB pattern (broadcast to all subscribers)
+    - Embedded Worker: Background ZmqWorker for command/event/task handlers
 
     Sockets used for local communication:
     - Windows: tcp://127.0.0.1:port (IPC not supported)
     - Unix: ipc:///tmp/message_bus_*_<pid>
 
     Use cases:
+    - Drop-in replacement for LocalMessageBus with multi-process capability
     - Multi-process worker pools
     - Local service mesh
     - Process-level isolation
@@ -132,6 +133,8 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
         "_query_timeout_ms",
         "_query_req_socket",
         "_query_lock",
+        "_embedded_worker",
+        "_worker_thread",
     )
 
     def __init__(
@@ -201,6 +204,16 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
         self._rep_thread = threading.Thread(target=self._run_rep_loop, daemon=True)
         self._rep_thread.start()
 
+        # Create embedded worker for HandlerRegistry methods
+        self._embedded_worker = ZmqWorker(
+            task_socket=self._task_socket_addr,
+            event_socket=self._event_socket_addr,
+            command_socket=self._command_socket_addr,
+            serializer=self._serializer,
+        )
+        self._worker_thread = threading.Thread(target=self._embedded_worker.run, daemon=True)
+        self._worker_thread.start()
+
     def _run_rep_loop(self) -> None:
         """Run REP socket loop in background thread."""
         while self._running:
@@ -254,6 +267,22 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
                 raise ValueError(f"Query handler already registered for {query_type.__name__}")
             self._query_handlers[query_type] = handler
 
+    # HandlerRegistry methods - delegate to embedded worker
+
+    def register_command(
+        self, command_type: type[Command], handler: Callable[[Command], None]
+    ) -> None:
+        """Register a command handler. Delegates to embedded worker."""
+        self._embedded_worker.register_command(command_type, handler)
+
+    def subscribe(self, event_type: type[Event], handler: Callable[[Event], None]) -> None:
+        """Subscribe to an event. Delegates to embedded worker."""
+        self._embedded_worker.subscribe(event_type, handler)
+
+    def register_task(self, task_type: type[Task], handler: Callable[[Task], None]) -> None:
+        """Register a task handler. Delegates to embedded worker."""
+        self._embedded_worker.register_task(task_type, handler)
+
     # Dispatch methods
 
     def send(self, query: Query[T]) -> T:
@@ -304,13 +333,24 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
     def close(self) -> None:
         """Close all sockets and terminate context."""
         self._running = False
-        self._rep_thread.join(timeout=1.0)
 
-        self._task_push_socket.close()
-        self._command_push_socket.close()
-        self._query_req_socket.close()
-        self._query_rep_socket.close()
-        self._event_pub_socket.close()
+        # Stop embedded worker first
+        if hasattr(self, "_embedded_worker"):
+            self._embedded_worker.stop()
+        if hasattr(self, "_worker_thread"):
+            # Give worker time to exit poll loop (shorter timeout for faster cleanup)
+            self._worker_thread.join(timeout=0.5)
+
+        self._rep_thread.join(timeout=0.5)
+
+        # Close sockets with linger=0 to avoid blocking on send
+        self._task_push_socket.close(linger=0)
+        self._command_push_socket.close(linger=0)
+        self._query_req_socket.close(linger=0)
+        self._query_rep_socket.close(linger=0)
+        self._event_pub_socket.close(linger=0)
+
+        # Terminate context (pyzmq 24.0.0+ requires explicit cleanup)
         self._context.term()
 
     def __enter__(self) -> "ZmqMessageBus":
@@ -512,9 +552,11 @@ class ZmqWorker(HandlerRegistry):
     def close(self) -> None:
         """Close all sockets and terminate context."""
         self.stop()
-        self._task_pull_socket.close()
-        self._command_pull_socket.close()
-        self._event_sub_socket.close()
+        # Close sockets with linger=0 to avoid blocking on send
+        self._task_pull_socket.close(linger=0)
+        self._command_pull_socket.close(linger=0)
+        self._event_sub_socket.close(linger=0)
+        # Terminate context (pyzmq 24.0.0+ requires explicit cleanup)
         self._context.term()
 
     def __enter__(self) -> "ZmqWorker":
