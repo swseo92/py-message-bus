@@ -68,7 +68,7 @@ class TestZmqInterfaceHierarchy:
     """Verify ZMQ interface inheritance."""
 
     def test_zmq_message_bus_is_dispatcher_only(self):
-        """ZmqMessageBus implements dispatcher interfaces only."""
+        """ZmqMessageBus implements full MessageBus interface for drop-in compatibility."""
         from message_bus import (
             HandlerRegistry,
             MessageDispatcher,
@@ -80,7 +80,7 @@ class TestZmqInterfaceHierarchy:
         assert issubclass(ZmqMessageBus, QueryDispatcher)
         assert issubclass(ZmqMessageBus, QueryRegistry)
         assert issubclass(ZmqMessageBus, MessageDispatcher)
-        assert not issubclass(ZmqMessageBus, HandlerRegistry)
+        assert issubclass(ZmqMessageBus, HandlerRegistry)  # Now implements full interface
 
     def test_zmq_worker_is_handler_registry(self):
         """ZmqWorker implements HandlerRegistry."""

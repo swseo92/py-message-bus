@@ -175,25 +175,24 @@ Distributed message bus using ZeroMQ for inter-process communication.
 ```python
 from message_bus import ZmqMessageBus, ZmqWorker
 
-# Server process
+# Server process (default: ipc:///tmp/message_bus_*_<pid> on Unix, tcp://127.0.0.1:port on Windows)
 bus = ZmqMessageBus(
-    query_port=5555,
-    command_port=5556,
-    event_port=5557,
-    task_port=5558
+    task_socket="ipc:///tmp/message_bus_task",
+    query_socket="ipc:///tmp/message_bus_query",
+    event_socket="ipc:///tmp/message_bus_event",
+    command_socket="ipc:///tmp/message_bus_command",
 )
 # Dispatch from any process
 result = bus.send(GetUser(user_id="123"))
 
 # Worker process
 worker = ZmqWorker(
-    query_port=5555,
-    command_port=5556,
-    event_port=5557,
-    task_port=5558
+    task_socket="ipc:///tmp/message_bus_task",
+    event_socket="ipc:///tmp/message_bus_event",
+    command_socket="ipc:///tmp/message_bus_command",
 )
 worker.register_query(GetUser, lambda q: {"id": q.user_id})
-worker.start()  # Blocks and processes messages
+worker.run()  # Blocks and processes messages
 ```
 
 **Requires:** `pip install py-message-bus[zmq]`
@@ -209,14 +208,25 @@ worker.start()  # Blocks and processes messages
 from message_bus import ZmqMessageBus, Serializer, PickleSerializer
 
 # Default: PickleSerializer (backward compatible)
-bus = ZmqMessageBus(query_port=5555, ...)
+bus = ZmqMessageBus(
+    task_socket="ipc:///tmp/message_bus_task",
+    query_socket="ipc:///tmp/message_bus_query",
+    event_socket="ipc:///tmp/message_bus_event",
+    command_socket="ipc:///tmp/message_bus_command",
+)
 
 # Custom serializer (implement Serializer protocol)
 class JsonSerializer:
     def dumps(self, obj: object) -> bytes: ...
     def loads(self, data: bytes) -> object: ...
 
-bus = ZmqMessageBus(query_port=5555, serializer=JsonSerializer(), ...)
+bus = ZmqMessageBus(
+    task_socket="ipc:///tmp/message_bus_task",
+    query_socket="ipc:///tmp/message_bus_query",
+    event_socket="ipc:///tmp/message_bus_event",
+    command_socket="ipc:///tmp/message_bus_command",
+    serializer=JsonSerializer(),
+)
 ```
 
 **Limitations:**

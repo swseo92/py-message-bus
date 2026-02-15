@@ -28,7 +28,9 @@ logger = logging.getLogger(__name__)
 try:
     import zmq
 except ImportError:
-    zmq = None
+    from types import ModuleType
+
+    zmq = cast(ModuleType, None)
 
 T = TypeVar("T")
 
@@ -84,12 +86,15 @@ def _validate_socket_addr(addr: str) -> None:
         raise ValueError(f"Unsupported socket protocol: {addr!r}. Use 'ipc://' or 'tcp://'")
 
 
-class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
+class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher, HandlerRegistry):
     """
     ZeroMQ-based message bus for local multi-process communication.
 
-    Implements QueryDispatcher, QueryRegistry, MessageDispatcher.
-    Does NOT implement HandlerRegistry - use ZmqWorker for handler registration.
+    Implements the full MessageBus interface (QueryDispatcher, QueryRegistry,
+    MessageDispatcher, HandlerRegistry) for drop-in compatibility with LocalMessageBus.
+
+    For single-process usage, handlers are automatically managed by an internal worker.
+    For multi-process usage, create ZmqWorker instances separately.
 
     WARNING: This implementation uses pickle for serialization.
     Only use between trusted processes. Pickle deserialization can execute arbitrary code.
@@ -104,6 +109,7 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
     - Unix: ipc:///tmp/message_bus_*_<pid>
 
     Use cases:
+    - Drop-in replacement for LocalMessageBus with ZMQ backend
     - Multi-process worker pools
     - Local service mesh
     - Process-level isolation
@@ -121,11 +127,15 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
         "_event_pub_socket",
         "_command_push_socket",
         "_query_handlers",
+        "_command_handlers",
+        "_event_subscribers",
+        "_task_handlers",
         "_task_socket_addr",
         "_query_socket_addr",
         "_event_socket_addr",
         "_command_socket_addr",
         "_rep_thread",
+        "_worker_thread",
         "_running",
         "_handlers_lock",
         "_serializer",
@@ -194,12 +204,22 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
 
         # Query handlers (for REP socket)
         self._query_handlers: dict[type[Query[Any]], Callable[[Query[Any]], Any]] = {}
+        # Command/Event/Task handlers (for internal worker)
+        self._command_handlers: dict[type[Command], Callable[[Command], None]] = {}
+        self._event_subscribers: dict[type[Event], list[Callable[[Event], None]]] = defaultdict(
+            list
+        )
+        self._task_handlers: dict[type[Task], Callable[[Task], None]] = {}
         self._handlers_lock = threading.Lock()
 
         # Start REP socket thread
         self._running = True
         self._rep_thread = threading.Thread(target=self._run_rep_loop, daemon=True)
         self._rep_thread.start()
+
+        # Start internal worker thread for command/event/task handlers
+        self._worker_thread = threading.Thread(target=self._run_worker_loop, daemon=True)
+        self._worker_thread.start()
 
     def _run_rep_loop(self) -> None:
         """Run REP socket loop in background thread."""
@@ -246,6 +266,123 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
                 # Log error and continue
                 logger.exception("Error in REP loop: %s", e)
 
+    def _run_worker_loop(self) -> None:
+        """Run internal worker loop for command/event/task handlers in background thread."""
+        # Create PULL socket for commands/tasks
+        task_pull_socket = self._context.socket(zmq.PULL)
+        task_pull_socket.connect(self._task_socket_addr)
+
+        command_pull_socket = self._context.socket(zmq.PULL)
+        command_pull_socket.connect(self._command_socket_addr)
+
+        # Create SUB socket for events
+        event_sub_socket = self._context.socket(zmq.SUB)
+        event_sub_socket.connect(self._event_socket_addr)
+        event_sub_socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all events
+
+        poller = zmq.Poller()
+        poller.register(task_pull_socket, zmq.POLLIN)
+        poller.register(command_pull_socket, zmq.POLLIN)
+        poller.register(event_sub_socket, zmq.POLLIN)
+
+        try:
+            while self._running:
+                try:
+                    socks = dict(poller.poll(timeout=100))
+
+                    # Handle tasks
+                    if task_pull_socket in socks:
+                        message = task_pull_socket.recv()
+                        try:
+                            msg_type, task = self._serializer.loads(message)
+                        except Exception as e:
+                            logger.error("Failed to deserialize task message: %s", e)
+                            continue
+                        if msg_type == "task":
+                            if not isinstance(task, Task):
+                                logger.warning(
+                                    "Invalid task type received: %s", type(task).__name__
+                                )
+                                continue
+                            task_type = type(task)
+                            with self._handlers_lock:
+                                task_handler = self._task_handlers.get(task_type)
+                            if task_handler:
+                                try:
+                                    task_handler(task)
+                                except Exception as e:
+                                    logger.exception(
+                                        "Task handler failed for %s: %s", task_type.__name__, e
+                                    )
+                            else:
+                                logger.error(
+                                    "No handler registered for task type: %s", task_type.__name__
+                                )
+
+                    # Handle commands
+                    if command_pull_socket in socks:
+                        message = command_pull_socket.recv()
+                        try:
+                            msg_type, command = self._serializer.loads(message)
+                        except Exception as e:
+                            logger.error("Failed to deserialize command message: %s", e)
+                            continue
+                        if msg_type == "command":
+                            if not isinstance(command, Command):
+                                logger.warning(
+                                    "Invalid command type received: %s", type(command).__name__
+                                )
+                                continue
+                            command_type = type(command)
+                            with self._handlers_lock:
+                                cmd_handler = self._command_handlers.get(command_type)
+                            if cmd_handler:
+                                try:
+                                    cmd_handler(command)
+                                except Exception as e:
+                                    logger.exception(
+                                        "Command handler failed for %s: %s",
+                                        command_type.__name__,
+                                        e,
+                                    )
+                            else:
+                                logger.error(
+                                    "No handler registered for command type: %s",
+                                    command_type.__name__,
+                                )
+
+                    # Handle events
+                    if event_sub_socket in socks:
+                        event_type_name, event_data = event_sub_socket.recv_multipart()
+                        try:
+                            event = self._serializer.loads(event_data)
+                        except Exception as e:
+                            logger.error("Failed to deserialize event: %s", e)
+                            continue
+                        if not isinstance(event, Event):
+                            logger.warning("Invalid event type received: %s", type(event).__name__)
+                            continue
+                        event_type = type(event)
+                        with self._handlers_lock:
+                            event_handlers = self._event_subscribers.get(event_type, [])
+                        for event_handler in event_handlers:
+                            try:
+                                event_handler(event)
+                            except Exception as e:
+                                logger.exception(
+                                    "Event handler failed for %s: %s", event_type.__name__, e
+                                )
+                except Exception as e:
+                    logger.exception("Error in worker loop: %s", e)
+        finally:
+            # Ensure sockets are closed when loop exits
+            try:
+                task_pull_socket.close()
+                command_pull_socket.close()
+                event_sub_socket.close()
+            except Exception:
+                pass
+
     # Registration methods
 
     def register_query(self, query_type: type[Query[T]], handler: Callable[[Query[T]], T]) -> None:
@@ -253,6 +390,24 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
             if query_type in self._query_handlers:
                 raise ValueError(f"Query handler already registered for {query_type.__name__}")
             self._query_handlers[query_type] = handler
+
+    def register_command(
+        self, command_type: type[Command], handler: Callable[[Command], None]
+    ) -> None:
+        with self._handlers_lock:
+            if command_type in self._command_handlers:
+                raise ValueError(f"Command handler already registered for {command_type.__name__}")
+            self._command_handlers[command_type] = handler
+
+    def subscribe(self, event_type: type[Event], handler: Callable[[Event], None]) -> None:
+        with self._handlers_lock:
+            self._event_subscribers[event_type].append(handler)
+
+    def register_task(self, task_type: type[Task], handler: Callable[[Task], None]) -> None:
+        with self._handlers_lock:
+            if task_type in self._task_handlers:
+                raise ValueError(f"Task handler already registered for {task_type.__name__}")
+            self._task_handlers[task_type] = handler
 
     # Dispatch methods
 
@@ -305,6 +460,7 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher):
         """Close all sockets and terminate context."""
         self._running = False
         self._rep_thread.join(timeout=1.0)
+        self._worker_thread.join(timeout=1.0)
 
         self._task_push_socket.close()
         self._command_push_socket.close()

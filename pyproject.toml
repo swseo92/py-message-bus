@@ -88,3 +88,8 @@ name = "latency should only depend on ports and middleware"
 type = "forbidden"
 source_modules = ["message_bus.latency"]
 forbidden_modules = ["message_bus.local", "message_bus.zmq_bus", "message_bus.recording"]
+
+[dependency-groups]
+dev = [
+    "pyzmq>=27.1.0",
+]
