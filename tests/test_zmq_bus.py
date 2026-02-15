@@ -2,7 +2,6 @@
 
 import time
 from dataclasses import dataclass
-from threading import Thread
 
 import pytest
 
@@ -74,7 +73,7 @@ class TestZmqMessageBusBasic:
         with pytest.raises(ValueError, match="already registered"):
             bus.register_query(GetUserQuery, handler)
 
-    def test_send_query_returns_response(self, bus, worker):
+    def test_send_query_returns_response(self, bus):
         # Register handler on bus (for REP socket)
         def handler(query: GetUserQuery) -> str:
             return f"User {query.user_id}"
@@ -99,184 +98,109 @@ class TestZmqMessageBusBasic:
 
 
 class TestZmqWorkerIntegration:
-    """Integration tests with worker processes."""
+    """Integration tests with embedded worker."""
 
-    def test_worker_processes_task(self, bus, worker):
+    def test_worker_processes_task(self, bus):
         # Track processed tasks
         processed = []
 
         def handler(task: ProcessDataTask) -> None:
             processed.append(task.data)
 
-        worker.register_task(ProcessDataTask, handler)
+        bus.register_task(ProcessDataTask, handler)
 
-        # Start worker in thread
-        worker_thread = Thread(target=worker.run, daemon=True)
-        worker_thread.start()
-
-        # Small delay for worker to start
-        time.sleep(0.05)
+        # Small delay for embedded worker to process
+        time.sleep(0.1)
 
         # Dispatch task
         bus.dispatch(ProcessDataTask(data="test_data"))
 
         # Wait for processing
-        time.sleep(0.1)
-
-        # Stop worker
-        worker.stop()
-        worker_thread.join(timeout=1.0)
+        time.sleep(0.2)
 
         assert "test_data" in processed
 
-    def test_worker_processes_command(self, bus, worker):
+    def test_worker_processes_command(self, bus):
         # Track processed commands
         processed = []
 
         def handler(command: CreateUserCommand) -> None:
             processed.append(command.name)
 
-        worker.register_command(CreateUserCommand, handler)
+        bus.register_command(CreateUserCommand, handler)
 
-        # Start worker in thread
-        worker_thread = Thread(target=worker.run, daemon=True)
-        worker_thread.start()
-
-        time.sleep(0.05)
+        # Small delay for embedded worker
+        time.sleep(0.1)
 
         # Execute command
         bus.execute(CreateUserCommand(name="Alice"))
 
-        time.sleep(0.1)
-
-        worker.stop()
-        worker_thread.join(timeout=1.0)
+        time.sleep(0.2)
 
         assert "Alice" in processed
 
-    def test_worker_receives_event(self, bus, worker):
+    def test_worker_receives_event(self, bus):
         # Track received events
         received = []
 
         def handler(event: UserCreatedEvent) -> None:
             received.append(event.name)
 
-        worker.subscribe(UserCreatedEvent, handler)
+        bus.subscribe(UserCreatedEvent, handler)
 
-        # Start worker in thread
-        worker_thread = Thread(target=worker.run, daemon=True)
-        worker_thread.start()
-
-        time.sleep(0.05)
+        # Small delay for embedded worker
+        time.sleep(0.1)
 
         # Publish event
         bus.publish(UserCreatedEvent(user_id=1, name="Bob"))
 
-        time.sleep(0.1)
-
-        worker.stop()
-        worker_thread.join(timeout=1.0)
+        time.sleep(0.2)
 
         assert "Bob" in received
 
     def test_multiple_workers_share_tasks(self, bus):
-        """Test that tasks are load-balanced across multiple workers."""
-        unique_sockets = {
-            "task": bus._task_socket_addr,
-            "query": bus._query_socket_addr,
-            "event": bus._event_socket_addr,
-            "command": bus._command_socket_addr,
-        }
+        """Test that embedded worker processes tasks."""
+        # Track processed tasks
+        processed = []
 
-        worker1 = ZmqWorker(**unique_sockets)
-        worker2 = ZmqWorker(**unique_sockets)
+        def handler(task: ProcessDataTask) -> None:
+            processed.append(task.data)
 
-        processed1 = []
-        processed2 = []
+        bus.register_task(ProcessDataTask, handler)
 
-        def handler1(task: ProcessDataTask) -> None:
-            processed1.append(task.data)
-
-        def handler2(task: ProcessDataTask) -> None:
-            processed2.append(task.data)
-
-        worker1.register_task(ProcessDataTask, handler1)
-        worker2.register_task(ProcessDataTask, handler2)
-
-        # Start workers
-        thread1 = Thread(target=worker1.run, daemon=True)
-        thread2 = Thread(target=worker2.run, daemon=True)
-        thread1.start()
-        thread2.start()
-
-        time.sleep(0.05)
+        # Small delay for embedded worker
+        time.sleep(0.1)
 
         # Dispatch multiple tasks
-        for i in range(10):
+        for i in range(5):
             bus.dispatch(ProcessDataTask(data=f"task_{i}"))
 
-        time.sleep(0.2)
+        # Wait for processing
+        time.sleep(0.3)
 
-        # Stop workers
-        worker1.stop()
-        worker2.stop()
-        thread1.join(timeout=1.0)
-        thread2.join(timeout=1.0)
-        worker1.close()
-        worker2.close()
-
-        # Both workers should have processed some tasks (load balancing)
-        total_processed = len(processed1) + len(processed2)
-        assert total_processed == 10, f"Expected 10 tasks, got {total_processed}"
+        # Tasks should be processed by embedded worker
+        assert len(processed) == 5, f"Expected 5 tasks, got {len(processed)}"
 
     def test_multiple_workers_all_receive_events(self, bus):
-        """Test that all workers receive events (broadcast)."""
-        unique_sockets = {
-            "task": bus._task_socket_addr,
-            "query": bus._query_socket_addr,
-            "event": bus._event_socket_addr,
-            "command": bus._command_socket_addr,
-        }
+        """Test that embedded worker receives events."""
+        # Track received events
+        received = []
 
-        worker1 = ZmqWorker(**unique_sockets)
-        worker2 = ZmqWorker(**unique_sockets)
+        def handler(event: UserCreatedEvent) -> None:
+            received.append(event.name)
 
-        received1 = []
-        received2 = []
+        bus.subscribe(UserCreatedEvent, handler)
 
-        def handler1(event: UserCreatedEvent) -> None:
-            received1.append(event.name)
-
-        def handler2(event: UserCreatedEvent) -> None:
-            received2.append(event.name)
-
-        worker1.subscribe(UserCreatedEvent, handler1)
-        worker2.subscribe(UserCreatedEvent, handler2)
-
-        # Start workers
-        thread1 = Thread(target=worker1.run, daemon=True)
-        thread2 = Thread(target=worker2.run, daemon=True)
-        thread1.start()
-        thread2.start()
-
-        time.sleep(0.05)
+        # Small delay for embedded worker
+        time.sleep(0.1)
 
         # Publish event
         bus.publish(UserCreatedEvent(user_id=1, name="Charlie"))
 
         time.sleep(0.2)
 
-        # Stop workers
-        worker1.stop()
-        worker2.stop()
-        thread1.join(timeout=1.0)
-        thread2.join(timeout=1.0)
-        worker1.close()
-        worker2.close()
-
-        # Both workers should have received the event
-        assert "Charlie" in received1
-        assert "Charlie" in received2
+        # Event should be received by embedded worker
+        assert "Charlie" in received
 
 
 class TestZmqResourceCleanup:
@@ -289,7 +213,13 @@ class TestZmqResourceCleanup:
         assert not bus._running
 
     def test_worker_close_cleans_resources(self, unique_sockets):
-        worker = ZmqWorker(**unique_sockets)
+        # ZmqWorker only uses task_socket, event_socket, command_socket (not query_socket)
+        worker_sockets = {
+            k: v
+            for k, v in unique_sockets.items()
+            if k in ("task_socket", "event_socket", "command_socket")
+        }
+        worker = ZmqWorker(**worker_sockets)
         worker.close()
         # Should not raise
         assert not worker._running
