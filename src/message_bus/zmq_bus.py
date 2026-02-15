@@ -338,15 +338,19 @@ class ZmqMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher, HandlerRe
         if hasattr(self, "_embedded_worker"):
             self._embedded_worker.stop()
         if hasattr(self, "_worker_thread"):
-            self._worker_thread.join(timeout=1.0)
+            # Give worker time to exit poll loop (shorter timeout for faster cleanup)
+            self._worker_thread.join(timeout=0.5)
 
-        self._rep_thread.join(timeout=1.0)
+        self._rep_thread.join(timeout=0.5)
 
-        self._task_push_socket.close()
-        self._command_push_socket.close()
-        self._query_req_socket.close()
-        self._query_rep_socket.close()
-        self._event_pub_socket.close()
+        # Close sockets with linger=0 to avoid blocking on send
+        self._task_push_socket.close(linger=0)
+        self._command_push_socket.close(linger=0)
+        self._query_req_socket.close(linger=0)
+        self._query_rep_socket.close(linger=0)
+        self._event_pub_socket.close(linger=0)
+
+        # Terminate context (pyzmq 24.0.0+ requires explicit cleanup)
         self._context.term()
 
     def __enter__(self) -> "ZmqMessageBus":
@@ -548,9 +552,11 @@ class ZmqWorker(HandlerRegistry):
     def close(self) -> None:
         """Close all sockets and terminate context."""
         self.stop()
-        self._task_pull_socket.close()
-        self._command_pull_socket.close()
-        self._event_sub_socket.close()
+        # Close sockets with linger=0 to avoid blocking on send
+        self._task_pull_socket.close(linger=0)
+        self._command_pull_socket.close(linger=0)
+        self._event_sub_socket.close(linger=0)
+        # Terminate context (pyzmq 24.0.0+ requires explicit cleanup)
         self._context.term()
 
     def __enter__(self) -> "ZmqWorker":
