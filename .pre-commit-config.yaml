@@ -101,23 +101,6 @@ repos:
         stages: [pre-push]
         pass_filenames: false
 
-  # ============================================
-  # Claude Multi-Perspective Code Review - pre-push
-  # ============================================
-  # 결과 저장 위치:
-  #   .claude-review/meta.json - diff hash
-  #   .claude-review/results/*.json - 관점별 결과 (PASS/FAIL)
-  #   .claude-review/reports/*.md - 상세 보고서
-  #
-  - repo: local
-    hooks:
-      - id: claude-review
-        name: Claude Multi-Perspective Review
-        entry: python .claude/scripts/claude-review.py
-        language: system
-        stages: [pre-push]
-        pass_filenames: false
-        always_run: true
 
   # ============================================
   # Module README Auto-Update - pre-commit
