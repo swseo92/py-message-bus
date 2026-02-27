@@ -254,6 +254,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         "_max_retry",
         "_claim_idle_ms",
         "_dead_letter_store",
+        "_max_stream_length",
     )
 
     def __init__(
@@ -267,6 +268,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         max_retry: int = 3,
         claim_idle_ms: int = 30_000,
         dead_letter_store: DeadLetterStore | None = None,
+        max_stream_length: int = 10_000,
         _block_ms: int = 100,
         _redis_client: Any | None = None,
     ) -> None:
@@ -274,6 +276,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             raise ImportError(
                 "redis package is required for AsyncRedisMessageBus. "
                 "Install with: pip install 'redis>=5.0.0'"
+            )
+        if max_stream_length <= 0:
+            raise ValueError(
+                f"max_stream_length must be a positive integer, got {max_stream_length}"
             )
         self._redis_url = redis_url
         self._consumer_group = consumer_group
@@ -285,6 +291,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         self._max_retry = max_retry
         self._claim_idle_ms = claim_idle_ms
         self._dead_letter_store: DeadLetterStore | None = dead_letter_store
+        self._max_stream_length = max_stream_length
         self._block_ms = _block_ms
         # Injected client takes priority (used in tests with fakeredis)
         self._redis: Any = _redis_client
@@ -380,6 +387,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 "correlation_id": correlation_id.encode(),
                 "reply_stream": reply_stream.encode(),
             },
+            maxlen=self._max_stream_length,
+            approximate=True,
         )
 
         loop = asyncio.get_running_loop()
@@ -522,7 +531,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
     async def _xadd(self, stream_key: str, message: Any) -> None:
         """Serialize *message* and append it to *stream_key*."""
         data = self._serializer.dumps(message)
-        await self._redis.xadd(stream_key, {"data": data})
+        await self._redis.xadd(
+            stream_key, {"data": data}, maxlen=self._max_stream_length, approximate=True
+        )
 
     async def _ensure_group(self, stream_key: str, group: str) -> None:
         """Create consumer group (and stream) if they do not yet exist."""
@@ -755,7 +766,12 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                         try:
                             result = await handler(msg)
                             result_data = self._serializer.dumps(result)
-                            await self._redis.xadd(reply_stream, {"data": result_data})
+                            await self._redis.xadd(
+                                reply_stream,
+                                {"data": result_data},
+                                maxlen=self._max_stream_length,
+                                approximate=True,
+                            )
                         except Exception as exc:
                             logger.warning(
                                 "Query handler %s raised %s (reply_stream=%s): %s",
@@ -800,14 +816,16 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             await self._redis.xadd(
                 reply_stream,
                 {"error_type": error_type, "error_message": error_message},
+                maxlen=self._max_stream_length,
+                approximate=True,
             )
-        except Exception as e:
-            logger.warning(
-                "Failed to write error reply to %s (%s: %s): %s",
+        except Exception:
+            logger.exception(
+                "Failed to write error reply to %s (%s: %s); "
+                "requester will receive TimeoutError instead of the original error",
                 reply_stream,
                 error_type,
                 error_message,
-                e,
             )
 
     async def _run_xautoclaim_loop(
