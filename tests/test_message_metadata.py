@@ -317,3 +317,88 @@ class TestConsumerIdempotency:
         await bus.close()
 
         assert results.count("prod-1") == 1, "Event handler must be called once for duplicate"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Retry-after-failure — dedup key released on handler error
+# ---------------------------------------------------------------------------
+
+
+async def _poll_until(condition, *, timeout: float = 2.0, interval: float = 0.02) -> bool:
+    """Poll *condition()* every *interval* seconds until True or *timeout* expires."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        if condition():
+            return True
+        await asyncio.sleep(interval)
+    return False
+
+
+class TestRetryAfterFailure:
+    """Handler failures must release the dedup key so the message can be retried."""
+
+    @pytest.mark.asyncio
+    async def test_failed_handler_allows_retry(self, bus, fake_redis):
+        """If the first handler invocation raises, the message must be retried."""
+        call_count = 0
+        results: list[str] = []
+
+        async def handler(cmd: PlaceOrderCommand) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("transient failure")
+            results.append(cmd.order_id)
+
+        bus.register_command(PlaceOrderCommand, handler)
+        await bus.start()
+
+        stream_key = bus._stream_key("command", "PlaceOrderCommand")
+        cmd = PlaceOrderCommand(order_id="retry-1", amount=Decimal("10.00"))
+        data = bus._serializer.dumps(cmd)
+        ikey = "retry-ikey-001"
+
+        await fake_redis.xadd(
+            stream_key,
+            {
+                "data": data,
+                "message_id": "msg-retry",
+                "producer_id": "prod",
+                "idempotency_key": ikey,
+                "enqueue_timestamp": datetime.now(UTC).isoformat(),
+            },
+        )
+
+        # Wait for first attempt (which fails and releases the key), then inject
+        # the same message again to simulate XAUTOCLAIM re-delivery.
+        await _poll_until(lambda: call_count >= 1)
+        await fake_redis.xadd(
+            stream_key,
+            {
+                "data": data,
+                "message_id": "msg-retry-2",
+                "producer_id": "prod",
+                "idempotency_key": ikey,  # same key — must be retried, not skipped
+                "enqueue_timestamp": datetime.now(UTC).isoformat(),
+            },
+        )
+
+        succeeded = await _poll_until(lambda: len(results) >= 1)
+        await bus.close()
+
+        assert succeeded, "Handler must succeed on second delivery after key release"
+        assert results == ["retry-1"]
+
+    @pytest.mark.asyncio
+    async def test_invalid_idempotency_ttl_raises(self):
+        """idempotency_ttl <= 0 must raise ValueError at construction time."""
+        import fakeredis as _fakeredis
+
+        fake_redis = _fakeredis.aioredis.FakeRedis()
+        with pytest.raises(ValueError, match="idempotency_ttl"):
+            AsyncRedisMessageBus(
+                redis_url="redis://localhost",
+                consumer_group="test-group",
+                idempotency_ttl=0,
+                _redis_client=fake_redis,
+            )
