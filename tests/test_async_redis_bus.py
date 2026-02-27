@@ -1468,3 +1468,113 @@ class TestHOLBlockingFix:
         assert max_concurrent <= 2, (
             f"concurrency=2 means max 2 concurrent handlers, got {max_concurrent}"
         )
+
+    def test_invalid_concurrency_raises_value_error(self, bus):
+        """concurrency=0 또는 음수는 Semaphore 데드락을 유발하므로 즉시 ValueError를 발생시킨다."""
+
+        async def noop(cmd: CreateOrderCommand) -> None:
+            pass
+
+        with pytest.raises(ValueError, match="concurrency must be a positive integer"):
+            bus.register_command(CreateOrderCommand, noop, concurrency=0)
+
+        with pytest.raises(ValueError, match="concurrency must be a positive integer"):
+            bus.register_command(CreateOrderCommand, noop, concurrency=-1)
+
+    def test_invalid_task_concurrency_raises_value_error(self, bus):
+        """register_task concurrency=0/-1도 ValueError를 발생시킨다."""
+
+        async def noop(t: ProcessPaymentTask) -> None:
+            pass
+
+        with pytest.raises(ValueError, match="concurrency must be a positive integer"):
+            bus.register_task(ProcessPaymentTask, noop, concurrency=0)
+
+    @pytest.mark.asyncio
+    async def test_concurrency_enables_actual_parallel_execution(
+        self, fake_redis_server, serializer
+    ):
+        """concurrency=2면 실제로 2개 이상 동시 실행이 일어난다."""
+        import fakeredis
+
+        concurrent_count = 0
+        max_concurrent = 0
+        completed = 0
+
+        async def parallel_handler(cmd: CreateOrderCommand) -> None:
+            nonlocal concurrent_count, max_concurrent, completed
+            concurrent_count += 1
+            max_concurrent = max(max_concurrent, concurrent_count)
+            await asyncio.sleep(0.05)
+            concurrent_count -= 1
+            completed += 1
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="parallel-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        bus.register_command(CreateOrderCommand, parallel_handler, concurrency=3)
+        await bus.start()
+
+        for i in range(6):
+            await bus.execute(CreateOrderCommand(order_id=f"p-{i}", amount=Decimal("1")))
+
+        deadline = asyncio.get_event_loop().time() + 3.0
+        while completed < 6 and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.02)
+
+        await bus.close()
+
+        assert completed == 6
+        assert max_concurrent >= 2, (
+            f"concurrency=3 should allow ≥2 parallel executions, got {max_concurrent}"
+        )
+        assert max_concurrent <= 3, f"concurrency=3 must cap at 3, got {max_concurrent}"
+
+    @pytest.mark.asyncio
+    async def test_register_task_concurrency_parameter(self, fake_redis_server, serializer):
+        """register_task(concurrency=N)도 정상 동작한다."""
+        import fakeredis
+
+        concurrent_count = 0
+        max_concurrent = 0
+        completed = 0
+
+        async def parallel_task(t: ProcessPaymentTask) -> None:
+            nonlocal concurrent_count, max_concurrent, completed
+            concurrent_count += 1
+            max_concurrent = max(max_concurrent, concurrent_count)
+            await asyncio.sleep(0.05)
+            concurrent_count -= 1
+            completed += 1
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="task-parallel-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        bus.register_task(ProcessPaymentTask, parallel_task, concurrency=2)
+        await bus.start()
+
+        for i in range(4):
+            await bus.dispatch(ProcessPaymentTask(payment_id=f"pay-{i}", amount=Decimal("1")))
+
+        deadline = asyncio.get_event_loop().time() + 3.0
+        while completed < 4 and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.02)
+
+        await bus.close()
+
+        assert completed == 4
+        assert max_concurrent <= 2, f"concurrency=2 must cap at 2, got {max_concurrent}"

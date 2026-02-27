@@ -341,6 +341,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
     ) -> None:
         if command_type in self._command_handlers:
             raise ValueError(f"Command handler already registered for {command_type.__name__}")
+        if concurrency is not None and concurrency <= 0:
+            raise ValueError(f"concurrency must be a positive integer, got {concurrency}")
         self._serializer.registry.register(command_type)
         self._command_handlers[command_type] = handler
         if concurrency is not None:
@@ -366,6 +368,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
     ) -> None:
         if task_type in self._task_handlers:
             raise ValueError(f"Task handler already registered for {task_type.__name__}")
+        if concurrency is not None and concurrency <= 0:
+            raise ValueError(f"concurrency must be a positive integer, got {concurrency}")
         self._serializer.registry.register(task_type)
         self._task_handlers[task_type] = handler
         if concurrency is not None:
@@ -684,6 +688,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             pass
         finally:
             if concurrent_tasks:
+                for t in concurrent_tasks:
+                    t.cancel()
                 await asyncio.gather(*concurrent_tasks, return_exceptions=True)
 
     async def _process_command_message(
@@ -796,6 +802,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             pass
         finally:
             if concurrent_tasks:
+                for t in concurrent_tasks:
+                    t.cancel()
                 await asyncio.gather(*concurrent_tasks, return_exceptions=True)
 
     async def _process_task_message(
