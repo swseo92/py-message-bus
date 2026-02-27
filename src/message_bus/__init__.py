@@ -2,10 +2,12 @@
 
 from message_bus.dead_letter import (
     AsyncDeadLetterMiddleware,
+    DeadLetterEntry,
     DeadLetterMiddleware,
     DeadLetterRecord,
     DeadLetterStore,
     MemoryDeadLetterStore,
+    QueryableDeadLetterStore,
 )
 from message_bus.latency import (
     AsyncLatencyMiddleware,
@@ -103,6 +105,8 @@ __all__ = [
     # Dead Letter
     "DeadLetterStore",
     "DeadLetterRecord",
+    "DeadLetterEntry",
+    "QueryableDeadLetterStore",
     "MemoryDeadLetterStore",
     "DeadLetterMiddleware",
     "AsyncDeadLetterMiddleware",
@@ -150,6 +154,21 @@ except ImportError:
 
     warnings.warn(
         "AsyncRedisMessageBus is unavailable. "
+        "Install the 'redis' package: pip install 'redis>=5.0.0'",
+        ImportWarning,
+        stacklevel=2,
+    )
+
+# Optional Redis Dead Letter Store support
+try:
+    from message_bus.redis_dead_letter import RedisDeadLetterStore  # noqa: F401
+
+    __all__.extend(["RedisDeadLetterStore"])
+except ImportError:
+    import warnings
+
+    warnings.warn(
+        "RedisDeadLetterStore is unavailable. "
         "Install the 'redis' package: pip install 'redis>=5.0.0'",
         ImportWarning,
         stacklevel=2,
