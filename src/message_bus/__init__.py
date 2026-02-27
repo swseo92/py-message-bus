@@ -165,6 +165,13 @@ try:
 
     __all__.extend(["RedisDeadLetterStore"])
 except ImportError:
-    pass
+    import warnings
+
+    warnings.warn(
+        "RedisDeadLetterStore is unavailable. "
+        "Install the 'redis' package: pip install 'redis>=5.0.0'",
+        ImportWarning,
+        stacklevel=2,
+    )
 
 __version__ = "0.1.0"

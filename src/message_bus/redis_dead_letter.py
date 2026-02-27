@@ -41,10 +41,17 @@ logger = logging.getLogger(__name__)
 
 try:
     import redis as _redis_module
+    from redis.exceptions import ConnectionError as RedisConnectionError
+    from redis.exceptions import TimeoutError as RedisTimeoutError
 except ImportError:
     _redis_module = None
+    RedisConnectionError = OSError  # type: ignore[assignment, misc]
+    RedisTimeoutError = TimeoutError  # type: ignore[assignment, misc]
 
 redis = _redis_module  # module-level name for monkeypatching in tests
+
+# Exception types that indicate transient Redis I/O failures (not programming errors).
+_REDIS_IO_ERRORS = (OSError, RedisConnectionError, RedisTimeoutError)
 
 
 class RedisDeadLetterStore(QueryableDeadLetterStore):
@@ -102,12 +109,20 @@ class RedisDeadLetterStore(QueryableDeadLetterStore):
     def append(self, message: Event | Command | Task, error: Exception, handler_name: str) -> None:
         """Append a failed message to the Redis Stream.
 
-        Non-blocking: any Redis error is logged and swallowed so that the
-        middleware's error propagation is never interrupted.
+        Raises
+        ------
+        RuntimeError
+            If the store has been closed.
+
+        Note
+        ----
+        Transient Redis I/O errors (connection failures, timeouts) are caught,
+        logged, and swallowed so that the middleware's original error propagation
+        is never interrupted. Programming errors (e.g. ``AttributeError``) are
+        **not** suppressed and will propagate normally.
         """
         if self._closed:
-            logger.warning("RedisDeadLetterStore.append() called after close, record dropped")
-            return
+            raise RuntimeError("RedisDeadLetterStore is closed; cannot append failed message")
         try:
             entry_fields = {
                 "message_type": type(message).__name__,
@@ -123,10 +138,11 @@ class RedisDeadLetterStore(QueryableDeadLetterStore):
                 maxlen=self._max_len,
                 approximate=True,
             )
-        except Exception:
-            logger.exception(
-                "RedisDeadLetterStore.append() failed to write to Redis stream '%s'",
+        except _REDIS_IO_ERRORS as exc:
+            logger.error(
+                "RedisDeadLetterStore.append() failed to write to Redis stream '%s': %s",
                 self._stream_key,
+                exc,
             )
 
     def close(self) -> None:
@@ -137,7 +153,7 @@ class RedisDeadLetterStore(QueryableDeadLetterStore):
         try:
             self._redis.close()
         except Exception:
-            logger.debug("RedisDeadLetterStore.close() encountered an error closing client")
+            logger.warning("RedisDeadLetterStore.close() encountered an error closing client")
 
     # ------------------------------------------------------------------
     # QueryableDeadLetterStore ABC
@@ -179,18 +195,37 @@ class RedisDeadLetterStore(QueryableDeadLetterStore):
 
     @staticmethod
     def _parse_entry(entry_id: str, fields: dict[str, str]) -> DeadLetterEntry:
-        """Build a :class:`~message_bus.DeadLetterEntry` from raw Redis Stream fields."""
-        raw_data = fields.get("message_data", "{}")
+        """Build a :class:`~message_bus.DeadLetterEntry` from raw Redis Stream fields.
+
+        Raises
+        ------
+        ValueError
+            If a required field is absent or contains corrupt data.
+        """
+        raw_data = fields.get("message_data")
+        if raw_data is None:
+            raise ValueError(
+                f"Dead letter entry {entry_id!r} is missing required field 'message_data'"
+            )
         try:
             message_data: dict[str, Any] = json.loads(raw_data)
-        except json.JSONDecodeError:
-            message_data = {"__raw__": raw_data}
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Dead letter entry {entry_id!r} has corrupt 'message_data': {exc}"
+            ) from exc
 
-        raw_ts = fields.get("failed_at", "")
+        raw_ts = fields.get("failed_at") or ""
+        if not raw_ts:
+            raise ValueError(
+                f"Dead letter entry {entry_id!r} is missing required field 'failed_at'"
+            )
         try:
             failed_at = datetime.fromisoformat(raw_ts)
-        except ValueError:
-            failed_at = datetime.now(UTC)
+        except ValueError as exc:
+            raise ValueError(
+                f"Dead letter entry {entry_id!r} has unparseable"
+                f" 'failed_at' value {raw_ts!r}: {exc}"
+            ) from exc
 
         return DeadLetterEntry(
             id=entry_id,

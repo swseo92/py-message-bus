@@ -229,24 +229,13 @@ class TestRedisDeadLetterStore:
     # close behaviour
     # ------------------------------------------------------------------
 
-    def test_append_after_close_is_dropped(self, fake_redis: fakeredis.FakeRedis) -> None:
-        """append() after close() silently drops the record."""
-        store = RedisDeadLetterStore(
-            redis_url="redis://localhost:6379/0",
-            _redis_client=fake_redis,
-        )
+    def test_append_after_close_raises_runtime_error(self, store: RedisDeadLetterStore) -> None:
+        """append() after close() must raise RuntimeError."""
         store.append(TestEvent(value=1), ValueError("before close"), "h1")
-        assert store.count() == 1
-
         store.close()
 
-        # Verify via a fresh store pointing to the same fakeredis
-        store2 = RedisDeadLetterStore(
-            redis_url="redis://localhost:6379/0",
-            _redis_client=fake_redis,
-        )
-        store.append(TestEvent(value=2), ValueError("dropped"), "h2")
-        assert store2.count() == 1  # still 1, not 2
+        with pytest.raises(RuntimeError, match="closed"):
+            store.append(TestEvent(value=2), ValueError("after close"), "h2")
 
     def test_close_is_idempotent(self, store: RedisDeadLetterStore) -> None:
         """close() called multiple times should not raise."""
