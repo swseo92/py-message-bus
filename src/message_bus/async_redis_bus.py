@@ -6,6 +6,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import math
 import socket
 import uuid
 from collections.abc import Awaitable, Callable
@@ -300,6 +301,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         if idempotency_ttl <= 0:
             raise ValueError(f"idempotency_ttl must be a positive integer (got {idempotency_ttl})")
         self._idempotency_ttl = idempotency_ttl
+        if not (shutdown_timeout > 0 and math.isfinite(shutdown_timeout)):
+            raise ValueError(
+                f"shutdown_timeout must be a finite positive number, got {shutdown_timeout!r}"
+            )
         self._shutdown_timeout = shutdown_timeout
         self._block_ms = _block_ms
         # Injected client takes priority (used in tests with fakeredis)
@@ -565,10 +570,16 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         """
         self._running = False
         if self._consumer_tasks:
-            _, pending = await asyncio.wait(
+            done, pending = await asyncio.wait(
                 self._consumer_tasks,
                 timeout=self._shutdown_timeout,
             )
+            for task in done:
+                if not task.cancelled() and task.exception() is not None:
+                    logger.warning(
+                        "Consumer task raised an exception during shutdown: %s",
+                        task.exception(),
+                    )
             if pending:
                 logger.warning(
                     "%d consumer task(s) did not finish within %.1fs shutdown timeout; "
@@ -731,7 +742,17 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                     # Forced cancellation: cancel in-flight tasks so messages stay in PEL
                     for t in concurrent_tasks:
                         t.cancel()
-                await asyncio.gather(*concurrent_tasks, return_exceptions=True)
+                try:
+                    await asyncio.gather(*concurrent_tasks, return_exceptions=True)
+                except asyncio.CancelledError:
+                    # We are being cancelled while draining inner tasks.
+                    # Ensure every inner task is cancelled and schedule a
+                    # background drain so they are not left orphaned.
+                    for t in concurrent_tasks:
+                        if not t.done():
+                            t.cancel()
+                    asyncio.ensure_future(asyncio.gather(*concurrent_tasks, return_exceptions=True))
+                    raise
 
     async def _process_command_message(
         self,
@@ -781,6 +802,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                     await handler(msg)
             else:
                 await handler(msg)
+        except asyncio.CancelledError:
+            if ikey is not None:
+                await self._release_dedup_key(ikey, scope=stream_key)
+            raise
         except Exception:
             logger.exception("Error processing command message id=%s", message_id)
             if ikey is not None:
@@ -850,7 +875,17 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                     # Forced cancellation: cancel in-flight tasks so messages stay in PEL
                     for t in concurrent_tasks:
                         t.cancel()
-                await asyncio.gather(*concurrent_tasks, return_exceptions=True)
+                try:
+                    await asyncio.gather(*concurrent_tasks, return_exceptions=True)
+                except asyncio.CancelledError:
+                    # We are being cancelled while draining inner tasks.
+                    # Ensure every inner task is cancelled and schedule a
+                    # background drain so they are not left orphaned.
+                    for t in concurrent_tasks:
+                        if not t.done():
+                            t.cancel()
+                    asyncio.ensure_future(asyncio.gather(*concurrent_tasks, return_exceptions=True))
+                    raise
 
     async def _process_task_message(
         self,
@@ -898,6 +933,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                     await handler(msg)
             else:
                 await handler(msg)
+        except asyncio.CancelledError:
+            if ikey is not None:
+                await self._release_dedup_key(ikey, scope=stream_key)
+            raise
         except Exception:
             logger.exception("Error processing task message id=%s", message_id)
             if ikey is not None:
@@ -1243,7 +1282,12 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         error_delay = 0.1
 
         while self._running:
-            await asyncio.sleep(sleep_secs)
+            # Sleep in 100 ms chunks so shutdown is responsive even with a
+            # large claim_idle_ms interval (e.g. 30 s default).
+            remaining = sleep_secs
+            while remaining > 0 and self._running:
+                await asyncio.sleep(min(0.1, remaining))
+                remaining -= 0.1
             if not self._running:
                 return
 
