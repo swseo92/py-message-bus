@@ -15,6 +15,8 @@ from decimal import Decimal
 from typing import Any, TypeVar
 
 from message_bus.dead_letter import DeadLetterStore
+from message_bus.latency import LatencyStats
+from message_bus.metrics import BusMetricsCollector, BusMetricsSnapshot, StreamMetrics
 from message_bus.ports import (
     AsyncMessageBus,
     Command,
@@ -259,6 +261,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         "_idempotency_ttl",
         "_concurrency_config",
         "_shutdown_timeout",
+        "_metrics_collector",
+        "_latency_stats",
     )
 
     def __init__(
@@ -275,6 +279,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         max_stream_length: int = 10_000,
         idempotency_ttl: int = 86400,
         shutdown_timeout: float = 5.0,
+        metrics_collector: BusMetricsCollector | None = None,
+        latency_stats: LatencyStats | None = None,
         _block_ms: int = 100,
         _redis_client: Any | None = None,
     ) -> None:
@@ -320,6 +326,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         self._event_subscriptions: list[
             tuple[type[Event], str, Callable[[Event], Awaitable[None]]]
         ] = []
+
+        # Metrics
+        self._metrics_collector: BusMetricsCollector | None = metrics_collector
+        self._latency_stats: LatencyStats | None = latency_stats
 
         # Runtime state
         self._running = False
@@ -606,6 +616,86 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         await self.close()
 
     # ------------------------------------------------------------------
+    # Observability
+    # ------------------------------------------------------------------
+
+    async def get_metrics_snapshot(self, include_pel: bool = True) -> BusMetricsSnapshot:
+        """Collect and return a point-in-time operational metrics snapshot.
+
+        All registered message types are included in the snapshot, even when
+        no messages have been processed yet (counters will be zero).
+
+        Parameters
+        ----------
+        include_pel:
+            When ``True`` (default), query Redis for the current Pending
+            Entries List (PEL) size of each stream/group.  Set to ``False``
+            to skip Redis queries and return only in-memory counters — useful
+            for low-latency scrape endpoints or when the bus has not been
+            started yet.
+
+        Returns
+        -------
+        BusMetricsSnapshot
+            Immutable snapshot with per-stream counters, optional PEL sizes,
+            and latency percentiles from the injected
+            :class:`~message_bus.LatencyStats` (if any).
+        """
+        from datetime import UTC, datetime
+
+        stream_metrics: list[StreamMetrics] = []
+
+        # (stream_key, consumer_group, metrics_key) tuples for all registered handlers.
+        # Event subscriptions use a composite metrics_key (stream_key:group) to avoid
+        # double-counting when multiple subscriber groups share the same stream key.
+        entries: list[tuple[str, str, str]] = []
+        for cmd_type in self._command_handlers:
+            sk = self._stream_key("command", cmd_type.__name__)
+            entries.append((sk, self._consumer_group, sk))
+        for task_type in self._task_handlers:
+            sk = self._stream_key("task", task_type.__name__)
+            entries.append((sk, self._consumer_group, sk))
+        for event_type, subscriber_group, _ in self._event_subscriptions:
+            sk = self._stream_key("event", event_type.__name__)
+            entries.append((sk, subscriber_group, f"{sk}:{subscriber_group}"))
+        for query_type in self._query_handlers:
+            sk = self._stream_key("query", query_type.__name__)
+            entries.append((sk, self._consumer_group, sk))
+
+        for stream_key, group, metrics_key in entries:
+            processed, failed = (0, 0)
+            if self._metrics_collector is not None:
+                processed, failed = self._metrics_collector.get_counts(metrics_key)
+
+            pel_size = -1
+            if include_pel and self._redis is not None:
+                try:
+                    pel_info = await self._redis.xpending(stream_key, group)
+                    pel_size = int(pel_info.get("pending", 0)) if pel_info else 0
+                except Exception:
+                    pel_size = -2
+                    logger.warning("Failed to query PEL for stream=%s group=%s", stream_key, group)
+
+            stream_metrics.append(
+                StreamMetrics(
+                    stream_key=stream_key,
+                    processed_total=processed,
+                    failed_total=failed,
+                    pel_size=pel_size,
+                )
+            )
+
+        latency_percentiles = (
+            self._latency_stats.all_percentiles() if self._latency_stats is not None else []
+        )
+
+        return BusMetricsSnapshot(
+            collected_at=datetime.now(UTC),
+            streams=stream_metrics,
+            latency_percentiles=latency_percentiles,
+        )
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
@@ -784,6 +874,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             msg = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
         except Exception:
             logger.exception("Failed to deserialize command message id=%s", message_id)
+            if self._metrics_collector is not None:
+                self._metrics_collector.record_failed(stream_key)
             await self._redis.xack(stream_key, self._consumer_group, message_id)
             return
 
@@ -793,6 +885,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 type(msg).__name__,
                 message_id,
             )
+            if self._metrics_collector is not None:
+                self._metrics_collector.record_failed(stream_key)
             await self._redis.xack(stream_key, self._consumer_group, message_id)
             return
 
@@ -810,8 +904,12 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             logger.exception("Error processing command message id=%s", message_id)
             if ikey is not None:
                 await self._release_dedup_key(ikey, scope=stream_key)
+            if self._metrics_collector is not None:
+                self._metrics_collector.record_failed(stream_key)
             return  # Leave in PEL for XAUTOCLAIM retry
 
+        if self._metrics_collector is not None:
+            self._metrics_collector.record_processed(stream_key)
         await self._redis.xack(stream_key, self._consumer_group, message_id)
 
     async def _run_single_task_consumer(
@@ -915,6 +1013,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             msg = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
         except Exception:
             logger.exception("Failed to deserialize task message id=%s", message_id)
+            if self._metrics_collector is not None:
+                self._metrics_collector.record_failed(stream_key)
             await self._redis.xack(stream_key, self._consumer_group, message_id)
             return
 
@@ -924,6 +1024,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 type(msg).__name__,
                 message_id,
             )
+            if self._metrics_collector is not None:
+                self._metrics_collector.record_failed(stream_key)
             await self._redis.xack(stream_key, self._consumer_group, message_id)
             return
 
@@ -941,8 +1043,12 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             logger.exception("Error processing task message id=%s", message_id)
             if ikey is not None:
                 await self._release_dedup_key(ikey, scope=stream_key)
+            if self._metrics_collector is not None:
+                self._metrics_collector.record_failed(stream_key)
             return  # Leave in PEL for XAUTOCLAIM retry
 
+        if self._metrics_collector is not None:
+            self._metrics_collector.record_processed(stream_key)
         await self._redis.xack(stream_key, self._consumer_group, message_id)
 
     async def _handle_command_task_batch(self, stream_str: str, batch: list[Any]) -> None:
@@ -986,7 +1092,11 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                         except Exception:
                             if ikey is not None:
                                 await self._release_dedup_key(ikey, scope=stream_str)
+                            if self._metrics_collector is not None:
+                                self._metrics_collector.record_failed(stream_str)
                             raise
+                        if self._metrics_collector is not None:
+                            self._metrics_collector.record_processed(stream_str)
                         await self._redis.xack(stream_str, self._consumer_group, message_id)
                     else:
                         if ikey is not None:
@@ -1003,7 +1113,11 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                         except Exception:
                             if ikey is not None:
                                 await self._release_dedup_key(ikey, scope=stream_str)
+                            if self._metrics_collector is not None:
+                                self._metrics_collector.record_failed(stream_str)
                             raise
+                        if self._metrics_collector is not None:
+                            self._metrics_collector.record_processed(stream_str)
                         await self._redis.xack(stream_str, self._consumer_group, message_id)
                     else:
                         if ikey is not None:
@@ -1090,12 +1204,24 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                             await self._release_dedup_key(
                                                 evt_ikey, scope=subscriber_group
                                             )
+                                        if self._metrics_collector is not None:
+                                            self._metrics_collector.record_failed(
+                                                f"{stream_key}:{subscriber_group}"
+                                            )
                                         raise
+                                    if self._metrics_collector is not None:
+                                        self._metrics_collector.record_processed(
+                                            f"{stream_key}:{subscriber_group}"
+                                        )
                                     await self._redis.xack(stream_key, subscriber_group, message_id)
                                 else:
                                     if evt_ikey is not None:
                                         await self._release_dedup_key(
                                             evt_ikey, scope=subscriber_group
+                                        )
+                                    if self._metrics_collector is not None:
+                                        self._metrics_collector.record_failed(
+                                            f"{stream_key}:{subscriber_group}"
                                         )
                                     logger.warning(
                                         "Received non-Event payload (type=%s); skipping id=%s",
@@ -1205,6 +1331,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 if isinstance(msg, Query):
                     handler = self._query_handlers.get(type(msg))
                     if handler is not None:
+                        _handler_ok = False
                         try:
                             result = await handler(msg)
                             result_data = self._serializer.dumps(result)
@@ -1214,6 +1341,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                 maxlen=self._max_stream_length,
                                 approximate=True,
                             )
+                            _handler_ok = True
                         except Exception as exc:
                             logger.warning(
                                 "Query handler %s raised %s (reply_stream=%s): %s",
@@ -1222,9 +1350,13 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                 reply_stream,
                                 exc,
                             )
+                            if self._metrics_collector is not None:
+                                self._metrics_collector.record_failed(stream_str)
                             await self._send_error_reply(reply_stream, type(exc).__name__, str(exc))
                         finally:
                             await self._redis.expire(reply_stream, self._REPLY_STREAM_TTL_SECONDS)
+                        if _handler_ok and self._metrics_collector is not None:
+                            self._metrics_collector.record_processed(stream_str)
                         await self._redis.xack(stream_str, self._consumer_group, message_id)
                     else:
                         logger.warning(
@@ -1479,6 +1611,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 )
                 if reprocess_ikey is not None:
                     await self._release_dedup_key(reprocess_ikey, scope=group)
+                if self._metrics_collector is not None:
+                    self._metrics_collector.record_failed(f"{stream_key}:{group}")
                 await self._redis.xack(stream_key, group, message_id)
                 return
             try:
@@ -1486,7 +1620,11 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             except Exception:
                 if reprocess_ikey is not None:
                     await self._release_dedup_key(reprocess_ikey, scope=group)
+                if self._metrics_collector is not None:
+                    self._metrics_collector.record_failed(f"{stream_key}:{group}")
                 raise
+            if self._metrics_collector is not None:
+                self._metrics_collector.record_processed(f"{stream_key}:{group}")
             await self._redis.xack(stream_key, group, message_id)
         except Exception:
             logger.exception("Error reprocessing claimed event message id=%s", message_id)
