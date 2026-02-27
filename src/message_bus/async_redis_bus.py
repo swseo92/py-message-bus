@@ -13,6 +13,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, TypeVar
 
+from message_bus.dead_letter import DeadLetterStore
 from message_bus.ports import (
     AsyncMessageBus,
     Command,
@@ -24,6 +25,20 @@ from message_bus.ports import (
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+class MaxRetriesExceededError(Exception):
+    """Raised when a message exceeds the maximum number of delivery attempts."""
+
+    def __init__(self, message_id: str, delivery_count: int, max_retry: int) -> None:
+        super().__init__(
+            f"Message {message_id} exceeded max retries "
+            f"(delivery_count={delivery_count}, max_retry={max_retry})"
+        )
+        self.message_id = message_id
+        self.delivery_count = delivery_count
+        self.max_retry = max_retry
+
 
 try:
     import redis.asyncio as aioredis
@@ -236,6 +251,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         "_event_subscriptions",
         "_query_handlers",
         "_query_reply_timeout",
+        "_max_retry",
+        "_claim_idle_ms",
+        "_dead_letter_store",
     )
 
     def __init__(
@@ -246,6 +264,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         serializer: AsyncJsonSerializer | None = None,
         consumer_name: str | None = None,
         query_reply_timeout: float = 30.0,
+        max_retry: int = 3,
+        claim_idle_ms: int = 30_000,
+        dead_letter_store: DeadLetterStore | None = None,
         _block_ms: int = 100,
         _redis_client: Any | None = None,
     ) -> None:
@@ -261,6 +282,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         self._consumer_name: str = consumer_name or (
             f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
         )
+        self._max_retry = max_retry
+        self._claim_idle_ms = claim_idle_ms
+        self._dead_letter_store: DeadLetterStore | None = dead_letter_store
         self._block_ms = _block_ms
         # Injected client takes priority (used in tests with fakeredis)
         self._redis: Any = _redis_client
@@ -436,8 +460,17 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         self._running = True
 
         # Single consumer loop for all commands and tasks
-        if self._command_handlers or self._task_handlers:
+        command_task_streams: list[str] = [
+            self._stream_key("command", t.__name__) for t in self._command_handlers
+        ] + [self._stream_key("task", t.__name__) for t in self._task_handlers]
+
+        if command_task_streams:
             self._consumer_tasks.append(asyncio.create_task(self._run_command_task_consumer()))
+            self._consumer_tasks.append(
+                asyncio.create_task(
+                    self._run_xautoclaim_loop(command_task_streams, self._consumer_group)
+                )
+            )
 
         # Single consumer loop for all queries (competitive consumption + reply)
         if self._query_handlers:
@@ -448,6 +481,11 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             stream_key = self._stream_key("event", event_type.__name__)
             self._consumer_tasks.append(
                 asyncio.create_task(self._run_event_consumer(stream_key, subscriber_group, handler))
+            )
+            self._consumer_tasks.append(
+                asyncio.create_task(
+                    self._run_xautoclaim_loop([stream_key], subscriber_group, event_handler=handler)
+                )
             )
 
     async def close(self) -> None:
@@ -771,6 +809,201 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 error_message,
                 e,
             )
+
+    async def _run_xautoclaim_loop(
+        self,
+        streams: list[str],
+        group: str,
+        event_handler: Callable[[Event], Awaitable[None]] | None = None,
+    ) -> None:
+        """Claim idle messages via XAUTOCLAIM; route to DLQ when max_retry exceeded."""
+        next_ids: dict[str, str] = dict.fromkeys(streams, "0-0")
+        sleep_secs = max(0.05, self._claim_idle_ms / 1000)
+        error_delay = 0.1
+
+        while self._running:
+            await asyncio.sleep(sleep_secs)
+            if not self._running:
+                return
+
+            for stream_key in streams:
+                try:
+                    result = await self._redis.xautoclaim(
+                        name=stream_key,
+                        groupname=group,
+                        consumername=self._consumer_name,
+                        min_idle_time=self._claim_idle_ms,
+                        start_id=next_ids[stream_key],
+                        count=10,
+                    )
+                    next_id_raw = result[0]
+                    claimed = result[1]
+                    next_ids[stream_key] = (
+                        next_id_raw.decode() if isinstance(next_id_raw, bytes) else str(next_id_raw)
+                    )
+
+                    if not claimed:
+                        next_ids[stream_key] = "0-0"
+                        continue
+
+                    # Fetch delivery counts for all claimed messages from PEL.
+                    # Use a large count to avoid undercount when PEL has many entries.
+                    pending = await self._redis.xpending_range(
+                        name=stream_key,
+                        groupname=group,
+                        min="-",
+                        max="+",
+                        count=10_000,
+                    )
+                    delivery_counts: dict[bytes, int] = {}
+                    for p in pending:
+                        mid = p["message_id"]
+                        if not isinstance(mid, bytes):
+                            mid = mid.encode()
+                        delivery_counts[mid] = int(p["times_delivered"])
+
+                    for message_id, fields in claimed:
+                        mid_bytes = (
+                            message_id if isinstance(message_id, bytes) else message_id.encode()
+                        )
+                        delivery_count = delivery_counts.get(mid_bytes, 1)
+
+                        if self._dead_letter_store is not None and delivery_count > self._max_retry:
+                            await self._send_to_dead_letter(
+                                stream_key, group, message_id, fields, delivery_count
+                            )
+                        elif event_handler is not None:
+                            await self._reprocess_event_message(
+                                stream_key, group, message_id, fields, event_handler
+                            )
+                        else:
+                            await self._handle_command_task_batch(
+                                stream_key, [(message_id, fields)]
+                            )
+
+                    error_delay = 0.1  # Reset on success
+                except asyncio.CancelledError:
+                    return
+                except RedisResponseError as e:
+                    if "NOGROUP" in str(e):
+                        # Consumer group not yet created; wait for main consumer to initialise.
+                        await asyncio.sleep(min(sleep_secs, 1.0))
+                    else:
+                        logger.exception(
+                            "XAUTOCLAIM Redis error for stream=%s group=%s", stream_key, group
+                        )
+                        await asyncio.sleep(error_delay)
+                        error_delay = min(error_delay * 2, 30.0)
+                except (RedisConnectionError, RedisTimeoutError):
+                    logger.warning(
+                        "Redis connection error in XAUTOCLAIM loop "
+                        "for stream=%s, retrying in %.1fs",
+                        stream_key,
+                        error_delay,
+                    )
+                    await asyncio.sleep(error_delay)
+                    error_delay = min(error_delay * 2, 30.0)
+                    await self._reconnect()
+                except Exception:
+                    logger.exception(
+                        "XAUTOCLAIM unexpected error for stream=%s group=%s consumer=%s",
+                        stream_key,
+                        group,
+                        self._consumer_name,
+                    )
+                    await asyncio.sleep(error_delay)
+                    error_delay = min(error_delay * 2, 30.0)
+
+    async def _send_to_dead_letter(
+        self,
+        stream_key: str,
+        group: str,
+        message_id: Any,
+        fields: dict[bytes | str, Any],
+        delivery_count: int,
+    ) -> None:
+        """Deserialize message, record in dead letter store, then ACK to remove from PEL.
+
+        XACK is sent only after a successful DLQ append.  If the append fails the
+        message intentionally stays in PEL so it can be recovered manually.
+        """
+        msg_id_str = message_id.decode() if isinstance(message_id, bytes) else str(message_id)
+
+        raw = fields.get(b"data") or fields.get("data")
+        if raw is None:
+            # Malformed message with no payload — ACK immediately to clear from PEL.
+            logger.warning(
+                "Dead letter message %s has no 'data' field; ACKing to clear from PEL",
+                msg_id_str,
+            )
+            try:
+                await self._redis.xack(stream_key, group, message_id)
+            except Exception:
+                logger.exception("Failed to ACK malformed dead letter message %s", msg_id_str)
+            return
+
+        if self._dead_letter_store is None:
+            return
+
+        try:
+            msg = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
+            error = MaxRetriesExceededError(msg_id_str, delivery_count, self._max_retry)
+            self._dead_letter_store.append(msg, error, type(msg).__name__)
+        except Exception:
+            logger.exception(
+                "Failed to record message %s to dead letter store; leaving in PEL for recovery",
+                msg_id_str,
+            )
+            return  # Do NOT ACK — leave in PEL for manual recovery.
+
+        # ACK only after the DLQ append succeeded.
+        try:
+            await self._redis.xack(stream_key, group, message_id)
+        except Exception:
+            logger.exception("Failed to ACK dead letter message %s", msg_id_str)
+            return
+
+        logger.warning(
+            "Message %s exceeded max retries (%d), routed to dead letter queue",
+            msg_id_str,
+            self._max_retry,
+        )
+
+    async def _reprocess_event_message(
+        self,
+        stream_key: str,
+        group: str,
+        message_id: Any,
+        fields: dict[bytes | str, Any],
+        handler: Callable[[Event], Awaitable[None]],
+    ) -> None:
+        """Reprocess a single claimed event message and ACK on success.
+
+        Malformed messages (missing data, wrong payload type) are ACKed immediately
+        to prevent them from being re-claimed indefinitely.
+        """
+        try:
+            raw = fields.get(b"data") or fields.get("data")
+            if raw is None:
+                logger.warning(
+                    "Claimed event message missing 'data' field; ACKing to clear from PEL id=%s",
+                    message_id,
+                )
+                await self._redis.xack(stream_key, group, message_id)
+                return
+            event = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
+            if not isinstance(event, Event):
+                logger.warning(
+                    "Claimed non-Event payload (type=%s); ACKing to clear from PEL id=%s",
+                    type(event).__name__,
+                    message_id,
+                )
+                await self._redis.xack(stream_key, group, message_id)
+                return
+            await handler(event)
+            await self._redis.xack(stream_key, group, message_id)
+        except Exception:
+            logger.exception("Error reprocessing claimed event message id=%s", message_id)
 
     async def _reconnect(self) -> None:
         """Replace the Redis client after a connection failure."""
