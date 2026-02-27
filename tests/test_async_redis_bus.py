@@ -1578,3 +1578,97 @@ class TestHOLBlockingFix:
 
         assert completed == 4
         assert max_concurrent <= 2, f"concurrency=2 must cap at 2, got {max_concurrent}"
+
+
+# ---------------------------------------------------------------------------
+# Malformed payload handling tests
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedPayloadHandling:
+    """Poison-message 방지: malformed 페이로드가 ACK 처리되어 재전달 루프가 없음을 검증."""
+
+    @pytest.mark.asyncio
+    async def test_missing_data_field_is_acked_and_handler_not_called(
+        self, fake_redis_server, serializer
+    ):
+        """'data' 필드가 없는 메시지는 ACK되고 핸들러가 호출되지 않아야 한다.
+
+        재전달 루프(poison-message)를 막기 위해, _process_command_message는
+        'data' 필드 누락 시 xack를 호출하고 핸들러를 건너뛴다.
+        """
+        import fakeredis
+
+        handler_called = False
+
+        async def handler(cmd: CreateOrderCommand) -> None:
+            nonlocal handler_called
+            handler_called = True
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="malformed-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        bus.register_command(CreateOrderCommand, handler)
+
+        # 컨슈머 그룹 생성 후 malformed 메시지를 직접 스트림에 주입
+        stream_key = "test:command:CreateOrderCommand"
+        await fake_redis.xgroup_create(stream_key, "malformed-test", id="0", mkstream=True)
+        await fake_redis.xadd(stream_key, {"garbage": "no_data_field"})
+
+        await bus.start()
+        await asyncio.sleep(0.3)
+        await bus.close()
+
+        # 핸들러가 호출되지 않아야 함
+        assert not handler_called, "Handler must not be called for message missing 'data' field"
+
+        # PEL에 미처리 메시지가 없어야 함 (ACK된 상태)
+        pending = await fake_redis.xpending(stream_key, "malformed-test")
+        assert pending["pending"] == 0, (
+            f"Malformed message must be ACKed (pending count should be 0, got {pending['pending']})"
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_data_field_in_task_is_acked(self, fake_redis_server, serializer):
+        """Task 스트림에서도 'data' 필드 누락 시 ACK되어 재전달 루프가 없어야 한다."""
+        import fakeredis
+
+        handler_called = False
+
+        async def task_handler(t: ProcessPaymentTask) -> None:
+            nonlocal handler_called
+            handler_called = True
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="malformed-task-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        bus.register_task(ProcessPaymentTask, task_handler)
+
+        stream_key = "test:task:ProcessPaymentTask"
+        await fake_redis.xgroup_create(stream_key, "malformed-task-test", id="0", mkstream=True)
+        await fake_redis.xadd(stream_key, {"no_data": "missing"})
+
+        await bus.start()
+        await asyncio.sleep(0.3)
+        await bus.close()
+
+        assert not handler_called, "Handler must not be called for task message missing 'data' field"
+
+        pending = await fake_redis.xpending(stream_key, "malformed-task-test")
+        assert pending["pending"] == 0, (
+            f"Malformed task message must be ACKed (pending={pending['pending']})"
+        )
