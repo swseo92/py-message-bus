@@ -13,9 +13,17 @@ pytest.importorskip("fakeredis")
 
 import fakeredis.aioredis  # noqa: E402
 
-from message_bus import AsyncRedisMessageBus, LatencyStats
-from message_bus.metrics import BusMetricsCollector, BusMetricsSnapshot, StreamMetrics
-from message_bus.ports import Command, Event, Query, Task
+from message_bus import (
+    AsyncRedisMessageBus,
+    BusMetricsCollector,
+    BusMetricsSnapshot,
+    Command,
+    Event,
+    LatencyStats,
+    Query,
+    StreamMetrics,
+    Task,
+)
 
 # ---------------------------------------------------------------------------
 # Test message types
@@ -303,8 +311,11 @@ async def test_processed_counter_increments_on_event_success(
             await asyncio.sleep(0)
         await asyncio.sleep(0.05)
 
-    stream_key = "message_bus:event:MetricEvent"
-    processed, failed = metrics_collector.get_counts(stream_key)
+    # Event metrics use a composite key (stream_key:subscriber_group) to avoid
+    # double-counting when multiple subscriber groups share the same stream key.
+    subscriber_group = "test-group:evt:MetricEvent:0"
+    metrics_key = f"message_bus:event:MetricEvent:{subscriber_group}"
+    processed, failed = metrics_collector.get_counts(metrics_key)
     assert processed == 1
     assert failed == 0
 
@@ -326,8 +337,9 @@ async def test_failed_counter_increments_on_event_failure(
             await asyncio.sleep(0)
         await asyncio.sleep(0.05)
 
-    stream_key = "message_bus:event:MetricEvent"
-    processed, failed = metrics_collector.get_counts(stream_key)
+    subscriber_group = "test-group:evt:MetricEvent:0"
+    metrics_key = f"message_bus:event:MetricEvent:{subscriber_group}"
+    processed, failed = metrics_collector.get_counts(metrics_key)
     assert processed == 0
     assert failed == 1
 

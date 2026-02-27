@@ -84,9 +84,10 @@ class StreamMetrics:
     pel_size: int
     """Current Pending Entries List (PEL) size queried from Redis.
 
-    ``-1`` when PEL was not queried (``include_pel=False`` passed to
-    :meth:`~message_bus.AsyncRedisMessageBus.get_metrics_snapshot`, or the
-    Redis query failed).  A non-zero value indicates un-ACKed messages
+    ``-1`` when PEL was not requested (``include_pel=False`` passed to
+    :meth:`~message_bus.AsyncRedisMessageBus.get_metrics_snapshot`).
+    ``-2`` when the PEL query failed (Redis error); a warning is logged.
+    A non-negative value indicates the number of un-ACKed messages
     awaiting retry or DLQ routing.
     """
 
@@ -127,7 +128,8 @@ class BusMetricsSnapshot:
     def total_pel_size(self) -> int:
         """Sum of non-negative :attr:`StreamMetrics.pel_size` across all streams.
 
-        Returns ``0`` when PEL was not queried (all sizes are ``-1``).
+        Returns ``0`` when PEL was not queried (all sizes are ``-1``) or
+        when all PEL queries failed (all sizes are ``-2``).
         """
         return sum(s.pel_size for s in self.streams if s.pel_size >= 0)
 
