@@ -138,10 +138,13 @@ try:
     from message_bus.async_redis_bus import (  # noqa: F401
         AsyncJsonSerializer,
         AsyncRedisMessageBus,
+        MaxRetriesExceededError,
         TypeRegistry,
     )
 
-    __all__.extend(["AsyncRedisMessageBus", "AsyncJsonSerializer", "TypeRegistry"])
+    __all__.extend(
+        ["AsyncRedisMessageBus", "AsyncJsonSerializer", "TypeRegistry", "MaxRetriesExceededError"]
+    )
 except ImportError:
     import warnings
 

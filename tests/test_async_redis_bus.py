@@ -726,3 +726,169 @@ class TestAsyncRedisMessageBusLifecycle:
         assert bus._stream_key("command", "FooCmd") == "test:command:FooCmd"
         assert bus._stream_key("event", "BarEvt") == "test:event:BarEvt"
         assert bus._stream_key("task", "BazTask") == "test:task:BazTask"
+
+
+# ---------------------------------------------------------------------------
+# AsyncRedisMessageBus – XAUTOCLAIM + max_retry + DeadLetter tests
+# ---------------------------------------------------------------------------
+
+
+class TestAsyncRedisMessageBusXAutoclaim:
+    def test_constructor_exposes_max_retry_and_claim_idle_ms(self, serializer, fake_redis):
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="grp",
+            serializer=serializer,
+            max_retry=5,
+            claim_idle_ms=10_000,
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        assert bus._max_retry == 5
+        assert bus._claim_idle_ms == 10_000
+
+    def test_default_max_retry_and_claim_idle_ms(self, serializer, fake_redis):
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="grp",
+            serializer=serializer,
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        assert bus._max_retry == 3
+        assert bus._claim_idle_ms == 30_000
+
+    @pytest.mark.asyncio
+    async def test_xautoclaim_routes_command_to_dead_letter_on_max_retry_exceeded(
+        self, fake_redis_server, serializer
+    ):
+        """Command that always fails is routed to DLQ when delivery_count > max_retry."""
+        import fakeredis
+
+        from message_bus.dead_letter import MemoryDeadLetterStore
+
+        dlq = MemoryDeadLetterStore()
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-dlq-group",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            max_retry=1,
+            claim_idle_ms=50,
+            dead_letter_store=dlq,
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+
+        received: list[CreateOrderCommand] = []
+
+        async def always_fails(cmd: CreateOrderCommand) -> None:
+            received.append(cmd)
+            raise RuntimeError("Simulated handler failure")
+
+        bus.register_command(CreateOrderCommand, always_fails)
+        await bus.start()
+
+        cmd = CreateOrderCommand(order_id="dlq-1", amount=Decimal("42.00"))
+        await bus.execute(cmd)
+
+        # Wait for initial delivery + XAUTOCLAIM cycle
+        await asyncio.sleep(0.6)
+
+        await bus.close()
+
+        # Message must have been attempted at least once
+        assert len(received) >= 1, "Handler should have been called at least once"
+        # After max_retry exceeded, message should be in DLQ
+        assert len(dlq.records) == 1, "Exactly one DLQ record expected"
+        assert dlq.records[0].message == cmd
+        assert "exceeded max retries" in str(dlq.records[0].error).lower()
+
+    @pytest.mark.asyncio
+    async def test_xautoclaim_does_not_route_to_dlq_without_dead_letter_store(
+        self, fake_redis_server, serializer
+    ):
+        """Without dead_letter_store configured, messages are only retried (no DLQ)."""
+        import fakeredis
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-nodlq-group",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            max_retry=1,
+            claim_idle_ms=50,
+            dead_letter_store=None,
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+
+        call_count = 0
+
+        async def counting_handler(cmd: CreateOrderCommand) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("First attempt fails")
+            # Second attempt succeeds
+
+        bus.register_command(CreateOrderCommand, counting_handler)
+        await bus.start()
+
+        cmd = CreateOrderCommand(order_id="retry-1", amount=Decimal("10.00"))
+        await bus.execute(cmd)
+
+        await asyncio.sleep(0.6)
+        await bus.close()
+
+        # Handler should have been called at least twice (initial + retry)
+        assert call_count >= 2
+
+    @pytest.mark.asyncio
+    async def test_xautoclaim_routes_event_to_dead_letter_on_max_retry_exceeded(
+        self, fake_redis_server, serializer
+    ):
+        """Event that always fails is routed to DLQ when delivery_count > max_retry."""
+        import fakeredis
+
+        from message_bus.dead_letter import MemoryDeadLetterStore
+
+        dlq = MemoryDeadLetterStore()
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-evt-dlq",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            max_retry=1,
+            claim_idle_ms=50,
+            dead_letter_store=dlq,
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+
+        received: list[OrderCreatedEvent] = []
+
+        async def failing_handler(evt: OrderCreatedEvent) -> None:
+            received.append(evt)
+            raise RuntimeError("Event handler failure")
+
+        bus.subscribe(OrderCreatedEvent, failing_handler)
+        await bus.start()
+
+        evt = OrderCreatedEvent(order_id="evt-dlq-1", created_at=datetime(2026, 2, 27, tzinfo=UTC))
+        await bus.publish(evt)
+
+        await asyncio.sleep(0.6)
+        await bus.close()
+
+        assert len(received) >= 1, "Handler should have been called at least once"
+        assert len(dlq.records) == 1, "Exactly one DLQ record expected"
+        assert dlq.records[0].message == evt
