@@ -1092,14 +1092,16 @@ class TestAsyncRedisMessageBusXAutoclaim:
 
         bus.register_query(GetOrderQuery, handler)
         await bus.start()
-
-        # Verify: only _run_query_consumer task is spawned (no xautoclaim task)
-        # Command/Event buses spawn 2 tasks per stream (consumer + xautoclaim).
-        # A Query-only bus must spawn exactly 1 task (query consumer, no xautoclaim).
-        assert len(bus._consumer_tasks) == 1, (
-            "Query-only bus must spawn exactly 1 background task "
-            "(no XAUTOCLAIM loop for query streams)"
-        )
+        try:
+            # Verify: only _run_query_consumer task is spawned (no xautoclaim task)
+            # Command/Event buses spawn 2 tasks per stream (consumer + xautoclaim).
+            # A Query-only bus must spawn exactly 1 task (query consumer, no xautoclaim).
+            assert len(bus._consumer_tasks) == 1, (
+                "Query-only bus must spawn exactly 1 background task "
+                "(no XAUTOCLAIM loop for query streams)"
+            )
+        finally:
+            await bus.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1240,3 +1242,30 @@ class TestMaxStreamLength:
         reply_stream_calls = [c for c in xadd_calls if "reply" in c["name"]]
         assert len(reply_stream_calls) >= 1
         assert reply_stream_calls[0]["kwargs"].get("maxlen") == 666
+
+    def test_invalid_max_stream_length_raises(self, serializer, fake_redis):
+        """max_stream_length <= 0 must raise ValueError at construction time (fail-fast)."""
+        with pytest.raises(ValueError, match="max_stream_length must be a positive integer"):
+            self._make_bus(serializer, fake_redis, max_stream_length=0)
+
+        with pytest.raises(ValueError, match="max_stream_length must be a positive integer"):
+            self._make_bus(serializer, fake_redis, max_stream_length=-1)
+
+    @pytest.mark.asyncio
+    async def test_send_error_reply_failure_is_logged_as_exception(
+        self, serializer, fake_redis, caplog
+    ):
+        """When _send_error_reply XADD fails, it must log at ERROR level (not silently swallow)."""
+        import logging
+
+        bus = self._make_bus(serializer, fake_redis)
+
+        async def always_fail(*args, **kwargs):
+            raise OSError("Redis connection lost")
+
+        fake_redis.xadd = always_fail
+
+        with caplog.at_level(logging.ERROR):
+            await bus._send_error_reply("test:reply:stream", "ValueError", "some error")
+
+        assert any("test:reply:stream" in r.message for r in caplog.records)

@@ -277,6 +277,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 "redis package is required for AsyncRedisMessageBus. "
                 "Install with: pip install 'redis>=5.0.0'"
             )
+        if max_stream_length <= 0:
+            raise ValueError(
+                f"max_stream_length must be a positive integer, got {max_stream_length}"
+            )
         self._redis_url = redis_url
         self._consumer_group = consumer_group
         self._app_name = app_name
@@ -815,13 +819,13 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 maxlen=self._max_stream_length,
                 approximate=True,
             )
-        except Exception as e:
-            logger.warning(
-                "Failed to write error reply to %s (%s: %s): %s",
+        except Exception:
+            logger.exception(
+                "Failed to write error reply to %s (%s: %s); "
+                "requester will receive TimeoutError instead of the original error",
                 reply_stream,
                 error_type,
                 error_message,
-                e,
             )
 
     async def _run_xautoclaim_loop(
