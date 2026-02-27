@@ -99,12 +99,14 @@ class OrderService:
 | `DeadLetterMiddleware` | 실패 추적 | 실패한 메시지 캡처, DeadLetterStore에 저장 |
 | `FakeMessageBus` | 테스팅 유틸리티 | 핸들러 없이 메시지 녹화, assertion 헬퍼 |
 | `ZmqMessageBus` + `ZmqWorker` | 멀티프로세스 | PUSH/PULL, REQ/REP, PUB/SUB 패턴, pickle 직렬화 |
-| `AsyncRedisMessageBus` | 분산 async (Redis) | Redis Streams, Command/Task 경쟁 소비, Event fan-out, 자동 재연결; Query는 미지원 (SWS2-42) |
+| `AsyncRedisMessageBus` | 분산 async (Redis) | Redis Streams, Command/Task 경쟁 소비, Event fan-out, Query correlation_id request-reply, 자동 재연결; `query_reply_timeout` 파라미터로 대기시간 설정 (기본 30.0초) |
 
 ### 에러 규칙
 
 - Query/Command/Task 중복 등록 시 `ValueError`
-- 미등록 Query/Command/Task 호출 시 `LookupError`
+- 미등록 Query/Command/Task 호출 시 `LookupError` (LocalMessageBus 계열)
+- `AsyncRedisMessageBus.send()`: 핸들러가 없으면 `TimeoutError` (분산 환경에서는 로컬 체크 불가)
+- `AsyncRedisMessageBus.send()`: 핸들러 예외는 `RuntimeError`로 전파 (error_type: error_message 형식)
 - Event는 구독자 없어도 예외 없음 (silent)
 
 ### Recording (recording.py)
