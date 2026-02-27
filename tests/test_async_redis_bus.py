@@ -1813,3 +1813,344 @@ class TestMalformedPayloadHandling:
         assert pending["pending"] == 0, (
             f"Malformed task message must be ACKed (pending={pending['pending']})"
         )
+
+
+# ---------------------------------------------------------------------------
+# SWS2-49: Reconnect consumer group recreation + NOGROUP handling
+# ---------------------------------------------------------------------------
+
+
+class TestReconnectConsumerGroupRecreation:
+    """SWS2-49: _reconnect() must recreate consumer groups after Redis failover."""
+
+    def _make_bus(self, serializer, redis_client):
+        return AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-group",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            _block_ms=0,
+            _redis_client=redis_client,
+        )
+
+    @pytest.mark.asyncio
+    async def test_ensure_all_groups_creates_command_groups(self, serializer, fake_redis):
+        """_ensure_all_groups() should create consumer groups for all command handlers."""
+        bus = self._make_bus(serializer, fake_redis)
+
+        async def handler(cmd: CreateOrderCommand) -> None:
+            pass
+
+        bus.register_command(CreateOrderCommand, handler)
+        await bus._ensure_all_groups()
+
+        stream_key = bus._stream_key("command", "CreateOrderCommand")
+        groups = await fake_redis.xinfo_groups(stream_key)
+        group_names = [
+            g["name"].decode() if isinstance(g["name"], bytes) else g["name"] for g in groups
+        ]
+        assert "test-group" in group_names
+
+        await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_ensure_all_groups_creates_event_groups(self, serializer, fake_redis):
+        """_ensure_all_groups() should create consumer groups for all event subscribers."""
+        bus = self._make_bus(serializer, fake_redis)
+
+        async def handler(evt: OrderCreatedEvent) -> None:
+            pass
+
+        bus.subscribe(OrderCreatedEvent, handler)
+        await bus._ensure_all_groups()
+
+        stream_key = bus._stream_key("event", "OrderCreatedEvent")
+        groups = await fake_redis.xinfo_groups(stream_key)
+        assert len(groups) >= 1
+
+        await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_ensure_all_groups_creates_query_groups(self, serializer, fake_redis):
+        """_ensure_all_groups() should create consumer groups for all query handlers."""
+        bus = self._make_bus(serializer, fake_redis)
+
+        async def handler(q: GetOrderQuery) -> str:
+            return f"ok:{q.order_id}"
+
+        bus.register_query(GetOrderQuery, handler)
+        await bus._ensure_all_groups()
+
+        stream_key = bus._stream_key("query", "GetOrderQuery")
+        groups = await fake_redis.xinfo_groups(stream_key)
+        group_names = [
+            g["name"].decode() if isinstance(g["name"], bytes) else g["name"] for g in groups
+        ]
+        assert "test-group" in group_names
+
+        await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_recreates_groups_on_new_connection(
+        self, serializer, fake_redis_server
+    ):
+        """After _reconnect(), consumer groups must exist on the new Redis connection."""
+        from unittest.mock import patch  # noqa: PLC0415
+
+        import fakeredis
+
+        initial_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = self._make_bus(serializer, initial_redis)
+
+        async def handler(cmd: CreateOrderCommand) -> None:
+            pass
+
+        bus.register_command(CreateOrderCommand, handler)
+        await bus.start()
+
+        # Simulate Redis failover: new master is a fresh server with no groups
+        new_server = fakeredis.FakeServer()
+        new_redis = fakeredis.aioredis.FakeRedis(server=new_server)
+
+        with patch("message_bus.async_redis_bus.aioredis.from_url", return_value=new_redis):
+            await bus._reconnect()
+
+        stream_key = bus._stream_key("command", "CreateOrderCommand")
+        groups = await new_redis.xinfo_groups(stream_key)
+        group_names = [
+            g["name"].decode() if isinstance(g["name"], bytes) else g["name"] for g in groups
+        ]
+        assert "test-group" in group_names, (
+            "Consumer group must be recreated on the new Redis connection after failover"
+        )
+
+        await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_nogroup_in_command_consumer_triggers_group_recreation(
+        self, serializer, fake_redis
+    ):
+        """NOGROUP error in command consumer loop must trigger _ensure_group calls."""
+        from redis.exceptions import ResponseError
+
+        bus = self._make_bus(serializer, fake_redis)
+
+        async def handler(cmd: CreateOrderCommand) -> None:
+            pass
+
+        bus.register_command(CreateOrderCommand, handler)
+
+        ensure_calls: list[tuple[str, str]] = []
+        original_ensure_group = bus._ensure_group
+
+        async def tracking_ensure_group(stream_key: str, group: str) -> None:
+            ensure_calls.append((stream_key, group))
+            await original_ensure_group(stream_key, group)
+
+        bus._ensure_group = tracking_ensure_group
+
+        call_count = 0
+
+        async def mock_xreadgroup(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ResponseError("NOGROUP Consumer Group 'test-group' does not exist")
+            return []
+
+        fake_redis.xreadgroup = mock_xreadgroup
+
+        await bus.start()
+        await asyncio.sleep(0.05)
+        await bus.close()
+
+        stream_key = bus._stream_key("command", "CreateOrderCommand")
+        calls_for_stream = [c for c in ensure_calls if c[0] == stream_key]
+        assert len(calls_for_stream) >= 2, (
+            f"Expected ≥2 _ensure_group calls for {stream_key} "
+            f"(startup + after NOGROUP), got {len(calls_for_stream)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_nogroup_in_event_consumer_triggers_group_recreation(
+        self, serializer, fake_redis
+    ):
+        """NOGROUP error in event consumer loop must trigger _ensure_group calls."""
+        from redis.exceptions import ResponseError
+
+        bus = self._make_bus(serializer, fake_redis)
+
+        async def handler(evt: OrderCreatedEvent) -> None:
+            pass
+
+        bus.subscribe(OrderCreatedEvent, handler)
+
+        ensure_calls: list[tuple[str, str]] = []
+        original_ensure_group = bus._ensure_group
+
+        async def tracking_ensure_group(stream_key: str, group: str) -> None:
+            ensure_calls.append((stream_key, group))
+            await original_ensure_group(stream_key, group)
+
+        bus._ensure_group = tracking_ensure_group
+
+        call_count = 0
+
+        async def mock_xreadgroup(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ResponseError("NOGROUP Consumer Group does not exist")
+            return []
+
+        fake_redis.xreadgroup = mock_xreadgroup
+
+        await bus.start()
+        await asyncio.sleep(0.05)
+        await bus.close()
+
+        stream_key = bus._stream_key("event", "OrderCreatedEvent")
+        calls_for_stream = [c for c in ensure_calls if c[0] == stream_key]
+        assert len(calls_for_stream) >= 2, (
+            f"Expected ≥2 _ensure_group calls for {stream_key} "
+            f"(startup + after NOGROUP), got {len(calls_for_stream)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_nogroup_in_query_consumer_triggers_group_recreation(
+        self, serializer, fake_redis
+    ):
+        """NOGROUP error in query consumer loop must trigger _ensure_group calls."""
+        from redis.exceptions import ResponseError
+
+        bus = self._make_bus(serializer, fake_redis)
+
+        async def handler(q: GetOrderQuery) -> str:
+            return f"ok:{q.order_id}"
+
+        bus.register_query(GetOrderQuery, handler)
+
+        ensure_calls: list[tuple[str, str]] = []
+        original_ensure_group = bus._ensure_group
+
+        async def tracking_ensure_group(stream_key: str, group: str) -> None:
+            ensure_calls.append((stream_key, group))
+            await original_ensure_group(stream_key, group)
+
+        bus._ensure_group = tracking_ensure_group
+
+        call_count = 0
+
+        async def mock_xreadgroup(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ResponseError("NOGROUP Consumer Group 'test-group' does not exist")
+            return []
+
+        fake_redis.xreadgroup = mock_xreadgroup
+
+        await bus.start()
+        await asyncio.sleep(0.05)
+        await bus.close()
+
+        stream_key = bus._stream_key("query", "GetOrderQuery")
+        calls_for_stream = [c for c in ensure_calls if c[0] == stream_key]
+        assert len(calls_for_stream) >= 2, (
+            f"Expected ≥2 _ensure_group calls for {stream_key} "
+            f"(startup + after NOGROUP), got {len(calls_for_stream)}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ensure_all_groups_creates_task_groups(self, serializer, fake_redis):
+        """_ensure_all_groups() should create consumer groups for all task handlers."""
+        bus = self._make_bus(serializer, fake_redis)
+
+        async def handler(task: ProcessPaymentTask) -> None:
+            pass
+
+        bus.register_task(ProcessPaymentTask, handler)
+        await bus._ensure_all_groups()
+
+        stream_key = bus._stream_key("task", "ProcessPaymentTask")
+        groups = await fake_redis.xinfo_groups(stream_key)
+        group_names = [
+            g["name"].decode() if isinstance(g["name"], bytes) else g["name"] for g in groups
+        ]
+        assert "test-group" in group_names
+
+        await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_non_nogroup_response_error_in_command_consumer_logs_exception(
+        self, serializer, fake_redis, caplog
+    ):
+        """Non-NOGROUP RedisResponseError must log as exception, not be swallowed."""
+        import logging
+
+        from redis.exceptions import ResponseError
+
+        bus = self._make_bus(serializer, fake_redis)
+
+        async def handler(cmd: CreateOrderCommand) -> None:
+            pass
+
+        bus.register_command(CreateOrderCommand, handler)
+
+        call_count = 0
+
+        async def mock_xreadgroup(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ResponseError("WRONGTYPE Operation against a key of the wrong type")
+            return []
+
+        fake_redis.xreadgroup = mock_xreadgroup
+
+        with caplog.at_level(logging.ERROR):
+            await bus.start()
+            await asyncio.sleep(0.05)
+            await bus.close()
+
+        assert any("Unexpected error in command consumer" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_reconnect_ensure_all_groups_failure_does_not_hide_connection(
+        self, serializer, fake_redis_server
+    ):
+        """_ensure_all_groups() failure during _reconnect() must not hide the new connection."""
+        from unittest.mock import patch  # noqa: PLC0415
+
+        import fakeredis
+
+        initial_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = self._make_bus(serializer, initial_redis)
+
+        async def handler(cmd: CreateOrderCommand) -> None:
+            pass
+
+        bus.register_command(CreateOrderCommand, handler)
+        await bus.start()
+
+        new_server = fakeredis.FakeServer()
+        new_redis = fakeredis.aioredis.FakeRedis(server=new_server)
+
+        # _ensure_all_groups will fail, but _reconnect should still set the new client
+        ensure_call_count = 0
+
+        async def failing_ensure_all_groups():
+            nonlocal ensure_call_count
+            ensure_call_count += 1
+            raise OSError("Simulated group creation failure")
+
+        with patch("message_bus.async_redis_bus.aioredis.from_url", return_value=new_redis):
+            bus._ensure_all_groups = failing_ensure_all_groups
+            await bus._reconnect()
+
+        # The new Redis client must be set despite _ensure_all_groups failing
+        assert bus._redis is new_redis
+        assert ensure_call_count == 1
+
+        await bus.close()
