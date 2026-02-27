@@ -819,6 +819,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         """Claim idle messages via XAUTOCLAIM; route to DLQ when max_retry exceeded."""
         next_ids: dict[str, str] = dict.fromkeys(streams, "0-0")
         sleep_secs = max(0.05, self._claim_idle_ms / 1000)
+        error_delay = 0.1
 
         while self._running:
             await asyncio.sleep(sleep_secs)
@@ -845,13 +846,14 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                         next_ids[stream_key] = "0-0"
                         continue
 
-                    # Fetch delivery counts for claimed messages from PEL
+                    # Fetch delivery counts for all claimed messages from PEL.
+                    # Use a large count to avoid undercount when PEL has many entries.
                     pending = await self._redis.xpending_range(
                         name=stream_key,
                         groupname=group,
                         min="-",
                         max="+",
-                        count=100,
+                        count=10_000,
                     )
                     delivery_counts: dict[bytes, int] = {}
                     for p in pending:
@@ -879,12 +881,38 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                 stream_key, [(message_id, fields)]
                             )
 
-                    if next_ids[stream_key] == "0-0":
-                        pass  # Full scan complete; reset happens on next iteration
+                    error_delay = 0.1  # Reset on success
                 except asyncio.CancelledError:
                     return
+                except RedisResponseError as e:
+                    if "NOGROUP" in str(e):
+                        # Consumer group not yet created; wait for main consumer to initialise.
+                        await asyncio.sleep(min(sleep_secs, 1.0))
+                    else:
+                        logger.exception(
+                            "XAUTOCLAIM Redis error for stream=%s group=%s", stream_key, group
+                        )
+                        await asyncio.sleep(error_delay)
+                        error_delay = min(error_delay * 2, 30.0)
+                except (RedisConnectionError, RedisTimeoutError):
+                    logger.warning(
+                        "Redis connection error in XAUTOCLAIM loop "
+                        "for stream=%s, retrying in %.1fs",
+                        stream_key,
+                        error_delay,
+                    )
+                    await asyncio.sleep(error_delay)
+                    error_delay = min(error_delay * 2, 30.0)
+                    await self._reconnect()
                 except Exception:
-                    logger.exception("XAUTOCLAIM error for stream=%s group=%s", stream_key, group)
+                    logger.exception(
+                        "XAUTOCLAIM unexpected error for stream=%s group=%s consumer=%s",
+                        stream_key,
+                        group,
+                        self._consumer_name,
+                    )
+                    await asyncio.sleep(error_delay)
+                    error_delay = min(error_delay * 2, 30.0)
 
     async def _send_to_dead_letter(
         self,
@@ -894,21 +922,47 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         fields: dict[bytes | str, Any],
         delivery_count: int,
     ) -> None:
-        """Deserialize message, record in dead letter store, and ACK to remove from PEL."""
+        """Deserialize message, record in dead letter store, then ACK to remove from PEL.
+
+        XACK is sent only after a successful DLQ append.  If the append fails the
+        message intentionally stays in PEL so it can be recovered manually.
+        """
         msg_id_str = message_id.decode() if isinstance(message_id, bytes) else str(message_id)
+
+        raw = fields.get(b"data") or fields.get("data")
+        if raw is None:
+            # Malformed message with no payload — ACK immediately to clear from PEL.
+            logger.warning(
+                "Dead letter message %s has no 'data' field; ACKing to clear from PEL",
+                msg_id_str,
+            )
+            try:
+                await self._redis.xack(stream_key, group, message_id)
+            except Exception:
+                logger.exception("Failed to ACK malformed dead letter message %s", msg_id_str)
+            return
+
+        if self._dead_letter_store is None:
+            return
+
         try:
-            raw = fields.get(b"data") or fields.get("data")
-            if raw is not None and self._dead_letter_store is not None:
-                msg = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
-                error = MaxRetriesExceededError(msg_id_str, delivery_count, self._max_retry)
-                self._dead_letter_store.append(msg, error, type(msg).__name__)
+            msg = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
+            error = MaxRetriesExceededError(msg_id_str, delivery_count, self._max_retry)
+            self._dead_letter_store.append(msg, error, type(msg).__name__)
         except Exception:
-            logger.exception("Failed to record message %s to dead letter store", msg_id_str)
-        # Always ACK to prevent infinite retry loop
+            logger.exception(
+                "Failed to record message %s to dead letter store; leaving in PEL for recovery",
+                msg_id_str,
+            )
+            return  # Do NOT ACK — leave in PEL for manual recovery.
+
+        # ACK only after the DLQ append succeeded.
         try:
             await self._redis.xack(stream_key, group, message_id)
         except Exception:
             logger.exception("Failed to ACK dead letter message %s", msg_id_str)
+            return
+
         logger.warning(
             "Message %s exceeded max retries (%d), routed to dead letter queue",
             msg_id_str,
@@ -923,24 +977,31 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         fields: dict[bytes | str, Any],
         handler: Callable[[Event], Awaitable[None]],
     ) -> None:
-        """Reprocess a single claimed event message and ACK on success."""
+        """Reprocess a single claimed event message and ACK on success.
+
+        Malformed messages (missing data, wrong payload type) are ACKed immediately
+        to prevent them from being re-claimed indefinitely.
+        """
         try:
             raw = fields.get(b"data") or fields.get("data")
             if raw is None:
                 logger.warning(
-                    "Claimed event message missing 'data' field; skipping id=%s", message_id
+                    "Claimed event message missing 'data' field; ACKing to clear from PEL id=%s",
+                    message_id,
                 )
+                await self._redis.xack(stream_key, group, message_id)
                 return
             event = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
-            if isinstance(event, Event):
-                await handler(event)
-                await self._redis.xack(stream_key, group, message_id)
-            else:
+            if not isinstance(event, Event):
                 logger.warning(
-                    "Claimed non-Event payload (type=%s); skipping id=%s",
+                    "Claimed non-Event payload (type=%s); ACKing to clear from PEL id=%s",
                     type(event).__name__,
                     message_id,
                 )
+                await self._redis.xack(stream_key, group, message_id)
+                return
+            await handler(event)
+            await self._redis.xack(stream_key, group, message_id)
         except Exception:
             logger.exception("Error reprocessing claimed event message id=%s", message_id)
 

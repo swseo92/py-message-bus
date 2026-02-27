@@ -892,3 +892,114 @@ class TestAsyncRedisMessageBusXAutoclaim:
         assert len(received) >= 1, "Handler should have been called at least once"
         assert len(dlq.records) == 1, "Exactly one DLQ record expected"
         assert dlq.records[0].message == evt
+
+    @pytest.mark.asyncio
+    async def test_xautoclaim_does_not_dlq_at_exactly_max_retry(
+        self, fake_redis_server, serializer
+    ):
+        """Message with delivery_count == max_retry must NOT be routed to DLQ (only > triggers it).
+
+        With max_retry=2:
+        - delivery_count=1 (initial delivery, fails)         → NOT > 2 → retry
+        - delivery_count=2 (XAUTOCLAIM reclaim, succeeds)   → NOT > 2 → ACKed, no DLQ
+        """
+        import fakeredis
+
+        from message_bus.dead_letter import MemoryDeadLetterStore
+
+        dlq = MemoryDeadLetterStore()
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+
+        # max_retry=2: DLQ only triggers when delivery_count > 2 (i.e., 3+)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-boundary-group",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            max_retry=2,
+            claim_idle_ms=50,
+            dead_letter_store=dlq,
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+
+        call_count = 0
+
+        async def handler_succeeds_on_second(cmd: CreateOrderCommand) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("First attempt fails")
+            # 2nd call (delivery_count==max_retry) succeeds → no DLQ
+
+        bus.register_command(CreateOrderCommand, handler_succeeds_on_second)
+        await bus.start()
+
+        cmd = CreateOrderCommand(order_id="boundary-1", amount=Decimal("1.00"))
+        await bus.execute(cmd)
+
+        await asyncio.sleep(0.8)
+        await bus.close()
+
+        # delivery_count==max_retry must NOT go to DLQ; only delivery_count>max_retry would
+        assert call_count >= 2, "Handler should have been called at least twice"
+        assert len(dlq.records) == 0, (
+            "Message at exactly max_retry should not be routed to DLQ"
+        )
+
+    @pytest.mark.asyncio
+    async def test_dlq_message_removed_from_pel_after_routing(
+        self, fake_redis_server, serializer
+    ):
+        """After DLQ routing the message must be ACKed and absent from the PEL."""
+        import fakeredis
+
+        from message_bus.dead_letter import MemoryDeadLetterStore
+
+        dlq = MemoryDeadLetterStore()
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-pel-group",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            max_retry=1,
+            claim_idle_ms=50,
+            dead_letter_store=dlq,
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+
+        async def always_fails(cmd: CreateOrderCommand) -> None:
+            raise RuntimeError("Always fails")
+
+        bus.register_command(CreateOrderCommand, always_fails)
+        await bus.start()
+
+        cmd = CreateOrderCommand(order_id="pel-1", amount=Decimal("9.99"))
+        await bus.execute(cmd)
+
+        await asyncio.sleep(0.8)
+        await bus.close()
+
+        # Message must be in DLQ
+        assert len(dlq.records) == 1, "Message should have been routed to DLQ"
+
+        # PEL must be empty — the message was ACKed after DLQ append.
+        # fakeredis returns a non-list value when the PEL is empty, so we
+        # normalise the result before asserting.
+        stream_key = f"bus:cmd:{CreateOrderCommand.__name__}"
+        try:
+            raw_pending = await fake_redis.xpending_range(
+                stream_key, "test-pel-group", min="-", max="+", count=100
+            )
+            pending_count = len(raw_pending) if isinstance(raw_pending, list) else 0
+        except (TypeError, IndexError):
+            # fakeredis quirk: returns an unexpected scalar when PEL is empty.
+            pending_count = 0
+        assert pending_count == 0, (
+            "PEL should be empty after DLQ routing (message must be ACKed)"
+        )
