@@ -133,4 +133,16 @@ try:
 except ImportError:
     pass
 
+# Optional Async Redis support
+try:
+    from message_bus.async_redis_bus import (  # noqa: F401
+        AsyncJsonSerializer,
+        AsyncRedisMessageBus,
+        TypeRegistry,
+    )
+
+    __all__.extend(["AsyncRedisMessageBus", "AsyncJsonSerializer", "TypeRegistry"])
+except ImportError:
+    pass
+
 __version__ = "0.1.0"
