@@ -9,7 +9,7 @@ import logging
 import socket
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, TypeVar
 
@@ -255,6 +255,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         "_claim_idle_ms",
         "_dead_letter_store",
         "_max_stream_length",
+        "_idempotency_ttl",
     )
 
     def __init__(
@@ -269,6 +270,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         claim_idle_ms: int = 30_000,
         dead_letter_store: DeadLetterStore | None = None,
         max_stream_length: int = 10_000,
+        idempotency_ttl: int = 86400,
         _block_ms: int = 100,
         _redis_client: Any | None = None,
     ) -> None:
@@ -292,6 +294,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         self._claim_idle_ms = claim_idle_ms
         self._dead_letter_store: DeadLetterStore | None = dead_letter_store
         self._max_stream_length = max_stream_length
+        self._idempotency_ttl = idempotency_ttl
         self._block_ms = _block_ms
         # Injected client takes priority (used in tests with fakeredis)
         self._redis: Any = _redis_client
@@ -528,12 +531,48 @@ class AsyncRedisMessageBus(AsyncMessageBus):
     def _stream_key(self, prefix: str, name: str) -> str:
         return f"{self._app_name}:{prefix}:{name}"
 
-    async def _xadd(self, stream_key: str, message: Any) -> None:
-        """Serialize *message* and append it to *stream_key*."""
+    async def _xadd(
+        self, stream_key: str, message: Any, idempotency_key: str | None = None
+    ) -> None:
+        """Serialize *message* and append it to *stream_key* with audit metadata."""
         data = self._serializer.dumps(message)
+        msg_id = uuid.uuid4().hex
         await self._redis.xadd(
-            stream_key, {"data": data}, maxlen=self._max_stream_length, approximate=True
+            stream_key,
+            {
+                "data": data,
+                "message_id": msg_id,
+                "producer_id": self._consumer_name,
+                "idempotency_key": idempotency_key or msg_id,
+                "enqueue_timestamp": datetime.now(UTC).isoformat(),
+            },
+            maxlen=self._max_stream_length,
+            approximate=True,
         )
+
+    async def _is_duplicate(self, idempotency_key: str, scope: str = "") -> bool:
+        """Return True if *idempotency_key* was already successfully processed.
+
+        Uses GET (read-only) so that failed handlers do not permanently
+        mark the key.  Call :meth:`_mark_processed` after a successful
+        handler invocation to record completion.
+
+        *scope* isolates consumer groups (e.g. different event subscribers).
+        """
+        prefix = f"{scope}:" if scope else ""
+        dedup_key = f"{self._app_name}:dedup:{prefix}{idempotency_key}"
+        return bool(await self._redis.exists(dedup_key))
+
+    async def _mark_processed(self, idempotency_key: str, scope: str = "") -> None:
+        """Persist *idempotency_key* after successful handler execution.
+
+        Must be called **after** the handler succeeds and **before** XACK so
+        that a crash between mark and ACK causes a safe re-delivery (the key
+        is present → the duplicate check skips re-execution).
+        """
+        prefix = f"{scope}:" if scope else ""
+        dedup_key = f"{self._app_name}:dedup:{prefix}{idempotency_key}"
+        await self._redis.set(dedup_key, "1", ex=self._idempotency_ttl)
 
     async def _ensure_group(self, stream_key: str, group: str) -> None:
         """Create consumer group (and stream) if they do not yet exist."""
@@ -595,12 +634,28 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 if raw is None:
                     logger.warning("Message missing 'data' field; skipping id=%s", message_id)
                     continue
+
+                ikey_raw = fields.get(b"idempotency_key") or fields.get("idempotency_key")
+                ikey: str | None = None
+                if ikey_raw is not None:
+                    ikey = ikey_raw.decode() if isinstance(ikey_raw, bytes) else ikey_raw
+                    if await self._is_duplicate(ikey, scope=stream_str):
+                        logger.info(
+                            "Skipping duplicate message (idempotency_key=%s) id=%s",
+                            ikey,
+                            message_id,
+                        )
+                        await self._redis.xack(stream_str, self._consumer_group, message_id)
+                        continue
+
                 msg = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
 
                 if ":command:" in stream_str and isinstance(msg, Command):
                     handler = self._command_handlers.get(type(msg))
                     if handler is not None:
                         await handler(msg)
+                        if ikey is not None:
+                            await self._mark_processed(ikey, scope=stream_str)
                         await self._redis.xack(stream_str, self._consumer_group, message_id)
                     else:
                         logger.warning(
@@ -611,6 +666,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                     task_handler = self._task_handlers.get(type(msg))
                     if task_handler is not None:
                         await task_handler(msg)
+                        if ikey is not None:
+                            await self._mark_processed(ikey, scope=stream_str)
                         await self._redis.xack(stream_str, self._consumer_group, message_id)
                     else:
                         logger.warning(
@@ -650,11 +707,35 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                         message_id,
                                     )
                                     continue
+
+                                ikey_raw = fields.get(b"idempotency_key") or fields.get(
+                                    "idempotency_key"
+                                )
+                                evt_ikey: str | None = None
+                                if ikey_raw is not None:
+                                    evt_ikey = (
+                                        ikey_raw.decode()
+                                        if isinstance(ikey_raw, bytes)
+                                        else ikey_raw
+                                    )
+                                    if await self._is_duplicate(evt_ikey, scope=subscriber_group):
+                                        logger.info(
+                                            "Skipping duplicate event (idempotency_key=%s) id=%s",
+                                            evt_ikey,
+                                            message_id,
+                                        )
+                                        await self._redis.xack(
+                                            stream_key, subscriber_group, message_id
+                                        )
+                                        continue
+
                                 event = self._serializer.loads(
                                     raw if isinstance(raw, bytes) else raw.encode()
                                 )
                                 if isinstance(event, Event):
                                     await handler(event)
+                                    if evt_ikey is not None:
+                                        await self._mark_processed(evt_ikey, scope=subscriber_group)
                                     await self._redis.xack(stream_key, subscriber_group, message_id)
                                 else:
                                     logger.warning(
