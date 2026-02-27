@@ -944,14 +944,10 @@ class TestAsyncRedisMessageBusXAutoclaim:
 
         # delivery_count==max_retry must NOT go to DLQ; only delivery_count>max_retry would
         assert call_count >= 2, "Handler should have been called at least twice"
-        assert len(dlq.records) == 0, (
-            "Message at exactly max_retry should not be routed to DLQ"
-        )
+        assert len(dlq.records) == 0, "Message at exactly max_retry should not be routed to DLQ"
 
     @pytest.mark.asyncio
-    async def test_dlq_message_removed_from_pel_after_routing(
-        self, fake_redis_server, serializer
-    ):
+    async def test_dlq_message_removed_from_pel_after_routing(self, fake_redis_server, serializer):
         """After DLQ routing the message must be ACKed and absent from the PEL."""
         import fakeredis
 
@@ -1000,9 +996,7 @@ class TestAsyncRedisMessageBusXAutoclaim:
         except (TypeError, IndexError):
             # fakeredis quirk: returns an unexpected scalar when PEL is empty.
             pending_count = 0
-        assert pending_count == 0, (
-            "PEL should be empty after DLQ routing (message must be ACKed)"
-        )
+        assert pending_count == 0, "PEL should be empty after DLQ routing (message must be ACKed)"
 
     @pytest.mark.asyncio
     async def test_xautoclaim_routes_task_to_dead_letter_on_max_retry_exceeded(
@@ -1062,9 +1056,7 @@ class TestAsyncRedisMessageBusXAutoclaim:
         """
         from message_bus import MaxRetriesExceededError
 
-        err = MaxRetriesExceededError(
-            message_id="msg-1", delivery_count=4, max_retry=3
-        )
+        err = MaxRetriesExceededError(message_id="msg-1", delivery_count=4, max_retry=3)
         assert isinstance(err, Exception)
         assert err.message_id == "msg-1"
         assert err.delivery_count == 4
@@ -1073,9 +1065,7 @@ class TestAsyncRedisMessageBusXAutoclaim:
         assert "4" in str(err)
 
     @pytest.mark.asyncio
-    async def test_query_stream_has_no_xautoclaim_loop(
-        self, fake_redis_server, serializer
-    ):
+    async def test_query_stream_has_no_xautoclaim_loop(self, fake_redis_server, serializer):
         """Query consumer does NOT have an XAUTOCLAIM loop (by design).
 
         Command/Task/Event streams get XAUTOCLAIM recovery. Query streams do not:
@@ -1111,4 +1101,142 @@ class TestAsyncRedisMessageBusXAutoclaim:
             "(no XAUTOCLAIM loop for query streams)"
         )
 
-        await bus.close()
+
+# ---------------------------------------------------------------------------
+# MAXLEN / OOM prevention tests  (SWS2-45)
+# ---------------------------------------------------------------------------
+
+
+class TestMaxStreamLength:
+    """XADD MAXLEN option must be applied to all streams to prevent Redis OOM."""
+
+    def _make_bus(self, serializer, fake_redis, **kwargs):
+        return AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-group",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+            **kwargs,
+        )
+
+    def test_default_max_stream_length_is_10000(self, serializer, fake_redis):
+        bus = self._make_bus(serializer, fake_redis)
+        assert bus._max_stream_length == 10_000
+
+    def test_custom_max_stream_length_is_stored(self, serializer, fake_redis):
+        bus = self._make_bus(serializer, fake_redis, max_stream_length=500)
+        assert bus._max_stream_length == 500
+
+    @pytest.mark.asyncio
+    async def test_execute_xadd_includes_maxlen(self, serializer, fake_redis):
+        """execute() must pass maxlen to Redis XADD."""
+        bus = self._make_bus(serializer, fake_redis, max_stream_length=999)
+
+        async def noop_handler(_: CreateOrderCommand) -> None:
+            pass
+
+        bus.register_command(CreateOrderCommand, noop_handler)
+
+        xadd_calls: list[dict] = []
+        original_xadd = fake_redis.xadd
+
+        async def capturing_xadd(name, fields, *args, **kwargs):
+            xadd_calls.append({"name": name, "kwargs": kwargs})
+            return await original_xadd(name, fields, *args, **kwargs)
+
+        fake_redis.xadd = capturing_xadd
+        await bus.execute(CreateOrderCommand(order_id="o1", amount=Decimal("10")))
+
+        assert len(xadd_calls) == 1
+        assert xadd_calls[0]["kwargs"].get("maxlen") == 999
+
+    @pytest.mark.asyncio
+    async def test_publish_xadd_includes_maxlen(self, serializer, fake_redis):
+        """publish() must pass maxlen to Redis XADD."""
+        bus = self._make_bus(serializer, fake_redis, max_stream_length=888)
+
+        xadd_calls: list[dict] = []
+        original_xadd = fake_redis.xadd
+
+        async def capturing_xadd(name, fields, *args, **kwargs):
+            xadd_calls.append({"name": name, "kwargs": kwargs})
+            return await original_xadd(name, fields, *args, **kwargs)
+
+        fake_redis.xadd = capturing_xadd
+        await bus.publish(OrderCreatedEvent(order_id="e1", created_at=datetime.now(UTC)))
+
+        assert len(xadd_calls) == 1
+        assert xadd_calls[0]["kwargs"].get("maxlen") == 888
+
+    @pytest.mark.asyncio
+    async def test_send_query_stream_xadd_includes_maxlen(self, serializer, fake_redis_server):
+        """send() query stream XADD must pass maxlen."""
+        import fakeredis
+
+        producer_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        consumer_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+
+        producer = self._make_bus(serializer, producer_redis, max_stream_length=777)
+        consumer = self._make_bus(serializer, consumer_redis)
+
+        async def handler(q: GetOrderQuery) -> str:
+            return f"ok:{q.order_id}"
+
+        consumer.register_query(GetOrderQuery, handler)
+
+        xadd_calls: list[dict] = []
+        original_xadd = producer_redis.xadd
+
+        async def capturing_xadd(name, fields, *args, **kwargs):
+            xadd_calls.append({"name": name, "kwargs": kwargs})
+            return await original_xadd(name, fields, *args, **kwargs)
+
+        producer_redis.xadd = capturing_xadd
+
+        await consumer.start()
+        try:
+            await producer.send(GetOrderQuery(order_id="q1"))
+        finally:
+            await consumer.close()
+
+        query_stream_calls = [c for c in xadd_calls if "query" in c["name"]]
+        assert len(query_stream_calls) >= 1
+        assert query_stream_calls[0]["kwargs"].get("maxlen") == 777
+
+    @pytest.mark.asyncio
+    async def test_reply_stream_xadd_includes_maxlen(self, serializer, fake_redis_server):
+        """Reply stream XADD (query result) must pass maxlen."""
+        import fakeredis
+
+        producer_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        consumer_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+
+        producer = self._make_bus(serializer, producer_redis)
+        consumer = self._make_bus(serializer, consumer_redis, max_stream_length=666)
+
+        async def handler(q: GetOrderQuery) -> str:
+            return f"ok:{q.order_id}"
+
+        consumer.register_query(GetOrderQuery, handler)
+
+        xadd_calls: list[dict] = []
+        original_xadd = consumer_redis.xadd
+
+        async def capturing_xadd(name, fields, *args, **kwargs):
+            xadd_calls.append({"name": name, "kwargs": kwargs})
+            return await original_xadd(name, fields, *args, **kwargs)
+
+        consumer_redis.xadd = capturing_xadd
+
+        await consumer.start()
+        try:
+            await producer.send(GetOrderQuery(order_id="q1"))
+        finally:
+            await consumer.close()
+
+        reply_stream_calls = [c for c in xadd_calls if "reply" in c["name"]]
+        assert len(reply_stream_calls) >= 1
+        assert reply_stream_calls[0]["kwargs"].get("maxlen") == 666
