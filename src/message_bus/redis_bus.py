@@ -88,7 +88,10 @@ def _fields_for_xadd(fields: dict[bytes, bytes]) -> dict[str, str]:
     result: dict[str, str] = {}
     for k, v in fields.items():
         if isinstance(k, bytes):
-            str_key = k.decode("utf-8")
+            try:
+                str_key = k.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"Cannot decode key: {exc}") from exc
         elif isinstance(k, str):
             str_key = k
         else:
@@ -504,7 +507,7 @@ class RedisMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher, Handler
         """Dispatch a task to one worker."""
         stream_key = self._stream_key("task", type(task).__name__)
         fields = _serialize_message(task, self._serializer)
-        self._redis.xadd(stream_key, fields)  # type: ignore[arg-type]
+        self._redis.xadd(stream_key, _fields_for_xadd(fields))
 
     def close(self) -> None:
         """Close connections and stop workers."""

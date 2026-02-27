@@ -392,6 +392,11 @@ class TestFieldsForXadd:
         with pytest.raises(ValueError, match="Cannot decode value for key"):
             _fields_for_xadd({b"key": invalid_utf8})
 
+    def test_invalid_utf8_bytes_key_raises_value_error(self) -> None:
+        invalid_utf8_key = b"\xff\xfe"
+        with pytest.raises(ValueError, match="Cannot decode key"):
+            _fields_for_xadd({invalid_utf8_key: b"value"})
+
     def test_empty_dict_returns_empty_dict(self) -> None:
         assert _fields_for_xadd({}) == {}
 
@@ -421,3 +426,31 @@ class TestFieldsForXaddCallShape:
         for k, v in result.items():
             assert isinstance(k, str), f"Key {k!r} is not str"
             assert isinstance(v, str), f"Value {v!r} is not str"
+
+    def test_dispatch_passes_str_fields_to_xadd(self) -> None:
+        """dispatch() must pass str fields (via _fields_for_xadd) to Redis xadd."""
+        from unittest.mock import MagicMock, patch
+
+        from message_bus.redis_bus import JsonSerializer, RedisMessageBus
+
+        @dataclass(frozen=True)
+        class _Task(Task):
+            value: int
+
+        mock_client = MagicMock()
+        with patch("message_bus.redis_bus.Redis") as mock_redis_cls:
+            mock_redis_cls.from_url.return_value = mock_client
+
+            bus = RedisMessageBus(
+                redis_url="redis://localhost:6379/0",
+                app_name="test",
+                serializer=JsonSerializer(),
+            )
+            bus.dispatch(_Task(value=99))
+
+        assert mock_client.xadd.called
+        call_args = mock_client.xadd.call_args[0]
+        fields_arg = call_args[1]
+        for k, v in fields_arg.items():
+            assert isinstance(k, str), f"xadd key {k!r} is not str"
+            assert isinstance(v, str), f"xadd value {v!r} is not str"
