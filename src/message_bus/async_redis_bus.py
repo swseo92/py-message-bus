@@ -443,12 +443,17 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                 return self._serializer.loads(  # type: ignore[no-any-return]
                                     raw if isinstance(raw, bytes) else raw.encode()
                                 )
+                            raise RuntimeError(
+                                f"Malformed reply envelope on stream {reply_stream!r}: "
+                                f"missing 'data' and 'error_type' "
+                                f"(id={msg_id!r}, keys={list(fields.keys())!r})"
+                            )
                 elif self._block_ms == 0:
                     await asyncio.sleep(0)  # yield to event loop in non-blocking mode
         finally:
             try:
                 await self._redis.delete(reply_stream)
-            except Exception as e:
+            except (RedisConnectionError, RedisTimeoutError, RedisResponseError, OSError) as e:
                 logger.warning("Failed to delete reply stream %s: %s", reply_stream, e)
 
     async def execute(self, command: Command) -> None:

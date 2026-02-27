@@ -720,10 +720,10 @@ class TestAsyncRedisMessageBusQuery:
             await bus.close()
 
     @pytest.mark.asyncio
-    async def test_send_query_last_id_not_reset_to_origin_after_empty_read(
+    async def test_send_query_last_id_advances_after_malformed_envelope(
         self, fake_redis_server, serializer
     ):
-        """send() must track last_id and not always re-read from '0-0'."""
+        """send() raises RuntimeError on malformed envelope and starts cursor at '0-0'."""
         from unittest.mock import patch  # noqa: PLC0415
 
         import fakeredis
@@ -737,33 +737,83 @@ class TestAsyncRedisMessageBusQuery:
             consumer_name="caller",
             _block_ms=0,
             _redis_client=client,
-            query_reply_timeout=0.15,
+            query_reply_timeout=0.5,
         )
         await bus.start()
 
         call_ids: list[str] = []
+        malformed_msg_id = "1700000000000-0"
+        call_count = [0]
 
         async def spy_xread(streams, count=None, block=None):
             for k, stream_id in streams.items():
                 if "reply" in str(k):
                     call_ids.append(stream_id if isinstance(stream_id, str) else stream_id.decode())
+            call_count[0] += 1
+            if call_count[0] == 1:
+                # First call: return empty → cursor stays at "0-0"
+                return []
+            if call_count[0] == 2:
+                # Second call: return malformed envelope → last_id advances, RuntimeError raised
+                return [
+                    (
+                        b"reply_stream",
+                        [(malformed_msg_id.encode(), {b"irrelevant": b"field"})],
+                    )
+                ]
             return []
 
         try:
             with (
                 patch.object(client, "xread", side_effect=spy_xread),
-                pytest.raises((asyncio.TimeoutError, TimeoutError)),
+                pytest.raises(RuntimeError, match="Malformed reply envelope"),
             ):
                 await bus.send(GetOrderQuery(order_id="test-lastid"))
 
-            assert call_ids, "No xread calls for reply stream"
-            # First call must start from "0-0"
-            assert call_ids[0] == "0-0", f"First read must use '0-0', got: {call_ids[0]}"
-            # ID must never regress across iterations
-            for i in range(1, len(call_ids)):
-                assert call_ids[i] >= call_ids[i - 1], (
-                    f"ID must not regress: call {i} used '{call_ids[i]}' after '{call_ids[i - 1]}'"
-                )
+            # First call used "0-0"
+            assert call_ids[0] == "0-0", f"First read must start at '0-0', got: {call_ids[0]}"
+            # Second call also used "0-0" (empty first read, cursor not advanced)
+            assert call_ids[1] == "0-0", (
+                f"Second read must use '0-0' after empty read, got: {call_ids[1]}"
+            )
+        finally:
+            await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_send_query_blocking_mode_receives_valid_reply(
+        self, fake_redis_server, serializer
+    ):
+        """send() with _block_ms > 0 correctly deserializes and returns the handler reply."""
+        from unittest.mock import patch  # noqa: PLC0415
+
+        import fakeredis
+
+        client = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="svc",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="caller",
+            _block_ms=50,
+            _redis_client=client,
+            query_reply_timeout=1.0,
+        )
+        await bus.start()
+
+        expected = "order:test-block-ok"
+        serialized_reply = serializer.dumps(expected)
+
+        async def mock_xread(streams, count=None, block=None):
+            for stream_key in streams:
+                if "reply" in str(stream_key):
+                    return [(stream_key, [(b"1-0", {b"data": serialized_reply})])]
+            return []
+
+        try:
+            with patch.object(client, "xread", side_effect=mock_xread):
+                result = await bus.send(GetOrderQuery(order_id="test-block-ok"))
+            assert result == expected
         finally:
             await bus.close()
 
