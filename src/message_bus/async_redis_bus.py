@@ -396,12 +396,12 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                     raw if isinstance(raw, bytes) else raw.encode()
                                 )
 
-                await asyncio.sleep(0)  # yield so the consumer loop can run
+                await asyncio.sleep(0.005)  # yield + brief pause to reduce busy-poll load
         finally:
             try:
                 await self._redis.delete(reply_stream)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Failed to delete reply stream %s: %s", reply_stream, e)
 
     async def execute(self, command: Command) -> None:
         """Publish *command* to its Redis stream (competitive consumption)."""
@@ -674,6 +674,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 logger.exception("Unexpected error in query consumer")
                 await asyncio.sleep(0.1)
 
+    # TTL for orphaned reply streams (seconds); guards against late consumer writes
+    # after the caller has already timed out and deleted its local copy.
+    _REPLY_STREAM_TTL_SECONDS = 60
+
     async def _handle_query_batch(self, stream_str: str, batch: list[Any]) -> None:
         """Process a batch of query messages, writing replies to their reply streams."""
         for message_id, fields in batch:
@@ -682,18 +686,28 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 raw = fields.get(b"data") or fields.get("data")
                 reply_stream_raw = fields.get(b"reply_stream") or fields.get("reply_stream")
 
+                # Decode reply_stream early so we can send error replies even on bad data
+                if reply_stream_raw is not None:
+                    reply_stream = (
+                        reply_stream_raw.decode()
+                        if isinstance(reply_stream_raw, bytes)
+                        else reply_stream_raw
+                    )
+
                 if raw is None or reply_stream_raw is None:
                     logger.warning(
-                        "Query message missing required fields; skipping id=%s", message_id
+                        "Query message missing required fields "
+                        "(data=%s, reply_stream=%s); skipping id=%s",
+                        raw is not None,
+                        reply_stream_raw is not None,
+                        message_id,
                     )
+                    if reply_stream:
+                        await self._send_error_reply(
+                            reply_stream, "ValueError", "Missing required query fields"
+                        )
                     await self._redis.xack(stream_str, self._consumer_group, message_id)
                     continue
-
-                reply_stream = (
-                    reply_stream_raw.decode()
-                    if isinstance(reply_stream_raw, bytes)
-                    else reply_stream_raw
-                )
 
                 msg = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
 
@@ -705,13 +719,16 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                             result_data = self._serializer.dumps(result)
                             await self._redis.xadd(reply_stream, {"data": result_data})
                         except Exception as exc:
-                            await self._redis.xadd(
+                            logger.warning(
+                                "Query handler %s raised %s (reply_stream=%s): %s",
+                                type(msg).__name__,
+                                type(exc).__name__,
                                 reply_stream,
-                                {
-                                    "error_type": type(exc).__name__,
-                                    "error_message": str(exc),
-                                },
+                                exc,
                             )
+                            await self._send_error_reply(reply_stream, type(exc).__name__, str(exc))
+                        finally:
+                            await self._redis.expire(reply_stream, self._REPLY_STREAM_TTL_SECONDS)
                         await self._redis.xack(stream_str, self._consumer_group, message_id)
                     else:
                         logger.warning(
@@ -728,16 +745,32 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             except Exception:
                 logger.exception("Error processing query message id=%s", message_id)
                 if reply_stream:
-                    try:
-                        await self._redis.xadd(
-                            reply_stream,
-                            {
-                                "error_type": "RuntimeError",
-                                "error_message": "Internal error processing query",
-                            },
-                        )
-                    except Exception:
-                        pass
+                    await self._send_error_reply(
+                        reply_stream, "RuntimeError", "Internal error processing query"
+                    )
+                # Always ACK to prevent PEL growth on unrecoverable errors
+                try:
+                    await self._redis.xack(stream_str, self._consumer_group, message_id)
+                except Exception as e:
+                    logger.warning("Failed to XACK query message id=%s: %s", message_id, e)
+
+    async def _send_error_reply(
+        self, reply_stream: str, error_type: str, error_message: str
+    ) -> None:
+        """Write an error reply to *reply_stream*, logging failures instead of swallowing."""
+        try:
+            await self._redis.xadd(
+                reply_stream,
+                {"error_type": error_type, "error_message": error_message},
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to write error reply to %s (%s: %s): %s",
+                reply_stream,
+                error_type,
+                error_message,
+                e,
+            )
 
     async def _reconnect(self) -> None:
         """Replace the Redis client after a connection failure."""

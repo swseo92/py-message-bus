@@ -602,6 +602,80 @@ class TestAsyncRedisMessageBusQuery:
         assert sorted(results) == ["result:a", "result:b", "result:c"]
         assert call_count[0] == 3
 
+    @pytest.mark.asyncio
+    async def test_query_competitive_consumption(self, fake_redis_server, serializer):
+        """Exactly one of two workers processes each query (no duplicate handling)."""
+        import fakeredis
+
+        processed_by: list[str] = []
+
+        def make_handler(name: str):
+            async def handler(q: GetOrderQuery) -> str:
+                processed_by.append(name)
+                return f"{name}:{q.order_id}"
+
+            return handler
+
+        # Both workers share the same consumer_group → competitive consumption
+        worker1 = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="workers",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="w1",
+            _block_ms=0,
+            _redis_client=fakeredis.aioredis.FakeRedis(server=fake_redis_server),
+        )
+        worker2 = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="workers",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="w2",
+            _block_ms=0,
+            _redis_client=fakeredis.aioredis.FakeRedis(server=fake_redis_server),
+        )
+
+        worker1.register_query(GetOrderQuery, make_handler("w1"))
+        worker2.register_query(GetOrderQuery, make_handler("w2"))
+
+        await worker1.start()
+        await worker2.start()
+
+        # Caller uses a separate bus instance (producer role)
+        caller = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="caller",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="caller",
+            _block_ms=0,
+            _redis_client=fakeredis.aioredis.FakeRedis(server=fake_redis_server),
+        )
+        await caller.start()
+
+        try:
+            result = await caller.send(GetOrderQuery(order_id="ord-400"))
+            assert len(processed_by) == 1, "query must be processed exactly once"
+            assert result.endswith(":ord-400")
+        finally:
+            await caller.close()
+            await worker1.close()
+            await worker2.close()
+
+    @pytest.mark.asyncio
+    async def test_query_handler_returns_none(self, bus):
+        """Query handler can return None; send() returns None without error."""
+
+        async def none_handler(q: GetOrderQuery) -> None:
+            return None
+
+        bus.register_query(GetOrderQuery, none_handler)
+        await bus.start()
+
+        result = await bus.send(GetOrderQuery(order_id="ord-500"))
+        assert result is None
+
 
 # ---------------------------------------------------------------------------
 # AsyncRedisMessageBus – lifecycle tests
