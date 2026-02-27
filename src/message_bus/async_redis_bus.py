@@ -296,9 +296,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         handler: Callable[[Event], Awaitable[None]],
     ) -> None:
         # Each subscription gets its own consumer group → fan-out semantics.
-        subscriber_group = (
-            f"{self._consumer_group}:event:{event_type.__name__}:{uuid.uuid4().hex[:8]}"
-        )
+        # Use deterministic index so the group name is stable across restarts.
+        sub_index = len(self._event_subscriptions)
+        subscriber_group = f"{self._consumer_group}:evt:{event_type.__name__}:{sub_index}"
         self._serializer.registry.register(event_type)
         self._event_subscriptions.append((event_type, subscriber_group, handler))
 
@@ -343,7 +343,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
 
         Must be called before dispatching or consuming messages.
         Register all handlers **before** calling this method.
+        Idempotent: calling again while already running is a no-op.
         """
+        if self._running:
+            return  # Already started – idempotent
         if self._redis is None:
             self._redis = aioredis.from_url(self._redis_url, decode_responses=False)
         self._running = True
@@ -372,8 +375,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         if self._redis is not None:
             try:
                 await self._redis.aclose()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Error closing Redis connection: %s", e)
             self._redis = None
 
     async def __aenter__(self) -> "AsyncRedisMessageBus":
@@ -399,8 +402,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         """Create consumer group (and stream) if they do not yet exist."""
         try:
             await self._redis.xgroup_create(stream_key, group, id="0", mkstream=True)
-        except RedisResponseError:
-            pass  # BUSYGROUP: group already exists – idempotent
+        except RedisResponseError as e:
+            if "BUSYGROUP" not in str(e):
+                raise  # Re-raise unexpected errors (ACL violations, stream errors, etc.)
 
     async def _run_command_task_consumer(self) -> None:
         """Background coroutine: competitive consumption of commands and tasks."""
@@ -452,7 +456,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             try:
                 raw: bytes | None = fields.get(b"data") or fields.get("data")
                 if raw is None:
-                    logger.error("Message missing 'data' field; skipping id=%s", message_id)
+                    logger.warning("Message missing 'data' field; skipping id=%s", message_id)
                     continue
                 msg = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
 
@@ -460,16 +464,22 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                     handler = self._command_handlers.get(type(msg))
                     if handler is not None:
                         await handler(msg)
+                        await self._redis.xack(stream_str, self._consumer_group, message_id)
                     else:
-                        logger.error("No handler for command %s", type(msg).__name__)
+                        logger.warning(
+                            "No handler for command %s; leaving in PEL for retry",
+                            type(msg).__name__,
+                        )
                 elif ":task:" in stream_str and isinstance(msg, Task):
                     task_handler = self._task_handlers.get(type(msg))
                     if task_handler is not None:
                         await task_handler(msg)
+                        await self._redis.xack(stream_str, self._consumer_group, message_id)
                     else:
-                        logger.error("No handler for task %s", type(msg).__name__)
-
-                await self._redis.xack(stream_str, self._consumer_group, message_id)
+                        logger.warning(
+                            "No handler for task %s; leaving in PEL for retry",
+                            type(msg).__name__,
+                        )
             except Exception:
                 logger.exception("Error processing command/task message id=%s", message_id)
 
@@ -498,13 +508,23 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                             try:
                                 raw = fields.get(b"data") or fields.get("data")
                                 if raw is None:
+                                    logger.warning(
+                                        "Event message missing 'data' field; skipping id=%s",
+                                        message_id,
+                                    )
                                     continue
                                 event = self._serializer.loads(
                                     raw if isinstance(raw, bytes) else raw.encode()
                                 )
                                 if isinstance(event, Event):
                                     await handler(event)
-                                await self._redis.xack(stream_key, subscriber_group, message_id)
+                                    await self._redis.xack(stream_key, subscriber_group, message_id)
+                                else:
+                                    logger.warning(
+                                        "Received non-Event payload (type=%s); skipping id=%s",
+                                        type(event).__name__,
+                                        message_id,
+                                    )
                             except Exception:
                                 logger.exception("Error processing event message id=%s", message_id)
                 else:
@@ -530,8 +550,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         if self._redis is not None:
             try:
                 await self._redis.aclose()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Error closing Redis connection during reconnect: %s", e)
         try:
             self._redis = aioredis.from_url(self._redis_url, decode_responses=False)
         except Exception:

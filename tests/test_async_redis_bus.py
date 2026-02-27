@@ -13,7 +13,7 @@ pytest.importorskip("fakeredis")
 
 import fakeredis.aioredis  # noqa: E402
 
-from message_bus.async_redis_bus import AsyncJsonSerializer, AsyncRedisMessageBus, TypeRegistry
+from message_bus import AsyncJsonSerializer, AsyncRedisMessageBus, TypeRegistry
 from message_bus.ports import Command, Event, Query, Task
 
 # ---------------------------------------------------------------------------

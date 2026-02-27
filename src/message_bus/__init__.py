@@ -143,6 +143,13 @@ try:
 
     __all__.extend(["AsyncRedisMessageBus", "AsyncJsonSerializer", "TypeRegistry"])
 except ImportError:
-    pass
+    import warnings
+
+    warnings.warn(
+        "AsyncRedisMessageBus is unavailable. "
+        "Install the 'redis' package: pip install 'redis>=5.0.0'",
+        ImportWarning,
+        stacklevel=2,
+    )
 
 __version__ = "0.1.0"

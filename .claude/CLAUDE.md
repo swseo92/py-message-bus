@@ -6,10 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 모듈러 모놀리스 아키텍처를 위한 경량 메시지 버스 라이브러리.
 
-- Zero dependencies (코어)
+- Zero dependencies (코어 전용; Redis async 구현은 `redis>=5.0.0` 필요)
 - Type-safe (Generic 지원)
 - Interface Segregation (필요한 인터페이스만 주입 가능)
-- 직접 함수 호출 방식 (실제 메시지 큐잉 없음)
+- 직접 함수 호출 방식 (LocalMessageBus) 또는 Redis Streams 기반 분산 처리 (AsyncRedisMessageBus)
 
 ## 명령어
 
@@ -49,7 +49,8 @@ src/message_bus/
 ├── timeout.py       # 미들웨어: TimeoutMiddleware (handler timeout enforcement)
 ├── dead_letter.py   # 미들웨어: DeadLetterMiddleware (실패 메시지 캡처)
 ├── testing.py       # 테스팅: FakeMessageBus, AsyncFakeMessageBus
-└── zmq_bus.py       # 구현체: ZmqMessageBus, ZmqWorker (optional, pyzmq 필요)
+├── zmq_bus.py       # 구현체: ZmqMessageBus, ZmqWorker (optional, pyzmq 필요)
+└── async_redis_bus.py  # 구현체: AsyncRedisMessageBus (optional, redis>=5.0.0 필요)
 ```
 
 ### Interface Segregation (ports.py)
@@ -98,6 +99,7 @@ class OrderService:
 | `DeadLetterMiddleware` | 실패 추적 | 실패한 메시지 캡처, DeadLetterStore에 저장 |
 | `FakeMessageBus` | 테스팅 유틸리티 | 핸들러 없이 메시지 녹화, assertion 헬퍼 |
 | `ZmqMessageBus` + `ZmqWorker` | 멀티프로세스 | PUSH/PULL, REQ/REP, PUB/SUB 패턴, pickle 직렬화 |
+| `AsyncRedisMessageBus` | 분산 async (Redis) | Redis Streams, Command/Task 경쟁 소비, Event fan-out, 자동 재연결; Query는 미지원 (SWS2-42) |
 
 ### 에러 규칙
 
