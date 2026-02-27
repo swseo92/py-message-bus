@@ -1410,3 +1410,406 @@ class TestMaxStreamLength:
             await bus._send_error_reply("test:reply:stream", "ValueError", "some error")
 
         assert any("test:reply:stream" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# SWS2-48: HOL Blocking 해소 (메시지 타입별 독립 컨슈머)
+# ---------------------------------------------------------------------------
+
+
+class TestHOLBlockingFix:
+    """Head-of-Line Blocking 해소 검증 – 메시지 타입별 독립 컨슈머."""
+
+    @pytest.mark.asyncio
+    async def test_slow_command_does_not_block_other_command_type(
+        self, fake_redis_server, serializer
+    ):
+        """느린 CommandA 핸들러가 CommandB 처리를 지연시키지 않아야 한다 (HOL 해소).
+
+        CreateOrderCommand 핸들러가 0.3초 걸려도 CancelOrderCommand는
+        즉시(< 0.3초) 처리돼야 한다.
+        """
+        import fakeredis
+
+        create_order_done = asyncio.Event()
+        cancel_order_done = asyncio.Event()
+        cancel_order_time: list[float] = []
+        create_order_time: list[float] = []
+
+        async def slow_create_handler(cmd: CreateOrderCommand) -> None:
+            await asyncio.sleep(0.3)
+            create_order_time.append(asyncio.get_event_loop().time())
+            create_order_done.set()
+
+        async def fast_cancel_handler(cmd: CancelOrderCommand) -> None:
+            cancel_order_time.append(asyncio.get_event_loop().time())
+            cancel_order_done.set()
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="hol-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        bus.register_command(CreateOrderCommand, slow_create_handler)
+        bus.register_command(CancelOrderCommand, fast_cancel_handler)
+
+        await bus.start()
+
+        await bus.execute(CreateOrderCommand(order_id="slow-1", amount=Decimal("100")))
+        await bus.execute(CancelOrderCommand(order_id="fast-1"))
+
+        await asyncio.wait_for(
+            asyncio.gather(create_order_done.wait(), cancel_order_done.wait()),
+            timeout=1.5,
+        )
+        await bus.close()
+
+        assert len(cancel_order_time) == 1
+        assert len(create_order_time) == 1
+        # CancelOrder(빠름)는 CreateOrder(느림)보다 먼저 완료돼야 한다
+        assert cancel_order_time[0] < create_order_time[0], (
+            f"HOL Blocking detected! cancel={cancel_order_time[0]:.4f}, "
+            f"create={create_order_time[0]:.4f}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_per_type_consumer_tasks_spawned(self, fake_redis_server, serializer):
+        """타입별 독립 컨슈머 태스크 쌍(consumer+xautoclaim)이 생성돼야 한다."""
+        import fakeredis
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="task-count-test",
+            app_name="test",
+            serializer=serializer,
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+
+        async def noop_create(cmd: CreateOrderCommand) -> None:
+            pass
+
+        async def noop_cancel(cmd: CancelOrderCommand) -> None:
+            pass
+
+        async def noop_task(t: ProcessPaymentTask) -> None:
+            pass
+
+        bus.register_command(CreateOrderCommand, noop_create)
+        bus.register_command(CancelOrderCommand, noop_cancel)
+        bus.register_task(ProcessPaymentTask, noop_task)
+
+        await bus.start()
+
+        # 3 타입 × 2 태스크(consumer + xautoclaim) = 6
+        assert len(bus._consumer_tasks) == 6, (
+            f"3 message types × 2 tasks each = 6 expected, got {len(bus._consumer_tasks)}"
+        )
+
+        await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_slow_task_does_not_block_command(self, fake_redis_server, serializer):
+        """느린 Task 핸들러가 Command 처리를 지연시키지 않아야 한다."""
+        import fakeredis
+
+        task_done = asyncio.Event()
+        cmd_done = asyncio.Event()
+        cmd_time: list[float] = []
+        task_time: list[float] = []
+
+        async def slow_task_handler(t: ProcessPaymentTask) -> None:
+            await asyncio.sleep(0.3)
+            task_time.append(asyncio.get_event_loop().time())
+            task_done.set()
+
+        async def fast_cmd_handler(cmd: CancelOrderCommand) -> None:
+            cmd_time.append(asyncio.get_event_loop().time())
+            cmd_done.set()
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="hol-task-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        bus.register_task(ProcessPaymentTask, slow_task_handler)
+        bus.register_command(CancelOrderCommand, fast_cmd_handler)
+
+        await bus.start()
+
+        await bus.dispatch(ProcessPaymentTask(payment_id="slow-pay", amount=Decimal("100")))
+        await bus.execute(CancelOrderCommand(order_id="fast-cancel"))
+
+        await asyncio.wait_for(
+            asyncio.gather(task_done.wait(), cmd_done.wait()),
+            timeout=1.5,
+        )
+        await bus.close()
+
+        # Command(빠름)가 Task(느림)보다 먼저 완료돼야 한다
+        assert cmd_time[0] < task_time[0], (
+            "CancelOrderCommand should finish before slow ProcessPaymentTask. "
+            "HOL Blocking between Task and Command detected!"
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrency_parameter_limits_concurrent_handlers(
+        self, fake_redis_server, serializer
+    ):
+        """register_command(concurrency=N)은 핸들러를 최대 N개 동시 실행으로 제한한다."""
+        import fakeredis
+
+        concurrent_count = 0
+        max_concurrent = 0
+        completed = 0
+        total = 5
+
+        async def tracking_handler(cmd: CreateOrderCommand) -> None:
+            nonlocal concurrent_count, max_concurrent, completed
+            concurrent_count += 1
+            max_concurrent = max(max_concurrent, concurrent_count)
+            await asyncio.sleep(0.05)
+            concurrent_count -= 1
+            completed += 1
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="sem-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        bus.register_command(CreateOrderCommand, tracking_handler, concurrency=2)
+        await bus.start()
+
+        for i in range(total):
+            await bus.execute(CreateOrderCommand(order_id=f"ord-{i}", amount=Decimal("1")))
+
+        deadline = asyncio.get_event_loop().time() + 3.0
+        while completed < total and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.05)
+
+        await bus.close()
+
+        assert completed == total, f"All {total} messages must be processed, got {completed}"
+        assert max_concurrent <= 2, (
+            f"concurrency=2 means max 2 concurrent handlers, got {max_concurrent}"
+        )
+
+    def test_invalid_concurrency_raises_value_error(self, bus):
+        """concurrency=0 또는 음수는 Semaphore 데드락을 유발하므로 즉시 ValueError를 발생시킨다."""
+
+        async def noop(cmd: CreateOrderCommand) -> None:
+            pass
+
+        with pytest.raises(ValueError, match="concurrency must be a positive integer"):
+            bus.register_command(CreateOrderCommand, noop, concurrency=0)
+
+        with pytest.raises(ValueError, match="concurrency must be a positive integer"):
+            bus.register_command(CreateOrderCommand, noop, concurrency=-1)
+
+    def test_invalid_task_concurrency_raises_value_error(self, bus):
+        """register_task concurrency=0/-1도 ValueError를 발생시킨다."""
+
+        async def noop(t: ProcessPaymentTask) -> None:
+            pass
+
+        with pytest.raises(ValueError, match="concurrency must be a positive integer"):
+            bus.register_task(ProcessPaymentTask, noop, concurrency=0)
+
+    @pytest.mark.asyncio
+    async def test_concurrency_enables_actual_parallel_execution(
+        self, fake_redis_server, serializer
+    ):
+        """concurrency=2면 실제로 2개 이상 동시 실행이 일어난다."""
+        import fakeredis
+
+        concurrent_count = 0
+        max_concurrent = 0
+        completed = 0
+
+        async def parallel_handler(cmd: CreateOrderCommand) -> None:
+            nonlocal concurrent_count, max_concurrent, completed
+            concurrent_count += 1
+            max_concurrent = max(max_concurrent, concurrent_count)
+            await asyncio.sleep(0.05)
+            concurrent_count -= 1
+            completed += 1
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="parallel-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        bus.register_command(CreateOrderCommand, parallel_handler, concurrency=3)
+        await bus.start()
+
+        for i in range(6):
+            await bus.execute(CreateOrderCommand(order_id=f"p-{i}", amount=Decimal("1")))
+
+        deadline = asyncio.get_event_loop().time() + 3.0
+        while completed < 6 and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.02)
+
+        await bus.close()
+
+        assert completed == 6
+        assert max_concurrent >= 2, (
+            f"concurrency=3 should allow ≥2 parallel executions, got {max_concurrent}"
+        )
+        assert max_concurrent <= 3, f"concurrency=3 must cap at 3, got {max_concurrent}"
+
+    @pytest.mark.asyncio
+    async def test_register_task_concurrency_parameter(self, fake_redis_server, serializer):
+        """register_task(concurrency=N)도 정상 동작한다."""
+        import fakeredis
+
+        concurrent_count = 0
+        max_concurrent = 0
+        completed = 0
+
+        async def parallel_task(t: ProcessPaymentTask) -> None:
+            nonlocal concurrent_count, max_concurrent, completed
+            concurrent_count += 1
+            max_concurrent = max(max_concurrent, concurrent_count)
+            await asyncio.sleep(0.05)
+            concurrent_count -= 1
+            completed += 1
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="task-parallel-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        bus.register_task(ProcessPaymentTask, parallel_task, concurrency=2)
+        await bus.start()
+
+        for i in range(4):
+            await bus.dispatch(ProcessPaymentTask(payment_id=f"pay-{i}", amount=Decimal("1")))
+
+        deadline = asyncio.get_event_loop().time() + 3.0
+        while completed < 4 and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.02)
+
+        await bus.close()
+
+        assert completed == 4
+        assert max_concurrent <= 2, f"concurrency=2 must cap at 2, got {max_concurrent}"
+
+
+# ---------------------------------------------------------------------------
+# Malformed payload handling tests
+# ---------------------------------------------------------------------------
+
+
+class TestMalformedPayloadHandling:
+    """Poison-message 방지: malformed 페이로드가 ACK 처리되어 재전달 루프가 없음을 검증."""
+
+    @pytest.mark.asyncio
+    async def test_missing_data_field_is_acked_and_handler_not_called(
+        self, fake_redis_server, serializer
+    ):
+        """'data' 필드가 없는 메시지는 ACK되고 핸들러가 호출되지 않아야 한다.
+
+        재전달 루프(poison-message)를 막기 위해, _process_command_message는
+        'data' 필드 누락 시 xack를 호출하고 핸들러를 건너뛴다.
+        """
+        import fakeredis
+
+        handler_called = False
+
+        async def handler(cmd: CreateOrderCommand) -> None:
+            nonlocal handler_called
+            handler_called = True
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="malformed-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        bus.register_command(CreateOrderCommand, handler)
+
+        # 컨슈머 그룹 생성 후 malformed 메시지를 직접 스트림에 주입
+        stream_key = "test:command:CreateOrderCommand"
+        await fake_redis.xgroup_create(stream_key, "malformed-test", id="0", mkstream=True)
+        await fake_redis.xadd(stream_key, {"garbage": "no_data_field"})
+
+        await bus.start()
+        await asyncio.sleep(0.3)
+        await bus.close()
+
+        # 핸들러가 호출되지 않아야 함
+        assert not handler_called, "Handler must not be called for message missing 'data' field"
+
+        # PEL에 미처리 메시지가 없어야 함 (ACK된 상태)
+        pending = await fake_redis.xpending(stream_key, "malformed-test")
+        assert pending["pending"] == 0, (
+            f"Malformed message must be ACKed (pending count should be 0, got {pending['pending']})"
+        )
+
+    @pytest.mark.asyncio
+    async def test_missing_data_field_in_task_is_acked(self, fake_redis_server, serializer):
+        """Task 스트림에서도 'data' 필드 누락 시 ACK되어 재전달 루프가 없어야 한다."""
+        import fakeredis
+
+        handler_called = False
+
+        async def task_handler(t: ProcessPaymentTask) -> None:
+            nonlocal handler_called
+            handler_called = True
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="malformed-task-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        bus.register_task(ProcessPaymentTask, task_handler)
+
+        stream_key = "test:task:ProcessPaymentTask"
+        await fake_redis.xgroup_create(stream_key, "malformed-task-test", id="0", mkstream=True)
+        await fake_redis.xadd(stream_key, {"no_data": "missing"})
+
+        await bus.start()
+        await asyncio.sleep(0.3)
+        await bus.close()
+
+        assert not handler_called, "Handler must not be called for task message missing 'data' field"
+
+        pending = await fake_redis.xpending(stream_key, "malformed-task-test")
+        assert pending["pending"] == 0, (
+            f"Malformed task message must be ACKed (pending={pending['pending']})"
+        )
