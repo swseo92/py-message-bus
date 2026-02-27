@@ -397,19 +397,29 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         )
 
         loop = asyncio.get_running_loop()
+        last_id = "0-0"
         deadline = loop.time() + self._query_reply_timeout
         try:
             while True:
-                if loop.time() >= deadline:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
                     raise TimeoutError(
                         f"Query {type(query).__name__!r} timed out "
                         f"after {self._query_reply_timeout}s"
                     )
 
-                result_msgs = await self._redis.xread({reply_stream: "0-0"}, count=1)
+                if self._block_ms > 0:
+                    block_ms = max(1, int(remaining * 1000))
+                    result_msgs = await self._redis.xread(
+                        {reply_stream: last_id}, count=1, block=block_ms
+                    )
+                else:
+                    result_msgs = await self._redis.xread({reply_stream: last_id}, count=1)
+
                 if result_msgs:
                     for _, msgs in result_msgs:
-                        for _msg_id, fields in msgs:
+                        for msg_id, fields in msgs:
+                            last_id = msg_id
                             error_type_raw = fields.get(b"error_type") or fields.get("error_type")
                             if error_type_raw:
                                 error_msg_raw = (
@@ -433,12 +443,17 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                 return self._serializer.loads(  # type: ignore[no-any-return]
                                     raw if isinstance(raw, bytes) else raw.encode()
                                 )
-
-                await asyncio.sleep(0.005)  # yield + brief pause to reduce busy-poll load
+                            raise RuntimeError(
+                                f"Malformed reply envelope on stream {reply_stream!r}: "
+                                f"missing 'data' and 'error_type' "
+                                f"(id={msg_id!r}, keys={list(fields.keys())!r})"
+                            )
+                elif self._block_ms == 0:
+                    await asyncio.sleep(0)  # yield to event loop in non-blocking mode
         finally:
             try:
                 await self._redis.delete(reply_stream)
-            except Exception as e:
+            except (RedisConnectionError, RedisTimeoutError, RedisResponseError, OSError) as e:
                 logger.warning("Failed to delete reply stream %s: %s", reply_stream, e)
 
     async def execute(self, command: Command) -> None:
