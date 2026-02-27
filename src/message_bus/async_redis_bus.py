@@ -256,6 +256,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         "_dead_letter_store",
         "_max_stream_length",
         "_idempotency_ttl",
+        "_concurrency_config",
     )
 
     def __init__(
@@ -315,6 +316,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         # Runtime state
         self._running = False
         self._consumer_tasks: list[asyncio.Task[None]] = []
+        # (message_type → max_concurrent) – None means unlimited (sequential)
+        self._concurrency_config: dict[type, int | None] = {}
 
     # ------------------------------------------------------------------
     # Registration (sync) – AsyncHandlerRegistry + AsyncQueryRegistry
@@ -334,11 +337,14 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         self,
         command_type: type[Command],
         handler: Callable[[Command], Awaitable[None]],
+        concurrency: int | None = None,
     ) -> None:
         if command_type in self._command_handlers:
             raise ValueError(f"Command handler already registered for {command_type.__name__}")
         self._serializer.registry.register(command_type)
         self._command_handlers[command_type] = handler
+        if concurrency is not None:
+            self._concurrency_config[command_type] = concurrency
 
     def subscribe(
         self,
@@ -356,11 +362,14 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         self,
         task_type: type[Task],
         handler: Callable[[Task], Awaitable[None]],
+        concurrency: int | None = None,
     ) -> None:
         if task_type in self._task_handlers:
             raise ValueError(f"Task handler already registered for {task_type.__name__}")
         self._serializer.registry.register(task_type)
         self._task_handlers[task_type] = handler
+        if concurrency is not None:
+            self._concurrency_config[task_type] = concurrency
 
     # ------------------------------------------------------------------
     # Dispatch (async) – AsyncMessageDispatcher + AsyncQueryDispatcher
@@ -473,17 +482,32 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             self._redis = aioredis.from_url(self._redis_url, decode_responses=False)
         self._running = True
 
-        # Single consumer loop for all commands and tasks
-        command_task_streams: list[str] = [
-            self._stream_key("command", t.__name__) for t in self._command_handlers
-        ] + [self._stream_key("task", t.__name__) for t in self._task_handlers]
-
-        if command_task_streams:
-            self._consumer_tasks.append(asyncio.create_task(self._run_command_task_consumer()))
+        # Per-message-type independent consumers (HOL Blocking 해소)
+        # 각 Command/Task 타입이 독립 컨슈머를 가져 느린 핸들러가 다른 타입을 블로킹하지 않는다.
+        for cmd_type, handler in self._command_handlers.items():
+            stream_key = self._stream_key("command", cmd_type.__name__)
+            concurrency = self._concurrency_config.get(cmd_type)
+            semaphore = asyncio.Semaphore(concurrency) if concurrency is not None else None
             self._consumer_tasks.append(
                 asyncio.create_task(
-                    self._run_xautoclaim_loop(command_task_streams, self._consumer_group)
+                    self._run_single_command_consumer(stream_key, handler, semaphore)
                 )
+            )
+            self._consumer_tasks.append(
+                asyncio.create_task(self._run_xautoclaim_loop([stream_key], self._consumer_group))
+            )
+
+        for task_type, task_handler in self._task_handlers.items():
+            stream_key = self._stream_key("task", task_type.__name__)
+            concurrency = self._concurrency_config.get(task_type)
+            task_semaphore = asyncio.Semaphore(concurrency) if concurrency is not None else None
+            self._consumer_tasks.append(
+                asyncio.create_task(
+                    self._run_single_task_consumer(stream_key, task_handler, task_semaphore)
+                )
+            )
+            self._consumer_tasks.append(
+                asyncio.create_task(self._run_xautoclaim_loop([stream_key], self._consumer_group))
             )
 
         # Single consumer loop for all queries (competitive consumption + reply)
@@ -491,14 +515,18 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             self._consumer_tasks.append(asyncio.create_task(self._run_query_consumer()))
 
         # Dedicated consumer loop per event subscriber (fan-out)
-        for event_type, subscriber_group, handler in self._event_subscriptions:
+        for event_type, subscriber_group, event_handler in self._event_subscriptions:
             stream_key = self._stream_key("event", event_type.__name__)
             self._consumer_tasks.append(
-                asyncio.create_task(self._run_event_consumer(stream_key, subscriber_group, handler))
+                asyncio.create_task(
+                    self._run_event_consumer(stream_key, subscriber_group, event_handler)
+                )
             )
             self._consumer_tasks.append(
                 asyncio.create_task(
-                    self._run_xautoclaim_loop([stream_key], subscriber_group, event_handler=handler)
+                    self._run_xautoclaim_loop(
+                        [stream_key], subscriber_group, event_handler=event_handler
+                    )
                 )
             )
 
@@ -598,50 +626,233 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             if "BUSYGROUP" not in str(e):
                 raise  # Re-raise unexpected errors (ACL violations, stream errors, etc.)
 
-    async def _run_command_task_consumer(self) -> None:
-        """Background coroutine: competitive consumption of commands and tasks."""
-        streams: list[str] = [
-            self._stream_key("command", t.__name__) for t in self._command_handlers
-        ] + [self._stream_key("task", t.__name__) for t in self._task_handlers]
+    async def _run_single_command_consumer(
+        self,
+        stream_key: str,
+        handler: Callable[[Command], Awaitable[None]],
+        semaphore: asyncio.Semaphore | None = None,
+    ) -> None:
+        """Per-type command consumer: 독립 실행으로 HOL Blocking을 방지한다.
 
-        for key in streams:
-            await self._ensure_group(key, self._consumer_group)
+        *semaphore* 가 주어지면 각 메시지를 asyncio.Task 로 발사해 최대 N 개 동시 처리.
+        없으면 순차 처리 (타입 간 격리만으로 HOL Blocking 해소).
+        """
+        await self._ensure_group(stream_key, self._consumer_group)
 
+        concurrent_tasks: set[asyncio.Task[None]] = set()
         retry_delay = 0.1
-        while self._running:
-            try:
-                messages = await self._redis.xreadgroup(
-                    groupname=self._consumer_group,
-                    consumername=self._consumer_name,
-                    streams=dict.fromkeys(streams, ">"),
-                    count=10,
-                    block=self._block_ms,
+        try:
+            while self._running:
+                try:
+                    messages = await self._redis.xreadgroup(
+                        groupname=self._consumer_group,
+                        consumername=self._consumer_name,
+                        streams={stream_key: ">"},
+                        count=10,
+                        block=self._block_ms,
+                    )
+                    if messages:
+                        for _, stream_msgs in messages:
+                            for message_id, fields in stream_msgs:
+                                coro = self._process_command_message(
+                                    stream_key, message_id, fields, handler, semaphore
+                                )
+                                if semaphore is not None:
+                                    task = asyncio.create_task(coro)
+                                    concurrent_tasks.add(task)
+                                    task.add_done_callback(concurrent_tasks.discard)
+                                else:
+                                    await coro
+                    else:
+                        await asyncio.sleep(0)
+                    retry_delay = 0.1
+                except asyncio.CancelledError:
+                    raise
+                except (RedisConnectionError, RedisTimeoutError):
+                    logger.warning(
+                        "Redis connection error in command consumer for %s, reconnecting in %.1fs",
+                        stream_key,
+                        retry_delay,
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 30.0)
+                    await self._reconnect()
+                except Exception:
+                    logger.exception("Unexpected error in command consumer for %s", stream_key)
+                    await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if concurrent_tasks:
+                await asyncio.gather(*concurrent_tasks, return_exceptions=True)
+
+    async def _process_command_message(
+        self,
+        stream_key: str,
+        message_id: Any,
+        fields: dict[Any, Any],
+        handler: Callable[[Command], Awaitable[None]],
+        semaphore: asyncio.Semaphore | None = None,
+    ) -> None:
+        """단일 Command 메시지를 처리하고 ACK한다. 실패 시 PEL에 남겨 XAUTOCLAIM이 재시도."""
+        raw: bytes | None = fields.get(b"data") or fields.get("data")
+        if raw is None:
+            logger.warning("Command message missing 'data' field; ACKing id=%s", message_id)
+            await self._redis.xack(stream_key, self._consumer_group, message_id)
+            return
+
+        ikey_raw = fields.get(b"idempotency_key") or fields.get("idempotency_key")
+        ikey: str | None = None
+        if ikey_raw is not None:
+            ikey = ikey_raw.decode() if isinstance(ikey_raw, bytes) else ikey_raw
+            if not await self._try_claim_dedup(ikey, scope=stream_key):
+                logger.info(
+                    "Skipping duplicate command (idempotency_key=%s) id=%s", ikey, message_id
                 )
-                if messages:
-                    for stream_name_raw, stream_msgs in messages:
-                        stream_str = (
-                            stream_name_raw.decode()
-                            if isinstance(stream_name_raw, bytes)
-                            else stream_name_raw
-                        )
-                        await self._handle_command_task_batch(stream_str, stream_msgs)
-                else:
-                    # Yield to event loop to avoid busy-wait (critical when block_ms=0)
-                    await asyncio.sleep(0)
-                retry_delay = 0.1  # Reset on success
-            except asyncio.CancelledError:
+                await self._redis.xack(stream_key, self._consumer_group, message_id)
                 return
-            except (RedisConnectionError, RedisTimeoutError):
-                logger.warning(
-                    "Redis connection error in command consumer, reconnecting in %.1fs",
-                    retry_delay,
+
+        try:
+            msg = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
+        except Exception:
+            logger.exception("Failed to deserialize command message id=%s", message_id)
+            await self._redis.xack(stream_key, self._consumer_group, message_id)
+            return
+
+        if not isinstance(msg, Command):
+            logger.warning(
+                "Non-Command payload on command stream (type=%s); ACKing id=%s",
+                type(msg).__name__,
+                message_id,
+            )
+            await self._redis.xack(stream_key, self._consumer_group, message_id)
+            return
+
+        try:
+            if semaphore is not None:
+                async with semaphore:
+                    await handler(msg)
+            else:
+                await handler(msg)
+        except Exception:
+            logger.exception("Error processing command message id=%s", message_id)
+            if ikey is not None:
+                await self._release_dedup_key(ikey, scope=stream_key)
+            return  # Leave in PEL for XAUTOCLAIM retry
+
+        await self._redis.xack(stream_key, self._consumer_group, message_id)
+
+    async def _run_single_task_consumer(
+        self,
+        stream_key: str,
+        handler: Callable[[Task], Awaitable[None]],
+        semaphore: asyncio.Semaphore | None = None,
+    ) -> None:
+        """Per-type task consumer: 독립 실행으로 HOL Blocking을 방지한다."""
+        await self._ensure_group(stream_key, self._consumer_group)
+
+        concurrent_tasks: set[asyncio.Task[None]] = set()
+        retry_delay = 0.1
+        try:
+            while self._running:
+                try:
+                    messages = await self._redis.xreadgroup(
+                        groupname=self._consumer_group,
+                        consumername=self._consumer_name,
+                        streams={stream_key: ">"},
+                        count=10,
+                        block=self._block_ms,
+                    )
+                    if messages:
+                        for _, stream_msgs in messages:
+                            for message_id, fields in stream_msgs:
+                                coro = self._process_task_message(
+                                    stream_key, message_id, fields, handler, semaphore
+                                )
+                                if semaphore is not None:
+                                    task = asyncio.create_task(coro)
+                                    concurrent_tasks.add(task)
+                                    task.add_done_callback(concurrent_tasks.discard)
+                                else:
+                                    await coro
+                    else:
+                        await asyncio.sleep(0)
+                    retry_delay = 0.1
+                except asyncio.CancelledError:
+                    raise
+                except (RedisConnectionError, RedisTimeoutError):
+                    logger.warning(
+                        "Redis connection error in task consumer for %s, reconnecting in %.1fs",
+                        stream_key,
+                        retry_delay,
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 30.0)
+                    await self._reconnect()
+                except Exception:
+                    logger.exception("Unexpected error in task consumer for %s", stream_key)
+                    await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if concurrent_tasks:
+                await asyncio.gather(*concurrent_tasks, return_exceptions=True)
+
+    async def _process_task_message(
+        self,
+        stream_key: str,
+        message_id: Any,
+        fields: dict[Any, Any],
+        handler: Callable[[Task], Awaitable[None]],
+        semaphore: asyncio.Semaphore | None = None,
+    ) -> None:
+        """단일 Task 메시지를 처리하고 ACK한다. 실패 시 PEL에 남겨 XAUTOCLAIM이 재시도."""
+        raw: bytes | None = fields.get(b"data") or fields.get("data")
+        if raw is None:
+            logger.warning("Task message missing 'data' field; ACKing id=%s", message_id)
+            await self._redis.xack(stream_key, self._consumer_group, message_id)
+            return
+
+        ikey_raw = fields.get(b"idempotency_key") or fields.get("idempotency_key")
+        ikey: str | None = None
+        if ikey_raw is not None:
+            ikey = ikey_raw.decode() if isinstance(ikey_raw, bytes) else ikey_raw
+            if not await self._try_claim_dedup(ikey, scope=stream_key):
+                logger.info(
+                    "Skipping duplicate task (idempotency_key=%s) id=%s", ikey, message_id
                 )
-                await asyncio.sleep(retry_delay)
-                retry_delay = min(retry_delay * 2, 30.0)
-                await self._reconnect()
-            except Exception:
-                logger.exception("Unexpected error in command consumer")
-                await asyncio.sleep(0.1)
+                await self._redis.xack(stream_key, self._consumer_group, message_id)
+                return
+
+        try:
+            msg = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
+        except Exception:
+            logger.exception("Failed to deserialize task message id=%s", message_id)
+            await self._redis.xack(stream_key, self._consumer_group, message_id)
+            return
+
+        if not isinstance(msg, Task):
+            logger.warning(
+                "Non-Task payload on task stream (type=%s); ACKing id=%s",
+                type(msg).__name__,
+                message_id,
+            )
+            await self._redis.xack(stream_key, self._consumer_group, message_id)
+            return
+
+        try:
+            if semaphore is not None:
+                async with semaphore:
+                    await handler(msg)
+            else:
+                await handler(msg)
+        except Exception:
+            logger.exception("Error processing task message id=%s", message_id)
+            if ikey is not None:
+                await self._release_dedup_key(ikey, scope=stream_key)
+            return  # Leave in PEL for XAUTOCLAIM retry
+
+        await self._redis.xack(stream_key, self._consumer_group, message_id)
 
     async def _handle_command_task_batch(self, stream_str: str, batch: list[Any]) -> None:
         for message_id, fields in batch:

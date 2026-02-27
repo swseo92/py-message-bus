@@ -1269,3 +1269,202 @@ class TestMaxStreamLength:
             await bus._send_error_reply("test:reply:stream", "ValueError", "some error")
 
         assert any("test:reply:stream" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# SWS2-48: HOL Blocking 해소 (메시지 타입별 독립 컨슈머)
+# ---------------------------------------------------------------------------
+
+
+class TestHOLBlockingFix:
+    """Head-of-Line Blocking 해소 검증 – 메시지 타입별 독립 컨슈머."""
+
+    @pytest.mark.asyncio
+    async def test_slow_command_does_not_block_other_command_type(
+        self, fake_redis_server, serializer
+    ):
+        """느린 CommandA 핸들러가 CommandB 처리를 지연시키지 않아야 한다 (HOL 해소).
+
+        CreateOrderCommand 핸들러가 0.3초 걸려도 CancelOrderCommand는
+        즉시(< 0.3초) 처리돼야 한다.
+        """
+        import fakeredis
+
+        create_order_done = asyncio.Event()
+        cancel_order_done = asyncio.Event()
+        cancel_order_time: list[float] = []
+        create_order_time: list[float] = []
+
+        async def slow_create_handler(cmd: CreateOrderCommand) -> None:
+            await asyncio.sleep(0.3)
+            create_order_time.append(asyncio.get_event_loop().time())
+            create_order_done.set()
+
+        async def fast_cancel_handler(cmd: CancelOrderCommand) -> None:
+            cancel_order_time.append(asyncio.get_event_loop().time())
+            cancel_order_done.set()
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="hol-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        bus.register_command(CreateOrderCommand, slow_create_handler)
+        bus.register_command(CancelOrderCommand, fast_cancel_handler)
+
+        await bus.start()
+
+        await bus.execute(CreateOrderCommand(order_id="slow-1", amount=Decimal("100")))
+        await bus.execute(CancelOrderCommand(order_id="fast-1"))
+
+        await asyncio.wait_for(
+            asyncio.gather(create_order_done.wait(), cancel_order_done.wait()),
+            timeout=1.5,
+        )
+        await bus.close()
+
+        assert len(cancel_order_time) == 1
+        assert len(create_order_time) == 1
+        # CancelOrder(빠름)는 CreateOrder(느림)보다 먼저 완료돼야 한다
+        assert cancel_order_time[0] < create_order_time[0], (
+            f"HOL Blocking detected! cancel={cancel_order_time[0]:.4f}, "
+            f"create={create_order_time[0]:.4f}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_per_type_consumer_tasks_spawned(self, fake_redis_server, serializer):
+        """타입별 독립 컨슈머 태스크 쌍(consumer+xautoclaim)이 생성돼야 한다."""
+        import fakeredis
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="task-count-test",
+            app_name="test",
+            serializer=serializer,
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+
+        async def noop_create(cmd: CreateOrderCommand) -> None:
+            pass
+
+        async def noop_cancel(cmd: CancelOrderCommand) -> None:
+            pass
+
+        async def noop_task(t: ProcessPaymentTask) -> None:
+            pass
+
+        bus.register_command(CreateOrderCommand, noop_create)
+        bus.register_command(CancelOrderCommand, noop_cancel)
+        bus.register_task(ProcessPaymentTask, noop_task)
+
+        await bus.start()
+
+        # 3 타입 × 2 태스크(consumer + xautoclaim) = 6
+        assert len(bus._consumer_tasks) == 6, (
+            f"3 message types × 2 tasks each = 6 expected, got {len(bus._consumer_tasks)}"
+        )
+
+        await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_slow_task_does_not_block_command(self, fake_redis_server, serializer):
+        """느린 Task 핸들러가 Command 처리를 지연시키지 않아야 한다."""
+        import fakeredis
+
+        task_done = asyncio.Event()
+        cmd_done = asyncio.Event()
+        cmd_time: list[float] = []
+        task_time: list[float] = []
+
+        async def slow_task_handler(t: ProcessPaymentTask) -> None:
+            await asyncio.sleep(0.3)
+            task_time.append(asyncio.get_event_loop().time())
+            task_done.set()
+
+        async def fast_cmd_handler(cmd: CancelOrderCommand) -> None:
+            cmd_time.append(asyncio.get_event_loop().time())
+            cmd_done.set()
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="hol-task-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        bus.register_task(ProcessPaymentTask, slow_task_handler)
+        bus.register_command(CancelOrderCommand, fast_cmd_handler)
+
+        await bus.start()
+
+        await bus.dispatch(ProcessPaymentTask(payment_id="slow-pay", amount=Decimal("100")))
+        await bus.execute(CancelOrderCommand(order_id="fast-cancel"))
+
+        await asyncio.wait_for(
+            asyncio.gather(task_done.wait(), cmd_done.wait()),
+            timeout=1.5,
+        )
+        await bus.close()
+
+        # Command(빠름)가 Task(느림)보다 먼저 완료돼야 한다
+        assert cmd_time[0] < task_time[0], (
+            "CancelOrderCommand should finish before slow ProcessPaymentTask. "
+            "HOL Blocking between Task and Command detected!"
+        )
+
+    @pytest.mark.asyncio
+    async def test_concurrency_parameter_limits_concurrent_handlers(
+        self, fake_redis_server, serializer
+    ):
+        """register_command(concurrency=N)은 핸들러를 최대 N개 동시 실행으로 제한한다."""
+        import fakeredis
+
+        concurrent_count = 0
+        max_concurrent = 0
+        completed = 0
+        total = 5
+
+        async def tracking_handler(cmd: CreateOrderCommand) -> None:
+            nonlocal concurrent_count, max_concurrent, completed
+            concurrent_count += 1
+            max_concurrent = max(max_concurrent, concurrent_count)
+            await asyncio.sleep(0.05)
+            concurrent_count -= 1
+            completed += 1
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="sem-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        bus.register_command(CreateOrderCommand, tracking_handler, concurrency=2)
+        await bus.start()
+
+        for i in range(total):
+            await bus.execute(CreateOrderCommand(order_id=f"ord-{i}", amount=Decimal("1")))
+
+        deadline = asyncio.get_event_loop().time() + 3.0
+        while completed < total and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.05)
+
+        await bus.close()
+
+        assert completed == total, f"All {total} messages must be processed, got {completed}"
+        assert max_concurrent <= 2, (
+            f"concurrency=2 means max 2 concurrent handlers, got {max_concurrent}"
+        )
