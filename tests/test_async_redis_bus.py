@@ -1003,3 +1003,112 @@ class TestAsyncRedisMessageBusXAutoclaim:
         assert pending_count == 0, (
             "PEL should be empty after DLQ routing (message must be ACKed)"
         )
+
+    @pytest.mark.asyncio
+    async def test_xautoclaim_routes_task_to_dead_letter_on_max_retry_exceeded(
+        self, fake_redis_server, serializer
+    ):
+        """Task that always fails is routed to DLQ when delivery_count > max_retry.
+
+        Cross-component integration: AsyncRedisMessageBus (XAUTOCLAIM) ↔ DeadLetterStore.
+        Tasks share the command_task_streams XAUTOCLAIM loop, so DLQ routing must
+        also apply to Task messages.
+        """
+        import fakeredis
+
+        from message_bus.dead_letter import MemoryDeadLetterStore
+
+        dlq = MemoryDeadLetterStore()
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-task-dlq-group",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            max_retry=1,
+            claim_idle_ms=50,
+            dead_letter_store=dlq,
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+
+        received: list[ProcessPaymentTask] = []
+
+        async def always_fails(task: ProcessPaymentTask) -> None:
+            received.append(task)
+            raise RuntimeError("Simulated task handler failure")
+
+        bus.register_task(ProcessPaymentTask, always_fails)
+        await bus.start()
+
+        task_msg = ProcessPaymentTask(payment_id="pay-dlq-1", amount=Decimal("99.00"))
+        await bus.dispatch(task_msg)
+
+        await asyncio.sleep(0.6)
+        await bus.close()
+
+        assert len(received) >= 1, "Task handler should have been called at least once"
+        assert len(dlq.records) == 1, "Exactly one DLQ record expected for Task"
+        assert dlq.records[0].message == task_msg
+        assert "exceeded max retries" in str(dlq.records[0].error).lower()
+
+    def test_max_retries_exceeded_error_importable_from_public_api(self):
+        """MaxRetriesExceededError must be importable from the top-level message_bus package.
+
+        Cross-component integration: async_redis_bus.MaxRetriesExceededError is re-exported
+        via __init__.py; callers must be able to catch it using the public API import.
+        """
+        from message_bus import MaxRetriesExceededError
+
+        err = MaxRetriesExceededError(
+            message_id="msg-1", delivery_count=4, max_retry=3
+        )
+        assert isinstance(err, Exception)
+        assert err.message_id == "msg-1"
+        assert err.delivery_count == 4
+        assert err.max_retry == 3
+        assert "msg-1" in str(err)
+        assert "4" in str(err)
+
+    @pytest.mark.asyncio
+    async def test_query_stream_has_no_xautoclaim_loop(
+        self, fake_redis_server, serializer
+    ):
+        """Query consumer does NOT have an XAUTOCLAIM loop (by design).
+
+        Command/Task/Event streams get XAUTOCLAIM recovery. Query streams do not:
+        a timed-out query caller already handles the failure via TimeoutError, so
+        stale PEL entries for queries are an expected operational artefact.
+        This test documents the current design boundary.
+        """
+        import fakeredis
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-query-no-xac",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+
+        async def handler(q: GetOrderQuery) -> str:
+            return f"ok:{q.order_id}"
+
+        bus.register_query(GetOrderQuery, handler)
+        await bus.start()
+
+        # Verify: only _run_query_consumer task is spawned (no xautoclaim task)
+        # Command/Event buses spawn 2 tasks per stream (consumer + xautoclaim).
+        # A Query-only bus must spawn exactly 1 task (query consumer, no xautoclaim).
+        assert len(bus._consumer_tasks) == 1, (
+            "Query-only bus must spawn exactly 1 background task "
+            "(no XAUTOCLAIM loop for query streams)"
+        )
+
+        await bus.close()
