@@ -2,10 +2,12 @@
 
 from message_bus.dead_letter import (
     AsyncDeadLetterMiddleware,
+    DeadLetterEntry,
     DeadLetterMiddleware,
     DeadLetterRecord,
     DeadLetterStore,
     MemoryDeadLetterStore,
+    QueryableDeadLetterStore,
 )
 from message_bus.latency import (
     AsyncLatencyMiddleware,
@@ -103,6 +105,8 @@ __all__ = [
     # Dead Letter
     "DeadLetterStore",
     "DeadLetterRecord",
+    "DeadLetterEntry",
+    "QueryableDeadLetterStore",
     "MemoryDeadLetterStore",
     "DeadLetterMiddleware",
     "AsyncDeadLetterMiddleware",
@@ -154,5 +158,13 @@ except ImportError:
         ImportWarning,
         stacklevel=2,
     )
+
+# Optional Redis Dead Letter Store support
+try:
+    from message_bus.redis_dead_letter import RedisDeadLetterStore  # noqa: F401
+
+    __all__.extend(["RedisDeadLetterStore"])
+except ImportError:
+    pass
 
 __version__ = "0.1.0"

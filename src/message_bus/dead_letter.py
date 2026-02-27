@@ -10,6 +10,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from message_bus.middleware import AsyncPassthroughMiddleware, PassthroughMiddleware
@@ -41,6 +42,56 @@ class DeadLetterStore(ABC):
     @abstractmethod
     def close(self) -> None:
         """Flush and close the store. Must be idempotent."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class DeadLetterEntry:
+    """A serializable dead letter record with a unique persistence identifier.
+
+    Unlike :class:`DeadLetterRecord` (which holds the live Exception object),
+    ``DeadLetterEntry`` stores only serializable data suitable for persistent
+    backends (e.g. Redis, databases).
+    """
+
+    id: str
+    message_type: str
+    message_data: dict[str, Any]
+    error_type: str
+    error_message: str
+    handler_name: str
+    failed_at: datetime
+
+
+class QueryableDeadLetterStore(DeadLetterStore):
+    """Extended :class:`DeadLetterStore` with query and management API.
+
+    Implementations (e.g. :class:`~message_bus.RedisDeadLetterStore`) persist
+    entries across process restarts and expose retrieval / replay operations.
+    """
+
+    @abstractmethod
+    def list(self, limit: int = 100) -> list[DeadLetterEntry]:
+        """Return recent entries, newest first.
+
+        Args:
+            limit: Maximum number of entries to return.
+        """
+        ...
+
+    @abstractmethod
+    def get(self, entry_id: str) -> DeadLetterEntry | None:
+        """Return a specific entry by its unique ID, or ``None`` if not found."""
+        ...
+
+    @abstractmethod
+    def delete(self, entry_id: str) -> None:
+        """Delete an entry by its unique ID."""
+        ...
+
+    @abstractmethod
+    def count(self) -> int:
+        """Return the total number of stored entries."""
         ...
 
 
