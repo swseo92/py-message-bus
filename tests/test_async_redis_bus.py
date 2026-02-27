@@ -676,6 +676,97 @@ class TestAsyncRedisMessageBusQuery:
         result = await bus.send(GetOrderQuery(order_id="ord-500"))
         assert result is None
 
+    @pytest.mark.asyncio
+    async def test_send_query_uses_xread_block_when_block_ms_positive(
+        self, fake_redis_server, serializer
+    ):
+        """send() must call xread(block=N) instead of polling when _block_ms > 0."""
+        from unittest.mock import patch  # noqa: PLC0415
+
+        import fakeredis
+
+        client = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="svc",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="caller",
+            _block_ms=50,
+            _redis_client=client,
+            query_reply_timeout=0.15,
+        )
+        await bus.start()
+
+        xread_block_values: list[int | None] = []
+
+        async def spy_xread(streams, count=None, block=None):
+            if any("reply" in str(k) for k in streams):
+                xread_block_values.append(block)
+            return []  # always empty → triggers timeout
+
+        try:
+            with (
+                patch.object(client, "xread", side_effect=spy_xread),
+                pytest.raises((asyncio.TimeoutError, TimeoutError)),
+            ):
+                await bus.send(GetOrderQuery(order_id="test-block"))
+
+            assert xread_block_values, "No xread calls recorded for reply stream"
+            assert all(b is not None and b > 0 for b in xread_block_values), (
+                f"Expected all reply xread calls to use block>0, got: {xread_block_values}"
+            )
+        finally:
+            await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_send_query_last_id_not_reset_to_origin_after_empty_read(
+        self, fake_redis_server, serializer
+    ):
+        """send() must track last_id and not always re-read from '0-0'."""
+        from unittest.mock import patch  # noqa: PLC0415
+
+        import fakeredis
+
+        client = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="svc",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="caller",
+            _block_ms=0,
+            _redis_client=client,
+            query_reply_timeout=0.15,
+        )
+        await bus.start()
+
+        call_ids: list[str] = []
+
+        async def spy_xread(streams, count=None, block=None):
+            for k, stream_id in streams.items():
+                if "reply" in str(k):
+                    call_ids.append(stream_id if isinstance(stream_id, str) else stream_id.decode())
+            return []
+
+        try:
+            with (
+                patch.object(client, "xread", side_effect=spy_xread),
+                pytest.raises((asyncio.TimeoutError, TimeoutError)),
+            ):
+                await bus.send(GetOrderQuery(order_id="test-lastid"))
+
+            assert call_ids, "No xread calls for reply stream"
+            # First call must start from "0-0"
+            assert call_ids[0] == "0-0", f"First read must use '0-0', got: {call_ids[0]}"
+            # ID must never regress across iterations
+            for i in range(1, len(call_ids)):
+                assert call_ids[i] >= call_ids[i - 1], (
+                    f"ID must not regress: call {i} used '{call_ids[i]}' after '{call_ids[i - 1]}'"
+                )
+        finally:
+            await bus.close()
+
 
 # ---------------------------------------------------------------------------
 # AsyncRedisMessageBus – lifecycle tests
