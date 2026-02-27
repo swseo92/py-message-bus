@@ -133,4 +133,23 @@ try:
 except ImportError:
     pass
 
+# Optional Async Redis support
+try:
+    from message_bus.async_redis_bus import (  # noqa: F401
+        AsyncJsonSerializer,
+        AsyncRedisMessageBus,
+        TypeRegistry,
+    )
+
+    __all__.extend(["AsyncRedisMessageBus", "AsyncJsonSerializer", "TypeRegistry"])
+except ImportError:
+    import warnings
+
+    warnings.warn(
+        "AsyncRedisMessageBus is unavailable. "
+        "Install the 'redis' package: pip install 'redis>=5.0.0'",
+        ImportWarning,
+        stacklevel=2,
+    )
+
 __version__ = "0.1.0"
