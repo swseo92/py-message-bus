@@ -76,11 +76,36 @@ def _deserialize_message(fields: dict[bytes, bytes], serializer: Serializer) -> 
 
 
 def _fields_for_xadd(fields: dict[bytes, bytes]) -> dict[str, str]:
-    """Convert bytes key/value pairs to strings for Redis xadd."""
-    return {
-        k.decode() if isinstance(k, bytes) else k: v.decode() if isinstance(v, bytes) else v
-        for k, v in fields.items()
-    }
+    """Convert bytes key/value pairs to strings for Redis xadd.
+
+    Raises
+    ------
+    TypeError
+        If any key or value is not ``bytes`` or ``str``.
+    ValueError
+        If a bytes value cannot be UTF-8 decoded.
+    """
+    result: dict[str, str] = {}
+    for k, v in fields.items():
+        if isinstance(k, bytes):
+            str_key = k.decode("utf-8")
+        elif isinstance(k, str):
+            str_key = k
+        else:
+            raise TypeError(f"Expected bytes or str key, got {type(k).__name__!r}: {k!r}")
+        if isinstance(v, bytes):
+            try:
+                str_val = v.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise ValueError(f"Cannot decode value for key {str_key!r}: {exc}") from exc
+        elif isinstance(v, str):
+            str_val = v
+        else:
+            raise TypeError(
+                f"Expected bytes or str value for key {str_key!r}, got {type(v).__name__!r}: {v!r}"
+            )
+        result[str_key] = str_val
+    return result
 
 
 class RedisMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher, HandlerRegistry):

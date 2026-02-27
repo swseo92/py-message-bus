@@ -9,7 +9,7 @@ import pytest
 pytest.importorskip("redis")
 
 from message_bus.ports import Command, Event, Query, Task
-from message_bus.redis_bus import JsonSerializer, RedisMessageBus, RedisWorker
+from message_bus.redis_bus import JsonSerializer, RedisMessageBus, RedisWorker, _fields_for_xadd
 
 
 @dataclass(frozen=True)
@@ -357,3 +357,67 @@ class TestRedisStreamKeys:
         assert task_key == f"{unique_app_name}:task:TestTask"
 
         bus.close()
+
+
+class TestFieldsForXadd:
+    """Unit tests for _fields_for_xadd() conversion helper (no Redis needed)."""
+
+    def test_bytes_keys_and_values_are_decoded(self) -> None:
+        fields = {b"key": b"value"}
+        result = _fields_for_xadd(fields)
+        assert result == {"key": "value"}
+
+    def test_str_keys_and_values_are_passed_through(self) -> None:
+        result = _fields_for_xadd({b"k": b"v"})
+        assert result == {"k": "v"}
+        # str keys/values also accepted
+        result2 = _fields_for_xadd({"k": "v"})  # type: ignore[arg-type]
+        assert result2 == {"k": "v"}
+
+    def test_mixed_bytes_and_str(self) -> None:
+        fields = {b"bytes_key": b"bytes_val", "str_key": "str_val"}  # type: ignore[dict-item]
+        result = _fields_for_xadd(fields)
+        assert result == {"bytes_key": "bytes_val", "str_key": "str_val"}
+
+    def test_non_bytes_non_str_key_raises_type_error(self) -> None:
+        with pytest.raises(TypeError, match="Expected bytes or str key"):
+            _fields_for_xadd({123: b"value"})  # type: ignore[dict-item]
+
+    def test_non_bytes_non_str_value_raises_type_error(self) -> None:
+        with pytest.raises(TypeError, match="Expected bytes or str value"):
+            _fields_for_xadd({b"key": 42})  # type: ignore[dict-item]
+
+    def test_invalid_utf8_bytes_value_raises_value_error(self) -> None:
+        invalid_utf8 = b"\xff\xfe"
+        with pytest.raises(ValueError, match="Cannot decode value for key"):
+            _fields_for_xadd({b"key": invalid_utf8})
+
+    def test_empty_dict_returns_empty_dict(self) -> None:
+        assert _fields_for_xadd({}) == {}
+
+    def test_all_string_fields_preserved(self) -> None:
+        fields = {b"data": b"hello", b"type": b"TestCommand"}
+        result = _fields_for_xadd(fields)
+        assert result["data"] == "hello"
+        assert result["type"] == "TestCommand"
+
+
+class TestFieldsForXaddCallShape:
+    """Tests that xadd is called with stringified fields from _fields_for_xadd."""
+
+    def test_serialize_message_produces_bytes_fields(self) -> None:
+        """_serialize_message output fed into _fields_for_xadd yields str fields."""
+        from message_bus.redis_bus import JsonSerializer, _serialize_message
+
+        serializer = JsonSerializer()
+
+        @dataclass(frozen=True)
+        class _Cmd(Command):
+            value: int
+
+        raw = _serialize_message(_Cmd(value=7), serializer)
+        result = _fields_for_xadd(raw)
+        # All keys and values must be strings
+        for k, v in result.items():
+            assert isinstance(k, str), f"Key {k!r} is not str"
+            assert isinstance(v, str), f"Value {v!r} is not str"
