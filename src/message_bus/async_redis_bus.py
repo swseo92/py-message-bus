@@ -170,8 +170,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
     * **Event** – ``XADD`` + a *per-subscriber* consumer group (fan-out:
       every subscriber receives every event independently).
     * **Task** – identical to Command.
-    * **Query** – not implemented; raises :exc:`NotImplementedError`.
-      See SWS2-42.
+    * **Query** – ``XADD`` to a query stream + ``XREADGROUP`` (competitive
+      consumption).  Each call generates a unique ``correlation_id``; the
+      consumer writes the reply to a per-request reply stream; the caller
+      polls until the reply arrives or *query_reply_timeout* elapses.
 
     Parameters
     ----------
@@ -185,6 +187,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
     serializer:
         Custom :class:`AsyncJsonSerializer`. A fresh one is created if
         omitted.
+    query_reply_timeout:
+        Maximum seconds to wait for a query reply before raising
+        :exc:`asyncio.TimeoutError`.  Defaults to ``30.0``.
     consumer_name:
         Identity of this consumer within its group.
         Auto-generated from ``hostname-<random>`` if omitted.
@@ -229,6 +234,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         "_command_handlers",
         "_task_handlers",
         "_event_subscriptions",
+        "_query_handlers",
+        "_query_reply_timeout",
     )
 
     def __init__(
@@ -238,6 +245,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         app_name: str = "message_bus",
         serializer: AsyncJsonSerializer | None = None,
         consumer_name: str | None = None,
+        query_reply_timeout: float = 30.0,
         _block_ms: int = 100,
         _redis_client: Any | None = None,
     ) -> None:
@@ -257,9 +265,12 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         # Injected client takes priority (used in tests with fakeredis)
         self._redis: Any = _redis_client
 
+        self._query_reply_timeout = query_reply_timeout
+
         # Handler registries
         self._command_handlers: dict[type[Command], Callable[[Command], Awaitable[None]]] = {}
         self._task_handlers: dict[type[Task], Callable[[Task], Awaitable[None]]] = {}
+        self._query_handlers: dict[type[Query[Any]], Callable[[Query[Any]], Awaitable[Any]]] = {}
         # (event_type, per-subscriber consumer group, handler)
         self._event_subscriptions: list[
             tuple[type[Event], str, Callable[[Event], Awaitable[None]]]
@@ -278,7 +289,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         query_type: type[Query[T]],
         handler: Callable[[Query[T]], Awaitable[T]],
     ) -> None:
-        raise NotImplementedError("AsyncRedisMessageBus does not support Query yet. See SWS2-42.")
+        if query_type in self._query_handlers:
+            raise ValueError(f"Query handler already registered for {query_type.__name__}")
+        self._serializer.registry.register(query_type)
+        self._query_handlers[query_type] = handler
 
     def register_command(
         self,
@@ -317,7 +331,77 @@ class AsyncRedisMessageBus(AsyncMessageBus):
     # ------------------------------------------------------------------
 
     async def send(self, query: Query[T]) -> T:
-        raise NotImplementedError("AsyncRedisMessageBus does not support Query yet. See SWS2-42.")
+        """Send *query* and await its reply via a correlation_id–based reply stream.
+
+        A unique reply stream is created per call and cleaned up after the reply
+        is received (or on timeout).
+
+        Raises
+        ------
+        asyncio.TimeoutError
+            When no reply arrives within *query_reply_timeout* seconds.
+        RuntimeError
+            When the handler raises an exception (type and message are preserved
+            in the error message).
+        """
+        correlation_id = uuid.uuid4().hex
+        reply_stream = self._stream_key("reply", correlation_id)
+        stream_key = self._stream_key("query", type(query).__name__)
+
+        data = self._serializer.dumps(query)
+        await self._redis.xadd(
+            stream_key,
+            {
+                "data": data,
+                "correlation_id": correlation_id.encode(),
+                "reply_stream": reply_stream.encode(),
+            },
+        )
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._query_reply_timeout
+        try:
+            while True:
+                if loop.time() >= deadline:
+                    raise TimeoutError(
+                        f"Query {type(query).__name__!r} timed out "
+                        f"after {self._query_reply_timeout}s"
+                    )
+
+                result_msgs = await self._redis.xread({reply_stream: "0-0"}, count=1)
+                if result_msgs:
+                    for _, msgs in result_msgs:
+                        for _msg_id, fields in msgs:
+                            error_type_raw = fields.get(b"error_type") or fields.get("error_type")
+                            if error_type_raw:
+                                error_msg_raw = (
+                                    fields.get(b"error_message")
+                                    or fields.get("error_message")
+                                    or b""
+                                )
+                                et = (
+                                    error_type_raw.decode()
+                                    if isinstance(error_type_raw, bytes)
+                                    else error_type_raw
+                                )
+                                em = (
+                                    error_msg_raw.decode()
+                                    if isinstance(error_msg_raw, bytes)
+                                    else error_msg_raw
+                                )
+                                raise RuntimeError(f"{et}: {em}")
+                            raw = fields.get(b"data") or fields.get("data")
+                            if raw is not None:
+                                return self._serializer.loads(  # type: ignore[no-any-return]
+                                    raw if isinstance(raw, bytes) else raw.encode()
+                                )
+
+                await asyncio.sleep(0)  # yield so the consumer loop can run
+        finally:
+            try:
+                await self._redis.delete(reply_stream)
+            except Exception:
+                pass
 
     async def execute(self, command: Command) -> None:
         """Publish *command* to its Redis stream (competitive consumption)."""
@@ -354,6 +438,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         # Single consumer loop for all commands and tasks
         if self._command_handlers or self._task_handlers:
             self._consumer_tasks.append(asyncio.create_task(self._run_command_task_consumer()))
+
+        # Single consumer loop for all queries (competitive consumption + reply)
+        if self._query_handlers:
+            self._consumer_tasks.append(asyncio.create_task(self._run_query_consumer()))
 
         # Dedicated consumer loop per event subscriber (fan-out)
         for event_type, subscriber_group, handler in self._event_subscriptions:
@@ -544,6 +632,112 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             except Exception:
                 logger.exception("Unexpected error in event consumer")
                 await asyncio.sleep(0.1)
+
+    async def _run_query_consumer(self) -> None:
+        """Background coroutine: competitive consumption of queries with reply delivery."""
+        streams: list[str] = [self._stream_key("query", t.__name__) for t in self._query_handlers]
+        for key in streams:
+            await self._ensure_group(key, self._consumer_group)
+
+        retry_delay = 0.1
+        while self._running:
+            try:
+                messages = await self._redis.xreadgroup(
+                    groupname=self._consumer_group,
+                    consumername=self._consumer_name,
+                    streams=dict.fromkeys(streams, ">"),
+                    count=10,
+                    block=self._block_ms,
+                )
+                if messages:
+                    for stream_name_raw, stream_msgs in messages:
+                        stream_str = (
+                            stream_name_raw.decode()
+                            if isinstance(stream_name_raw, bytes)
+                            else stream_name_raw
+                        )
+                        await self._handle_query_batch(stream_str, stream_msgs)
+                else:
+                    await asyncio.sleep(0)
+                retry_delay = 0.1
+            except asyncio.CancelledError:
+                return
+            except (RedisConnectionError, RedisTimeoutError):
+                logger.warning(
+                    "Redis connection error in query consumer, reconnecting in %.1fs",
+                    retry_delay,
+                )
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 30.0)
+                await self._reconnect()
+            except Exception:
+                logger.exception("Unexpected error in query consumer")
+                await asyncio.sleep(0.1)
+
+    async def _handle_query_batch(self, stream_str: str, batch: list[Any]) -> None:
+        """Process a batch of query messages, writing replies to their reply streams."""
+        for message_id, fields in batch:
+            reply_stream: str | None = None
+            try:
+                raw = fields.get(b"data") or fields.get("data")
+                reply_stream_raw = fields.get(b"reply_stream") or fields.get("reply_stream")
+
+                if raw is None or reply_stream_raw is None:
+                    logger.warning(
+                        "Query message missing required fields; skipping id=%s", message_id
+                    )
+                    await self._redis.xack(stream_str, self._consumer_group, message_id)
+                    continue
+
+                reply_stream = (
+                    reply_stream_raw.decode()
+                    if isinstance(reply_stream_raw, bytes)
+                    else reply_stream_raw
+                )
+
+                msg = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
+
+                if isinstance(msg, Query):
+                    handler = self._query_handlers.get(type(msg))
+                    if handler is not None:
+                        try:
+                            result = await handler(msg)
+                            result_data = self._serializer.dumps(result)
+                            await self._redis.xadd(reply_stream, {"data": result_data})
+                        except Exception as exc:
+                            await self._redis.xadd(
+                                reply_stream,
+                                {
+                                    "error_type": type(exc).__name__,
+                                    "error_message": str(exc),
+                                },
+                            )
+                        await self._redis.xack(stream_str, self._consumer_group, message_id)
+                    else:
+                        logger.warning(
+                            "No handler for query %s; leaving in PEL for retry",
+                            type(msg).__name__,
+                        )
+                else:
+                    logger.warning(
+                        "Non-Query payload on query stream (type=%s); skipping id=%s",
+                        type(msg).__name__,
+                        message_id,
+                    )
+                    await self._redis.xack(stream_str, self._consumer_group, message_id)
+            except Exception:
+                logger.exception("Error processing query message id=%s", message_id)
+                if reply_stream:
+                    try:
+                        await self._redis.xadd(
+                            reply_stream,
+                            {
+                                "error_type": "RuntimeError",
+                                "error_message": "Internal error processing query",
+                            },
+                        )
+                    except Exception:
+                        pass
 
     async def _reconnect(self) -> None:
         """Replace the Redis client after a connection failure."""
