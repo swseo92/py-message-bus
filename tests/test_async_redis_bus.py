@@ -1807,7 +1807,9 @@ class TestMalformedPayloadHandling:
         await asyncio.sleep(0.3)
         await bus.close()
 
-        assert not handler_called, "Handler must not be called for task message missing 'data' field"
+        assert not handler_called, (
+            "Handler must not be called for task message missing 'data' field"
+        )
 
         pending = await fake_redis.xpending(stream_key, "malformed-task-test")
         assert pending["pending"] == 0, (
@@ -2154,3 +2156,263 @@ class TestReconnectConsumerGroupRecreation:
         assert ensure_call_count == 1
 
         await bus.close()
+
+
+# ---------------------------------------------------------------------------
+# Graceful Shutdown (SWS2-52)
+# ---------------------------------------------------------------------------
+
+
+class TestGracefulShutdown:
+    """close() should protect in-flight messages during shutdown."""
+
+    def test_shutdown_timeout_default_value(self, serializer, fake_redis):
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="grp",
+            serializer=serializer,
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        assert bus._shutdown_timeout == 5.0
+
+    def test_shutdown_timeout_custom_value(self, serializer, fake_redis):
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="grp",
+            serializer=serializer,
+            shutdown_timeout=10.0,
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        assert bus._shutdown_timeout == 10.0
+
+    @pytest.mark.asyncio
+    async def test_close_waits_for_in_flight_sequential_command(
+        self, fake_redis_server, serializer
+    ):
+        """close() must not cancel a command handler that is in progress."""
+        handler_started = asyncio.Event()
+        handler_can_finish = asyncio.Event()
+        handler_done = asyncio.Event()
+
+        async def slow_handler(cmd: CreateOrderCommand) -> None:
+            handler_started.set()
+            await handler_can_finish.wait()
+            handler_done.set()
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="grp",
+            app_name="test_graceful",
+            serializer=serializer,
+            shutdown_timeout=5.0,
+            _block_ms=0,
+            _redis_client=fakeredis.aioredis.FakeRedis(server=fake_redis_server),
+        )
+        bus.register_command(CreateOrderCommand, slow_handler)
+        await bus.start()
+
+        await bus.execute(CreateOrderCommand(order_id="g1", amount=Decimal("1")))
+        # Wait until the handler is actively running
+        await asyncio.wait_for(handler_started.wait(), timeout=2.0)
+
+        # Initiate shutdown while handler is blocked
+        close_task = asyncio.create_task(bus.close())
+        await asyncio.sleep(0)  # let close() set _running=False and enter asyncio.wait
+
+        # Allow handler to complete
+        handler_can_finish.set()
+        await close_task
+
+        assert handler_done.is_set(), "Handler should have completed before shutdown"
+
+    @pytest.mark.asyncio
+    async def test_close_cancels_after_shutdown_timeout(self, fake_redis_server, serializer):
+        """close() must cancel consumer tasks that exceed shutdown_timeout."""
+        handler_started = asyncio.Event()
+
+        async def blocking_handler(cmd: CreateOrderCommand) -> None:
+            handler_started.set()
+            await asyncio.sleep(100)  # never finishes in time
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="grp",
+            app_name="test_timeout",
+            serializer=serializer,
+            shutdown_timeout=0.05,  # very short – will expire before handler
+            _block_ms=0,
+            _redis_client=fakeredis.aioredis.FakeRedis(server=fake_redis_server),
+        )
+        bus.register_command(CreateOrderCommand, blocking_handler)
+        await bus.start()
+
+        await bus.execute(CreateOrderCommand(order_id="t1", amount=Decimal("1")))
+        await asyncio.wait_for(handler_started.wait(), timeout=2.0)
+
+        # close() should return (after timeout) even though handler is still blocking
+        await asyncio.wait_for(bus.close(), timeout=2.0)
+
+        assert not bus._running
+
+    @pytest.mark.asyncio
+    async def test_unfinished_message_stays_in_pel_after_forced_cancel(
+        self, fake_redis_server, serializer
+    ):
+        """A message that could not complete within shutdown_timeout must remain in the PEL."""
+        handler_started = asyncio.Event()
+
+        async def blocking_handler(cmd: CreateOrderCommand) -> None:
+            handler_started.set()
+            await asyncio.sleep(100)
+
+        inspect_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="grp",
+            app_name="test_pel",
+            serializer=serializer,
+            consumer_name="consumer-1",
+            shutdown_timeout=0.05,
+            _block_ms=0,
+            _redis_client=fakeredis.aioredis.FakeRedis(server=fake_redis_server),
+        )
+        bus.register_command(CreateOrderCommand, blocking_handler)
+        await bus.start()
+
+        await bus.execute(CreateOrderCommand(order_id="p1", amount=Decimal("1")))
+        await asyncio.wait_for(handler_started.wait(), timeout=2.0)
+
+        await asyncio.wait_for(bus.close(), timeout=2.0)
+
+        # The message was dequeued but not ACKed → must remain in PEL
+        stream_key = "test_pel:command:CreateOrderCommand"
+        pending_info = await inspect_redis.xpending(stream_key, "grp")
+        assert pending_info["pending"] > 0, "Message should remain in PEL for XAUTOCLAIM recovery"
+        await inspect_redis.aclose()
+
+    def test_shutdown_timeout_rejects_invalid_values(self, serializer, fake_redis):
+        """shutdown_timeout must be a finite positive number."""
+        import math
+
+        for bad_value in (0, -1, -0.1, math.nan, math.inf, float("-inf")):
+            with pytest.raises(ValueError, match="shutdown_timeout"):
+                AsyncRedisMessageBus(
+                    redis_url="redis://localhost",
+                    consumer_group="grp",
+                    serializer=serializer,
+                    shutdown_timeout=bad_value,
+                    _block_ms=0,
+                    _redis_client=fake_redis,
+                )
+
+    @pytest.mark.asyncio
+    async def test_task_consumer_graceful_shutdown(self, fake_redis_server, serializer):
+        """close() must wait for an in-flight task handler to complete (parity with command)."""
+        handler_started = asyncio.Event()
+        handler_can_finish = asyncio.Event()
+        handler_done = asyncio.Event()
+
+        async def slow_task_handler(task: ProcessPaymentTask) -> None:
+            handler_started.set()
+            await handler_can_finish.wait()
+            handler_done.set()
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="grp",
+            app_name="test_task_graceful",
+            serializer=serializer,
+            shutdown_timeout=5.0,
+            _block_ms=0,
+            _redis_client=fakeredis.aioredis.FakeRedis(server=fake_redis_server),
+        )
+        bus.register_task(ProcessPaymentTask, slow_task_handler)
+        await bus.start()
+
+        await bus.dispatch(ProcessPaymentTask(payment_id="p1", amount=Decimal("10")))
+        await asyncio.wait_for(handler_started.wait(), timeout=2.0)
+
+        close_task = asyncio.create_task(bus.close())
+        await asyncio.sleep(0)
+
+        handler_can_finish.set()
+        await close_task
+
+        assert handler_done.is_set(), "Task handler should have completed before shutdown"
+
+    @pytest.mark.asyncio
+    async def test_concurrent_mode_shutdown_waits_for_inner_tasks(
+        self, fake_redis_server, serializer
+    ):
+        """close() must wait for concurrent inner tasks spawned by semaphore-mode consumers."""
+        handlers_started = 0
+        handlers_done = 0
+        all_started = asyncio.Event()
+        can_finish = asyncio.Event()
+
+        async def slow_handler(cmd: CreateOrderCommand) -> None:
+            nonlocal handlers_started, handlers_done
+            handlers_started += 1
+            if handlers_started >= 2:
+                all_started.set()
+            await can_finish.wait()
+            handlers_done += 1
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="grp",
+            app_name="test_concurrent_shutdown",
+            serializer=serializer,
+            shutdown_timeout=5.0,
+            _block_ms=0,
+            _redis_client=fakeredis.aioredis.FakeRedis(server=fake_redis_server),
+        )
+        bus.register_command(CreateOrderCommand, slow_handler, concurrency=2)
+        await bus.start()
+
+        await bus.execute(CreateOrderCommand(order_id="c1", amount=Decimal("1")))
+        await bus.execute(CreateOrderCommand(order_id="c2", amount=Decimal("2")))
+        await asyncio.wait_for(all_started.wait(), timeout=2.0)
+
+        close_task = asyncio.create_task(bus.close())
+        await asyncio.sleep(0)
+
+        can_finish.set()
+        await close_task
+
+        assert handlers_done == 2, "Both concurrent handlers should complete before shutdown"
+
+    @pytest.mark.asyncio
+    async def test_task_consumer_nogroup_recovery(self, fake_redis_server, serializer):
+        """Task consumer must recreate the consumer group after a NOGROUP error."""
+        handled = asyncio.Event()
+
+        async def handler(task: ProcessPaymentTask) -> None:
+            handled.set()
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="grp",
+            app_name="test_task_nogroup",
+            serializer=serializer,
+            shutdown_timeout=2.0,
+            _block_ms=0,
+            _redis_client=fakeredis.aioredis.FakeRedis(server=fake_redis_server),
+        )
+        bus.register_task(ProcessPaymentTask, handler)
+        await bus.start()
+
+        # Delete the consumer group to simulate NOGROUP scenario
+        stream_key = "test_task_nogroup:task:ProcessPaymentTask"
+        await bus._redis.xgroup_destroy(stream_key, "grp")
+
+        # Dispatch a task – the consumer must recover by recreating the group
+        await bus.dispatch(ProcessPaymentTask(payment_id="n1", amount=Decimal("5")))
+        try:
+            await asyncio.wait_for(handled.wait(), timeout=3.0)
+        finally:
+            await bus.close()
+
+        assert handled.is_set(), "Task handler should be called after NOGROUP recovery"
