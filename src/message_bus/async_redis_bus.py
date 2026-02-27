@@ -1050,8 +1050,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, 30.0)
                 await self._reconnect()
-            except Exception:
-                logger.exception("Unexpected error in event consumer")
+            except Exception as e:
+                if not await self._handle_nogroup_error(e, [stream_key], subscriber_group):
+                    logger.exception("Unexpected error in event consumer")
                 await asyncio.sleep(0.1)
 
     async def _run_query_consumer(self) -> None:
@@ -1091,8 +1092,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, 30.0)
                 await self._reconnect()
-            except Exception:
-                logger.exception("Unexpected error in query consumer")
+            except Exception as e:
+                if not await self._handle_nogroup_error(e, streams, self._consumer_group):
+                    logger.exception("Unexpected error in query consumer")
                 await asyncio.sleep(0.1)
 
     # TTL for orphaned reply streams (seconds); guards against late consumer writes
@@ -1416,6 +1418,49 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         except Exception:
             logger.exception("Error reprocessing claimed event message id=%s", message_id)
 
+    async def _ensure_all_groups(self) -> None:
+        """Recreate all registered consumer groups.
+
+        Called at startup and after reconnect to ensure groups exist on the
+        current Redis master (e.g. after a failover that promoted a new master).
+        """
+        for t in self._command_handlers:
+            await self._ensure_group(self._stream_key("command", t.__name__), self._consumer_group)
+        for t in self._task_handlers:
+            await self._ensure_group(self._stream_key("task", t.__name__), self._consumer_group)
+        for t in self._query_handlers:
+            await self._ensure_group(self._stream_key("query", t.__name__), self._consumer_group)
+        for event_type, subscriber_group, _ in self._event_subscriptions:
+            await self._ensure_group(
+                self._stream_key("event", event_type.__name__), subscriber_group
+            )
+
+    async def _handle_nogroup_error(self, exc: Exception, streams: list[str], group: str) -> bool:
+        """Handle a NOGROUP ResponseError by recreating consumer groups.
+
+        Returns True if *exc* was a NOGROUP error (regardless of whether the
+        group recreation succeeded), False otherwise.  Guards against the case
+        where the redis package is unavailable and ``RedisResponseError`` has
+        been aliased to the built-in ``Exception``.
+        """
+        if RedisResponseError is Exception:
+            return False
+        if not isinstance(exc, RedisResponseError) or "NOGROUP" not in str(exc):
+            return False
+        logger.warning(
+            "NOGROUP error detected, recreating %d consumer groups in group=%s",
+            len(streams),
+            group,
+        )
+        try:
+            for stream_key in streams:
+                await self._ensure_group(stream_key, group)
+        except Exception:
+            logger.exception(
+                "Failed to recreate consumer groups after NOGROUP error (group=%s)", group
+            )
+        return True
+
     async def _reconnect(self) -> None:
         """Replace the Redis client after a connection failure."""
         if self._redis is not None:
@@ -1427,3 +1472,11 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             self._redis = aioredis.from_url(self._redis_url, decode_responses=False)
         except Exception:
             logger.exception("Failed to reconnect to Redis")
+            return
+        try:
+            await self._ensure_all_groups()
+        except Exception:
+            logger.exception(
+                "Failed to recreate consumer groups after reconnect; "
+                "individual consumers will recover via NOGROUP handling"
+            )
