@@ -17,6 +17,7 @@ from message_bus.latency import (
     SeparationSignal,
 )
 from message_bus.local import AsyncLocalMessageBus, LocalMessageBus
+from message_bus.metrics import BusMetricsCollector, BusMetricsSnapshot, StreamMetrics
 from message_bus.middleware import (
     AsyncMiddleware,
     AsyncMiddlewareBus,
@@ -110,6 +111,10 @@ __all__ = [
     "MemoryDeadLetterStore",
     "DeadLetterMiddleware",
     "AsyncDeadLetterMiddleware",
+    # Metrics
+    "BusMetricsCollector",
+    "BusMetricsSnapshot",
+    "StreamMetrics",
 ]
 
 # Optional ZMQ support
