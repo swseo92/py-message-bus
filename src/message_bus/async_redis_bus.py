@@ -257,6 +257,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         "_max_stream_length",
         "_idempotency_ttl",
         "_concurrency_config",
+        "_shutdown_timeout",
     )
 
     def __init__(
@@ -272,6 +273,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         dead_letter_store: DeadLetterStore | None = None,
         max_stream_length: int = 10_000,
         idempotency_ttl: int = 86400,
+        shutdown_timeout: float = 5.0,
         _block_ms: int = 100,
         _redis_client: Any | None = None,
     ) -> None:
@@ -298,6 +300,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         if idempotency_ttl <= 0:
             raise ValueError(f"idempotency_ttl must be a positive integer (got {idempotency_ttl})")
         self._idempotency_ttl = idempotency_ttl
+        self._shutdown_timeout = shutdown_timeout
         self._block_ms = _block_ms
         # Injected client takes priority (used in tests with fakeredis)
         self._redis: Any = _redis_client
@@ -550,14 +553,32 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             )
 
     async def close(self) -> None:
-        """Cancel background consumers and close the Redis connection."""
+        """Gracefully stop consumers and close the Redis connection.
+
+        Sets the shutdown flag to prevent new messages from being fetched, then
+        waits up to ``shutdown_timeout`` seconds for in-flight messages to
+        complete before cancelling any remaining consumer tasks.
+
+        Messages that did not finish within the timeout remain in the Redis
+        Streams PEL (Pending Entry List) and will be reclaimed by XAUTOCLAIM
+        when the next consumer starts.
+        """
         self._running = False
-        for task in self._consumer_tasks:
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):
-                pass
+        if self._consumer_tasks:
+            _, pending = await asyncio.wait(
+                self._consumer_tasks,
+                timeout=self._shutdown_timeout,
+            )
+            if pending:
+                logger.warning(
+                    "%d consumer task(s) did not finish within %.1fs shutdown timeout; "
+                    "cancelling. Unacknowledged messages remain in the PEL for XAUTOCLAIM.",
+                    len(pending),
+                    self._shutdown_timeout,
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
         self._consumer_tasks.clear()
         if self._redis is not None:
             try:
@@ -660,6 +681,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
 
         concurrent_tasks: set[asyncio.Task[None]] = set()
         retry_delay = 0.1
+        _graceful = False
         try:
             while self._running:
                 try:
@@ -696,15 +718,19 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                     await asyncio.sleep(retry_delay)
                     retry_delay = min(retry_delay * 2, 30.0)
                     await self._reconnect()
-                except Exception:
-                    logger.exception("Unexpected error in command consumer for %s", stream_key)
+                except Exception as e:
+                    if not await self._handle_nogroup_error(e, [stream_key], self._consumer_group):
+                        logger.exception("Unexpected error in command consumer for %s", stream_key)
                     await asyncio.sleep(0.1)
+            _graceful = True  # loop exited normally via _running = False
         except asyncio.CancelledError:
             pass
         finally:
             if concurrent_tasks:
-                for t in concurrent_tasks:
-                    t.cancel()
+                if not _graceful:
+                    # Forced cancellation: cancel in-flight tasks so messages stay in PEL
+                    for t in concurrent_tasks:
+                        t.cancel()
                 await asyncio.gather(*concurrent_tasks, return_exceptions=True)
 
     async def _process_command_message(
@@ -774,6 +800,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
 
         concurrent_tasks: set[asyncio.Task[None]] = set()
         retry_delay = 0.1
+        _graceful = False
         try:
             while self._running:
                 try:
@@ -810,15 +837,19 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                     await asyncio.sleep(retry_delay)
                     retry_delay = min(retry_delay * 2, 30.0)
                     await self._reconnect()
-                except Exception:
-                    logger.exception("Unexpected error in task consumer for %s", stream_key)
+                except Exception as e:
+                    if not await self._handle_nogroup_error(e, [stream_key], self._consumer_group):
+                        logger.exception("Unexpected error in task consumer for %s", stream_key)
                     await asyncio.sleep(0.1)
+            _graceful = True  # loop exited normally via _running = False
         except asyncio.CancelledError:
             pass
         finally:
             if concurrent_tasks:
-                for t in concurrent_tasks:
-                    t.cancel()
+                if not _graceful:
+                    # Forced cancellation: cancel in-flight tasks so messages stay in PEL
+                    for t in concurrent_tasks:
+                        t.cancel()
                 await asyncio.gather(*concurrent_tasks, return_exceptions=True)
 
     async def _process_task_message(
@@ -841,9 +872,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         if ikey_raw is not None:
             ikey = ikey_raw.decode() if isinstance(ikey_raw, bytes) else ikey_raw
             if not await self._try_claim_dedup(ikey, scope=stream_key):
-                logger.info(
-                    "Skipping duplicate task (idempotency_key=%s) id=%s", ikey, message_id
-                )
+                logger.info("Skipping duplicate task (idempotency_key=%s) id=%s", ikey, message_id)
                 await self._redis.xack(stream_key, self._consumer_group, message_id)
                 return
 
