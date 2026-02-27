@@ -56,11 +56,6 @@ class JsonSerializer:
         return json.loads(data.decode("utf-8"))
 
 
-def _default_stream_key(prefix: str, name: str) -> str:
-    """Generate default Redis stream key."""
-    return f"message_bus:{prefix}:{name}"
-
-
 def _serialize_message(msg: Any, serializer: Serializer) -> dict[bytes, bytes]:
     """Serialize a message to Redis stream field-value pairs."""
     data = serializer.dumps(msg)
@@ -78,6 +73,14 @@ def _deserialize_message(fields: dict[bytes, bytes], serializer: Serializer) -> 
         return serializer.loads(data)
     except KeyError as e:
         raise ValueError(f"Missing 'data' field in message: {fields!r}") from e
+
+
+def _fields_for_xadd(fields: dict[bytes, bytes]) -> dict[str, str]:
+    """Convert bytes key/value pairs to strings for Redis xadd."""
+    return {
+        k.decode() if isinstance(k, bytes) else k: v.decode() if isinstance(v, bytes) else v
+        for k, v in fields.items()
+    }
 
 
 class RedisMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher, HandlerRegistry):
@@ -409,13 +412,7 @@ class RedisMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher, Handler
         fields[b"correlation_id"] = correlation_id.encode("utf-8")
         fields[b"response_stream"] = response_key.encode("utf-8")
 
-        self._redis.xadd(
-            query_stream,
-            {
-                k.decode() if isinstance(k, bytes) else k: v.decode() if isinstance(v, bytes) else v
-                for k, v in fields.items()
-            },
-        )
+        self._redis.xadd(query_stream, _fields_for_xadd(fields))
 
         # Wait for response
         start_time = time.time()
@@ -464,26 +461,14 @@ class RedisMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher, Handler
         """Execute a command."""
         stream_key = self._stream_key("command", type(command).__name__)
         fields = _serialize_message(command, self._serializer)
-        self._redis.xadd(
-            stream_key,
-            {
-                k.decode() if isinstance(k, bytes) else k: v.decode() if isinstance(v, bytes) else v
-                for k, v in fields.items()
-            },
-        )
+        self._redis.xadd(stream_key, _fields_for_xadd(fields))
 
     def publish(self, event: Event) -> None:
         """Publish an event to all subscribers."""
         # Add to event stream (for persistence/history)
         stream_key = self._stream_key("event", type(event).__name__)
         fields = _serialize_message(event, self._serializer)
-        self._redis.xadd(
-            stream_key,
-            {
-                k.decode() if isinstance(k, bytes) else k: v.decode() if isinstance(v, bytes) else v
-                for k, v in fields.items()
-            },
-        )
+        self._redis.xadd(stream_key, _fields_for_xadd(fields))
 
         # Also publish to pub/sub for immediate fan-out
         channel = self._stream_key("event", type(event).__name__)
