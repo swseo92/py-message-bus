@@ -1311,11 +1311,11 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         handler: Callable[[Command], Awaitable[None]],
         semaphore: asyncio.Semaphore | None = None,
     ) -> bool:
-        """단일 Command 메시지를 처리한다.
+        """Process a single Command message.
 
         Returns:
-            True  — 순차 경로(semaphore=None)에서 성공. caller가 배치 XACK 담당.
-            False — 이미 개별 XACK 완료(early-exit·concurrency 경로) 또는 실패(PEL 유지).
+            True  — sequential path (semaphore=None), success; caller is responsible for batch XACK.
+            False — already individually ACKed (early-exit / concurrency path) or failed (in PEL).
         """
         raw: bytes | None = fields.get(b"data") or fields.get("data")
         if raw is None:
@@ -1384,10 +1384,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         if self._metrics_collector is not None:
             self._metrics_collector.record_processed(stream_key)
         if semaphore is not None:
-            # Concurrency 경로: asyncio.Task로 독립 실행 — 즉시 개별 XACK
+            # Concurrency path: runs as an independent asyncio.Task — XACK immediately
             await self._redis.xack(stream_key, self._consumer_group, message_id)
             return False
-        return True  # 순차 경로: caller가 ack_ids 수집 후 배치 XACK
+        return True  # Sequential path: caller collects ack_ids for batch XACK
 
     async def _run_single_task_consumer(
         self,
@@ -1482,11 +1482,11 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         handler: Callable[[Task], Awaitable[None]],
         semaphore: asyncio.Semaphore | None = None,
     ) -> bool:
-        """단일 Task 메시지를 처리한다.
+        """Process a single Task message.
 
         Returns:
-            True  — 순차 경로(semaphore=None)에서 성공. caller가 배치 XACK 담당.
-            False — 이미 개별 XACK 완료(early-exit·concurrency 경로) 또는 실패(PEL 유지).
+            True  — sequential path (semaphore=None), success; caller is responsible for batch XACK.
+            False — already individually ACKed (early-exit / concurrency path) or failed (in PEL).
         """
         raw: bytes | None = fields.get(b"data") or fields.get("data")
         if raw is None:
@@ -1553,10 +1553,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         if self._metrics_collector is not None:
             self._metrics_collector.record_processed(stream_key)
         if semaphore is not None:
-            # Concurrency 경로: asyncio.Task로 독립 실행 — 즉시 개별 XACK
+            # Concurrency path: runs as an independent asyncio.Task — XACK immediately
             await self._redis.xack(stream_key, self._consumer_group, message_id)
             return False
-        return True  # 순차 경로: caller가 ack_ids 수집 후 배치 XACK
+        return True  # Sequential path: caller collects ack_ids for batch XACK
 
     async def _handle_command_task_batch(self, stream_str: str, batch: list[Any]) -> None:
         for message_id, fields in batch:

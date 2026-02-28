@@ -4941,3 +4941,46 @@ class TestConsumerLoopDirectDlq:
         )
         assert result is False
         assert len(dlq.records) == 0
+
+    @pytest.mark.asyncio
+    async def test_route_to_dlq_if_exhausted_returns_false_on_xpending_range_error(
+        self, fake_redis_server, serializer
+    ):
+        """_route_to_dlq_if_exhausted returns False (leave in PEL) when xpending_range raises.
+
+        If the Redis PEL query fails (network error, NOGROUP, etc.) the method must
+        log the exception and return False so the message stays in PEL for the
+        XAUTOCLAIM loop to retry — it must never silently discard the message.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        import fakeredis
+
+        from message_bus.dead_letter import MemoryDeadLetterStore
+
+        dlq = MemoryDeadLetterStore()
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-xpending-err",
+            app_name="test",
+            serializer=serializer,
+            max_retry=0,
+            dead_letter_store=dlq,
+            _redis_client=fake_redis,
+        )
+        bus._redis = fake_redis
+
+        with patch.object(
+            fake_redis,
+            "xpending_range",
+            new_callable=AsyncMock,
+            side_effect=ConnectionError("Simulated Redis connection failure"),
+        ):
+            result = await bus._route_to_dlq_if_exhausted(
+                "some:stream", b"1234-0", {}, "test-xpending-err"
+            )
+
+        assert result is False, "Must return False and leave message in PEL on xpending_range error"
+        assert len(dlq.records) == 0, "No DLQ record should be written when PEL query fails"
