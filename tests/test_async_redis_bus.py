@@ -4119,3 +4119,163 @@ class TestBatchXack:
             f"Expected 1 xack call for 4 event messages, got {len(xack_calls)}"
         )
         assert len(xack_calls[0][2]) == 4
+
+
+# ===========================================================================
+# Cross-feature integration tests (SWS2-61 + SWS2-62 + SWS2-63 + SWS2-64)
+# ===========================================================================
+
+
+class TestCrossFeatureIntegration:
+    """SWS2-61/62/63/64 피처 간 상호작용 통합 검증.
+
+    - SWS2-61: EVALSHA (Lua script register_script)
+    - SWS2-62: PubSub reply listener 이벤트 드리븐
+    - SWS2-63: Consumer 배치 XACK
+    - SWS2-64: execute_many / publish_many / dispatch_many
+    """
+
+    def _make_bus(self, fake_r, serializer, **kwargs):
+        return AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="cross-feature-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_r,
+            **kwargs,
+        )
+
+    @pytest.mark.asyncio
+    async def test_execute_many_with_idempotency_clears_pel_via_batch_xack(
+        self, fake_redis_server, serializer
+    ):
+        """SWS2-64 + SWS2-61 + SWS2-63 통합:
+        execute_many로 전송된 N개 Command가 EVALSHA dedup 체크를 거쳐
+        배치 XACK로 PEL을 완전히 비워야 한다.
+        """
+        import fakeredis
+
+        processed: list[str] = []
+
+        async def handler(cmd: CreateOrderCommand) -> None:
+            processed.append(cmd.order_id)
+
+        fake_r = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = self._make_bus(fake_r, serializer, command_idempotency=True)
+        bus.register_command(CreateOrderCommand, handler)
+        await bus.start()
+
+        cmds = [
+            CreateOrderCommand(order_id=f"xm-{i}", amount=Decimal("1.00"))
+            for i in range(4)
+        ]
+        await bus.execute_many(cmds)
+
+        deadline = asyncio.get_event_loop().time() + 2.0
+        while len(processed) < 4 and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.05)
+        await bus.close()
+
+        assert len(processed) == 4, f"Expected 4 processed, got {len(processed)}"
+
+        stream_key = bus._stream_key("command", "CreateOrderCommand")
+        pending = await fake_r.xpending(stream_key, "cross-feature-test")
+        assert pending["pending"] == 0, (
+            f"PEL should be empty after batch XACK, got {pending['pending']} pending"
+        )
+
+    @pytest.mark.asyncio
+    async def test_execute_many_duplicate_dedup_keys_still_cleared_from_pel(
+        self, fake_redis_server, serializer
+    ):
+        """SWS2-64 + SWS2-61 + SWS2-63 통합:
+        동일 idempotency_key를 공유하는 중복 Command가 전송될 때
+        consumer는 첫 번째만 처리(EVALSHA dedup)하고, 중복 메시지도 배치 XACK로
+        PEL에서 제거해야 한다 (무한 재시도 방지).
+        """
+        import fakeredis
+
+        processed: list[str] = []
+
+        async def handler(cmd: CreateOrderCommand) -> None:
+            processed.append(cmd.order_id)
+
+        fake_r = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = self._make_bus(fake_r, serializer, command_idempotency=True)
+        bus.register_command(CreateOrderCommand, handler)
+        await bus.start()
+
+        stream_key = bus._stream_key("command", "CreateOrderCommand")
+        shared_ikey = "dup-ikey-cross-001"
+        for i in range(3):
+            data = serializer.dumps(
+                CreateOrderCommand(order_id=f"dup-{i}", amount=Decimal("1.00"))
+            )
+            await fake_r.xadd(
+                stream_key,
+                {"data": data, "message_id": f"mid-{i}", "idempotency_key": shared_ikey},
+            )
+
+        await asyncio.sleep(0.5)
+        await bus.close()
+
+        assert len(processed) == 1, (
+            f"EVALSHA dedup: only 1 handler call expected, got {len(processed)}"
+        )
+        pending = await fake_r.xpending(stream_key, "cross-feature-test")
+        assert pending["pending"] == 0, (
+            f"All 3 messages (including deduped) must be XACK'd, got {pending['pending']} pending"
+        )
+
+    @pytest.mark.asyncio
+    async def test_query_resolves_correctly_during_concurrent_execute_many(
+        self, fake_redis_server, serializer
+    ):
+        """SWS2-62 + SWS2-64 통합:
+        execute_many로 Command 배치를 전송하는 동안 동시에 Query를 보내도
+        PubSub listen() 이벤트 드리븐 경로(SWS2-62)가 정상 동작해야 한다.
+        """
+        import fakeredis
+
+        fake_r = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+
+        producer = self._make_bus(fake_r, serializer)
+        consumer = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="cross-feature-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_r,
+        )
+
+        async def order_handler(cmd: CreateOrderCommand) -> None:
+            await asyncio.sleep(0)
+
+        async def query_handler(q: GetOrderQuery) -> str:
+            return f"order:{q.order_id}"
+
+        consumer.register_command(CreateOrderCommand, order_handler)
+        consumer.register_query(GetOrderQuery, query_handler)
+
+        await producer.start()
+        await consumer.start()
+
+        cmds = [
+            CreateOrderCommand(order_id=f"conc-{i}", amount=Decimal("1.00"))
+            for i in range(5)
+        ]
+        execute_task = asyncio.create_task(producer.execute_many(cmds))
+        query_result = await consumer.send(GetOrderQuery(order_id="q-001"))
+
+        await execute_task
+        await producer.close()
+        await consumer.close()
+
+        assert query_result == "order:q-001", (
+            f"Query via PubSub listen() must resolve correctly under concurrent load, "
+            f"got {query_result!r}"
+        )
