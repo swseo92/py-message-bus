@@ -286,6 +286,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         # Shared Pub/Sub reply listener
         "_pubsub",
         "_pending_queries",
+        "_stream_key_cache",
     )
 
     def __init__(
@@ -342,9 +343,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             )
         if sentinel_urls is not None:
             if not sentinel_urls:
-                raise ValueError(
-                    "sentinel_urls must contain at least one (host, port) tuple."
-                )
+                raise ValueError("sentinel_urls must contain at least one (host, port) tuple.")
             if not sentinel_service_name:
                 raise ValueError(
                     "sentinel_service_name is required when sentinel_urls is provided."
@@ -378,6 +377,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         # Metadata mode: "standard" (lightweight fields) or "none" (data only)
         self._metadata_mode: Literal["standard", "none"] = metadata_mode
         self._source_id: str = socket.gethostname()
+        self._stream_key_cache: dict[tuple[str, str], str] = {}
         # Injected client takes priority (used in tests with fakeredis)
         self._redis: Any = _redis_client
 
@@ -513,8 +513,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 )
             except TimeoutError:
                 raise TimeoutError(
-                    f"Query {type(query).__name__!r} timed out "
-                    f"after {self._query_reply_timeout}s"
+                    f"Query {type(query).__name__!r} timed out after {self._query_reply_timeout}s"
                 ) from None
         finally:
             self._pending_queries.pop(correlation_id, None)
@@ -655,9 +654,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             raise RuntimeError(
                 f"Failed to subscribe to Pub/Sub reply pattern {reply_pattern!r}: {exc}"
             ) from exc
-        self._consumer_tasks.append(
-            asyncio.create_task(self._run_pubsub_reply_listener())
-        )
+        self._consumer_tasks.append(asyncio.create_task(self._run_pubsub_reply_listener()))
 
         # Dedicated consumer loop per event subscriber (fan-out)
         for event_type, subscriber_group, event_handler in self._event_subscriptions:
@@ -882,12 +879,16 @@ class AsyncRedisMessageBus(AsyncMessageBus):
     # ------------------------------------------------------------------
 
     def _stream_key(self, prefix: str, name: str) -> str:
+        cache_key = (prefix, name)
+        cached = self._stream_key_cache.get(cache_key)
+        if cached is not None:
+            return cached
         if self._cluster_mode:
-            # Hash tag ensures all stream keys land on the same slot in Cluster mode.
-            # Redis Streams consumer groups (XREADGROUP) require all keys used by a
-            # given consumer group to be in the same hash slot.
-            return f"{{{self._app_name}}}:{prefix}:{name}"
-        return f"{self._app_name}:{prefix}:{name}"
+            result = f"{{{self._app_name}}}:{prefix}:{name}"
+        else:
+            result = f"{self._app_name}:{prefix}:{name}"
+        self._stream_key_cache[cache_key] = result
+        return result
 
     def _reply_channel_key(self, correlation_id: str) -> str:
         """Return the Pub/Sub channel name for a query reply."""
@@ -1539,13 +1540,29 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 if isinstance(msg, Query):
                     handler = self._query_handlers.get(type(msg))
                     if handler is not None:
+                        assert reply_channel is not None  # checked at field-validation above
                         _handler_ok = False
                         try:
                             result = await handler(msg)
                             result_data = self._serializer.dumps(result)
                             payload = json.dumps({"data": result_data.decode("utf-8")})
-                            await self._redis.publish(reply_channel, payload)
-                            _handler_ok = True
+                            try:
+                                await self._send_reply_and_ack(
+                                    reply_channel, payload, stream_str, message_id
+                                )
+                                _handler_ok = True
+                            except Exception as pipeline_exc:
+                                logger.warning(
+                                    "Query reply pipeline failed (reply_channel=%s): %s",
+                                    reply_channel,
+                                    pipeline_exc,
+                                )
+                                await self._send_error_reply(
+                                    reply_channel,
+                                    type(pipeline_exc).__name__,
+                                    str(pipeline_exc),
+                                )
+                                await self._redis.xack(stream_str, self._consumer_group, message_id)
                         except Exception as exc:
                             logger.warning(
                                 "Query handler %s raised %s (reply_channel=%s): %s",
@@ -1559,9 +1576,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                             await self._send_error_reply(
                                 reply_channel, type(exc).__name__, str(exc)
                             )
+                            await self._redis.xack(stream_str, self._consumer_group, message_id)
                         if _handler_ok and self._metrics_collector is not None:
                             self._metrics_collector.record_processed(stream_str)
-                        await self._redis.xack(stream_str, self._consumer_group, message_id)
                     else:
                         logger.warning(
                             "No handler for query %s; leaving in PEL for retry",
@@ -1585,6 +1602,19 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                     await self._redis.xack(stream_str, self._consumer_group, message_id)
                 except Exception as e:
                     logger.warning("Failed to XACK query message id=%s: %s", message_id, e)
+
+    async def _send_reply_and_ack(
+        self,
+        reply_channel: str,
+        payload: str,
+        stream_str: str,
+        message_id: bytes,
+    ) -> None:
+        """Pipeline PUBLISH reply + XACK into a single Redis round trip."""
+        async with self._redis.pipeline(transaction=False) as pipe:
+            pipe.publish(reply_channel, payload)
+            pipe.xack(stream_str, self._consumer_group, message_id)
+            await pipe.execute()
 
     async def _run_pubsub_reply_listener(self) -> None:
         """Background coroutine: receive PUBLISH-ed query replies and dispatch to futures.
@@ -1874,12 +1904,18 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         Called at startup and after reconnect to ensure groups exist on the
         current Redis master (e.g. after a failover that promoted a new master).
         """
-        for t in self._command_handlers:
-            await self._ensure_group(self._stream_key("command", t.__name__), self._consumer_group)
-        for t in self._task_handlers:
-            await self._ensure_group(self._stream_key("task", t.__name__), self._consumer_group)
-        for t in self._query_handlers:
-            await self._ensure_group(self._stream_key("query", t.__name__), self._consumer_group)
+        for cmd_t in self._command_handlers:
+            await self._ensure_group(
+                self._stream_key("command", cmd_t.__name__), self._consumer_group
+            )
+        for task_t in self._task_handlers:
+            await self._ensure_group(
+                self._stream_key("task", task_t.__name__), self._consumer_group
+            )
+        for query_t in self._query_handlers:
+            await self._ensure_group(
+                self._stream_key("query", query_t.__name__), self._consumer_group
+            )
         for event_type, subscriber_group, _ in self._event_subscriptions:
             await self._ensure_group(
                 self._stream_key("event", event_type.__name__), subscriber_group
