@@ -2991,3 +2991,239 @@ class TestStreamKeys:
         assert key1 == key2
         assert ("command", "FooCmd") in bus._stream_key_cache
         assert bus._stream_key_cache[("command", "FooCmd")] == key1
+
+
+# ---------------------------------------------------------------------------
+# SWS2-57: 타입별 멱등성 스마트 기본값 + Lua 원자 연산
+# ---------------------------------------------------------------------------
+
+
+class TestIdempotencyDefaults:
+    """타입별 멱등성 기본값 및 오버라이드 테스트."""
+
+    def _make_bus(self, fake_redis, serializer=None, **kwargs):
+        return AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-group",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+            **kwargs,
+        )
+
+    def test_command_idempotency_default_is_true(self, fake_redis):
+        """Command 멱등성은 기본 ON."""
+        bus = self._make_bus(fake_redis)
+        assert bus._command_idempotency is True
+
+    def test_task_idempotency_default_is_true(self, fake_redis):
+        """Task 멱등성은 기본 ON."""
+        bus = self._make_bus(fake_redis)
+        assert bus._task_idempotency is True
+
+    def test_event_idempotency_default_is_false(self, fake_redis):
+        """Event 멱등성은 기본 OFF."""
+        bus = self._make_bus(fake_redis)
+        assert bus._event_idempotency is False
+
+    def test_query_idempotency_default_is_false(self, fake_redis):
+        """Query 멱등성은 기본 OFF."""
+        bus = self._make_bus(fake_redis)
+        assert bus._query_idempotency is False
+
+    def test_idempotency_all_overridable(self, fake_redis):
+        """양방향 오버라이드: 기본값과 반대로 설정 가능."""
+        bus = self._make_bus(
+            fake_redis,
+            command_idempotency=False,
+            task_idempotency=False,
+            event_idempotency=True,
+            query_idempotency=True,
+        )
+        assert bus._command_idempotency is False
+        assert bus._task_idempotency is False
+        assert bus._event_idempotency is True
+        assert bus._query_idempotency is True
+
+    @pytest.mark.asyncio
+    async def test_command_dedup_skips_duplicate_with_lua(self, fake_redis_server, serializer):
+        """멱등성 ON + Lua 스크립트: 동일 idempotency_key Command는 한 번만 처리."""
+        call_count = 0
+
+        async def handler(cmd: CreateOrderCommand) -> None:
+            nonlocal call_count
+            call_count += 1
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-group",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            command_idempotency=True,
+            _block_ms=0,
+            _redis_client=fakeredis.aioredis.FakeRedis(server=fake_redis_server),
+        )
+        bus.register_command(CreateOrderCommand, handler)
+
+        async with bus:
+            # 동일한 stream_key에 두 번 XADD (같은 ikey)
+            stream_key = bus._stream_key("command", "CreateOrderCommand")
+            await bus._xadd(stream_key, CreateOrderCommand(order_id="1", amount=Decimal("10")), idempotency_key="ikey-1")
+            await bus._xadd(stream_key, CreateOrderCommand(order_id="2", amount=Decimal("20")), idempotency_key="ikey-1")
+            await asyncio.sleep(0.2)
+
+        assert call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_command_dedup_off_processes_all(self, fake_redis_server, serializer):
+        """멱등성 OFF: 동일 idempotency_key라도 모두 처리."""
+        call_count = 0
+
+        async def handler(cmd: CreateOrderCommand) -> None:
+            nonlocal call_count
+            call_count += 1
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-group",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            command_idempotency=False,
+            _block_ms=0,
+            _redis_client=fakeredis.aioredis.FakeRedis(server=fake_redis_server),
+        )
+        bus.register_command(CreateOrderCommand, handler)
+
+        async with bus:
+            stream_key = bus._stream_key("command", "CreateOrderCommand")
+            await bus._xadd(stream_key, CreateOrderCommand(order_id="1", amount=Decimal("10")), idempotency_key="ikey-x")
+            await bus._xadd(stream_key, CreateOrderCommand(order_id="2", amount=Decimal("20")), idempotency_key="ikey-x")
+            await asyncio.sleep(0.2)
+
+        assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_task_dedup_skips_duplicate_with_lua(self, fake_redis_server, serializer):
+        """멱등성 ON + Lua 스크립트: 동일 idempotency_key Task는 한 번만 처리."""
+        call_count = 0
+
+        async def handler(task: ProcessPaymentTask) -> None:
+            nonlocal call_count
+            call_count += 1
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-group",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            task_idempotency=True,
+            _block_ms=0,
+            _redis_client=fakeredis.aioredis.FakeRedis(server=fake_redis_server),
+        )
+        bus.register_task(ProcessPaymentTask, handler)
+
+        async with bus:
+            stream_key = bus._stream_key("task", "ProcessPaymentTask")
+            await bus._xadd(stream_key, ProcessPaymentTask(payment_id="p1", amount=Decimal("5")), idempotency_key="task-ikey-1")
+            await bus._xadd(stream_key, ProcessPaymentTask(payment_id="p2", amount=Decimal("5")), idempotency_key="task-ikey-1")
+            await asyncio.sleep(0.2)
+
+        assert call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_xadd_pipeline_sets_dedup_key_when_idempotency_on(self, fake_redis_server, serializer):
+        """XADD + SET NX 파이프라이닝: publish 시 dedup 키가 미리 설정됨."""
+        fake_r = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-group",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            command_idempotency=True,
+            _block_ms=0,
+            _redis_client=fake_r,
+        )
+        stream_key = bus._stream_key("command", "CreateOrderCommand")
+        ikey = "pipeline-test-ikey"
+        await bus._xadd(stream_key, CreateOrderCommand(order_id="1", amount=Decimal("1")), idempotency_key=ikey, with_dedup=True)
+
+        dedup_key = bus._dedup_key(ikey, scope=stream_key)
+        exists = await fake_r.exists(dedup_key)
+        assert exists == 1
+
+    @pytest.mark.asyncio
+    async def test_xadd_no_dedup_key_when_idempotency_off(self, fake_redis_server, serializer):
+        """XADD without dedup: idempotency_off 시 dedup 키 없음."""
+        fake_r = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-group",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            command_idempotency=False,
+            _block_ms=0,
+            _redis_client=fake_r,
+        )
+        stream_key = bus._stream_key("command", "CreateOrderCommand")
+        ikey = "no-dedup-ikey"
+        await bus._xadd(stream_key, CreateOrderCommand(order_id="1", amount=Decimal("1")), idempotency_key=ikey, with_dedup=False)
+
+        dedup_key = bus._dedup_key(ikey, scope=stream_key)
+        exists = await fake_r.exists(dedup_key)
+        assert exists == 0
+
+    @pytest.mark.asyncio
+    async def test_lua_claim_or_ack_returns_true_first_time(self, fake_redis_server, serializer):
+        """_claim_or_ack_dedup: 첫 번째 호출은 True (claimed)."""
+        fake_r = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-group",
+            app_name="test",
+            serializer=serializer,
+            _block_ms=0,
+            _redis_client=fake_r,
+        )
+        # Set up a stream and group
+        stream_key = "test:stream"
+        await fake_r.xadd(stream_key, {"data": "x"})
+        await fake_r.xgroup_create(stream_key, "test-group", id="0", mkstream=True)
+        msgs = await fake_r.xreadgroup("test-group", "test-consumer", {stream_key: ">"}, count=1)
+        mid = msgs[0][1][0][0]
+
+        result = await bus._claim_or_ack_dedup(stream_key, mid, "ikey-lua-1")
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_lua_claim_or_ack_returns_false_and_acks_on_duplicate(self, fake_redis_server, serializer):
+        """_claim_or_ack_dedup: 중복 시 False 반환 + XACK 자동 수행."""
+        fake_r = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-group",
+            app_name="test",
+            serializer=serializer,
+            _block_ms=0,
+            _redis_client=fake_r,
+        )
+        stream_key = "test:stream2"
+        await fake_r.xadd(stream_key, {"data": "y"})
+        await fake_r.xgroup_create(stream_key, "test-group", id="0", mkstream=True)
+        msgs = await fake_r.xreadgroup("test-group", "test-consumer", {stream_key: ">"}, count=1)
+        mid = msgs[0][1][0][0]
+
+        # First call: claimed
+        await bus._claim_or_ack_dedup(stream_key, mid, "ikey-lua-dup")
+        # Second call: duplicate
+        result = await bus._claim_or_ack_dedup(stream_key, mid, "ikey-lua-dup")
+        assert result is False
+        # PEL should be empty (XACK was done atomically)
+        pending = await fake_r.xpending(stream_key, "test-group")
+        assert pending["pending"] == 0

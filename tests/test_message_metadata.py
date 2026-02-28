@@ -295,14 +295,27 @@ class TestConsumerIdempotency:
 
     @pytest.mark.asyncio
     async def test_duplicate_event_idempotency_key_processed_once(
-        self, bus, fake_redis, fake_redis_server
+        self, serializer, fake_redis, fake_redis_server
     ):
-        """Duplicate event with same idempotency_key: subscriber handler called once."""
+        """Duplicate event with same idempotency_key: subscriber handler called once.
+
+        event_idempotency=True must be set explicitly; the default is False.
+        """
         results: list[str] = []
 
         async def handler(evt: StockUpdatedEvent) -> None:
             results.append(evt.product_id)
 
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-group",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-producer",
+            event_idempotency=True,
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
         bus.subscribe(StockUpdatedEvent, handler)
         await bus.start()
 
