@@ -4490,3 +4490,237 @@ class TestCrossFeatureIntegration:
             f"Query via PubSub listen() must resolve correctly under concurrent load, "
             f"got {query_result!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# SWS2-66: dedup 재시도 + 미지정 idempotency_key 경고
+# ---------------------------------------------------------------------------
+
+
+class TestReleaseDeduplicKeyRetry:
+    """_release_dedup_key exponential backoff 재시도 로직 테스트."""
+
+    def _make_bus(self, fake_redis, **kwargs):
+        return AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-group",
+            app_name="test",
+            consumer_name="test-consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+            **kwargs,
+        )
+
+    @pytest.mark.asyncio
+    async def test_release_dedup_key_succeeds_on_first_attempt(self, fake_redis):
+        """정상 케이스: 첫 번째 시도에서 성공하면 재시도 없이 반환."""
+        bus = self._make_bus(fake_redis)
+        await bus.start()
+
+        # dedup 키를 미리 설정
+        dedup_key = bus._dedup_key("test-ikey", scope="test-scope")
+        await fake_redis.set(dedup_key, "1")
+
+        # 삭제 성공 → 예외 없이 반환
+        await bus._release_dedup_key("test-ikey", scope="test-scope")
+
+        # 키가 삭제됐는지 확인
+        assert await fake_redis.exists(dedup_key) == 0
+
+        await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_release_dedup_key_retries_on_failure_then_succeeds(
+        self, fake_redis, caplog
+    ):
+        """Redis 오류 후 재시도 성공: 2번째 시도에서 성공하면 warning 1회 발생."""
+        import unittest.mock as mock
+
+        bus = self._make_bus(fake_redis)
+        await bus.start()
+
+        call_count = 0
+        original_delete = bus._redis.delete
+
+        async def flaky_delete(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise OSError("transient network error")
+            return await original_delete(*args, **kwargs)
+
+        with (
+            mock.patch.object(bus._redis, "delete", side_effect=flaky_delete),
+            mock.patch("asyncio.sleep", return_value=None),  # backoff 없이
+            caplog.at_level("WARNING", logger="message_bus.async_redis_bus"),
+        ):
+            await bus._release_dedup_key("retry-ikey", scope="retry-scope")
+
+        assert call_count == 2, f"Expected 2 attempts, got {call_count}"
+        # 1회 warning (첫 번째 실패) 기록
+        assert any("attempt 1/3" in r.message for r in caplog.records), (
+            "Expected a warning log mentioning attempt 1/3"
+        )
+
+        await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_release_dedup_key_logs_error_after_all_retries_exhausted(
+        self, fake_redis, caplog
+    ):
+        """3번 모두 실패하면 error 레벨 로그를 남기고 조용히 반환 (예외 미전파)."""
+        import unittest.mock as mock
+
+        bus = self._make_bus(fake_redis)
+        await bus.start()
+
+        async def always_fail(*args, **kwargs):
+            raise OSError("permanent failure")
+
+        with (
+            mock.patch.object(bus._redis, "delete", side_effect=always_fail),
+            mock.patch("asyncio.sleep", return_value=None),
+            caplog.at_level("ERROR", logger="message_bus.async_redis_bus"),
+        ):
+            # 예외가 전파되지 않아야 함
+            await bus._release_dedup_key("fail-ikey", scope="fail-scope")
+
+        error_records = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(error_records) == 1, (
+            f"Expected exactly 1 ERROR log after 3 failed attempts, got {len(error_records)}"
+        )
+        assert "after 3 attempts" in error_records[0].message, (
+            f"Error message should mention '3 attempts', got: {error_records[0].message!r}"
+        )
+
+        await bus.close()
+
+
+class TestMissingIdempotencyKeyWarning:
+    """idempotency_key 미지정 시 경고 로그 테스트."""
+
+    @pytest.mark.asyncio
+    async def test_command_missing_idempotency_key_emits_warning(
+        self, fake_redis_server, caplog
+    ):
+        """command_idempotency=True + idempotency_key 필드 없음 → WARNING 로그 발생."""
+        import fakeredis
+
+        async def handler(cmd: CreateOrderCommand) -> None:
+            pass
+
+        fake_r = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="warn-test",
+            app_name="test",
+            serializer=None,
+            consumer_name="consumer",
+            command_idempotency=True,
+            _block_ms=0,
+            _redis_client=fake_r,
+        )
+        bus.register_command(CreateOrderCommand, handler)
+
+        stream_key = "test:command:CreateOrderCommand"
+        # idempotency_key 필드 없이 data만 포함하는 메시지를 직접 주입
+        serializer = AsyncJsonSerializer()
+        data = serializer.dumps(CreateOrderCommand(order_id="w1", amount=Decimal("1.00")))
+        await fake_r.xgroup_create(stream_key, "warn-test", id="0", mkstream=True)
+        await fake_r.xadd(stream_key, {"data": data})  # no idempotency_key field
+
+        with caplog.at_level("WARNING", logger="message_bus.async_redis_bus"):
+            await bus.start()
+            await asyncio.sleep(0.3)
+            await bus.close()
+
+        warning_msgs = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        assert any("idempotency_key" in m and "dedup check skipped" in m for m in warning_msgs), (
+            f"Expected warning about missing idempotency_key, got: {warning_msgs}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_task_missing_idempotency_key_emits_warning(
+        self, fake_redis_server, caplog
+    ):
+        """task_idempotency=True + idempotency_key 필드 없음 → WARNING 로그 발생."""
+        import fakeredis
+
+        async def handler(t: ProcessPaymentTask) -> None:
+            pass
+
+        fake_r = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="warn-task-test",
+            app_name="test",
+            serializer=None,
+            consumer_name="consumer",
+            task_idempotency=True,
+            _block_ms=0,
+            _redis_client=fake_r,
+        )
+        bus.register_task(ProcessPaymentTask, handler)
+
+        stream_key = "test:task:ProcessPaymentTask"
+        serializer = AsyncJsonSerializer()
+        data = serializer.dumps(ProcessPaymentTask(payment_id="p1", amount=Decimal("5.00")))
+        await fake_r.xgroup_create(stream_key, "warn-task-test", id="0", mkstream=True)
+        await fake_r.xadd(stream_key, {"data": data})  # no idempotency_key field
+
+        with caplog.at_level("WARNING", logger="message_bus.async_redis_bus"):
+            await bus.start()
+            await asyncio.sleep(0.3)
+            await bus.close()
+
+        warning_msgs = [r.message for r in caplog.records if r.levelname == "WARNING"]
+        assert any("idempotency_key" in m and "dedup check skipped" in m for m in warning_msgs), (
+            f"Expected warning about missing idempotency_key for task, got: {warning_msgs}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_command_with_idempotency_key_no_warning(
+        self, fake_redis_server, caplog
+    ):
+        """idempotency_key 필드가 있으면 경고 없이 정상 처리."""
+        import fakeredis
+
+        processed: list[str] = []
+
+        async def handler(cmd: CreateOrderCommand) -> None:
+            processed.append(cmd.order_id)
+
+        fake_r = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="no-warn-test",
+            app_name="test",
+            serializer=None,
+            consumer_name="consumer",
+            command_idempotency=True,
+            _block_ms=0,
+            _redis_client=fake_r,
+        )
+        bus.register_command(CreateOrderCommand, handler)
+
+        with caplog.at_level("WARNING", logger="message_bus.async_redis_bus"):
+            async with bus:
+                stream_key = bus._stream_key("command", "CreateOrderCommand")
+                await bus._xadd(
+                    stream_key,
+                    CreateOrderCommand(order_id="ok1", amount=Decimal("1.00")),
+                    idempotency_key="explicit-ikey",
+                )
+                await asyncio.sleep(0.3)
+
+        # idempotency_key 관련 경고 없어야 함
+        dedup_warnings = [
+            r.message for r in caplog.records
+            if r.levelname == "WARNING"
+            and "idempotency_key" in r.message
+            and "dedup check skipped" in r.message
+        ]
+        assert not dedup_warnings, (
+            f"No dedup warning expected when idempotency_key is set, got: {dedup_warnings}"
+        )
+        assert "ok1" in processed
