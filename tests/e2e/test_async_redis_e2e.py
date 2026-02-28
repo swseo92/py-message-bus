@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass
-from typing import Any
 
 import pytest
 import redis.asyncio as aioredis
@@ -41,7 +40,7 @@ def unique_app() -> str:
 
 async def flush_keys(pattern: str) -> None:
     """Delete all Redis keys matching *pattern* (for cleanup)."""
-    client = aioredis.from_url(REDIS_URL, decode_responses=False)  # type: ignore[no-untyped-call]
+    client = aioredis.from_url(REDIS_URL, decode_responses=False)
     try:
         keys = await client.keys(pattern)
         if keys:
@@ -96,7 +95,7 @@ class FailingCommand(Command):
 # ---------------------------------------------------------------------------
 
 
-class TestSWS2_45_MaxStreamLength:
+class TestSws245MaxStreamLength:
     @pytest.mark.asyncio
     async def test_stream_length_capped(self):
         app = unique_app()
@@ -126,7 +125,7 @@ class TestSWS2_45_MaxStreamLength:
 
             # Query XLEN directly
             stream_key = f"{app}:command:PingCommand"
-            client = aioredis.from_url(REDIS_URL, decode_responses=False)  # type: ignore[no-untyped-call]
+            client = aioredis.from_url(REDIS_URL, decode_responses=False)
             try:
                 xlen = await client.xlen(stream_key)
             finally:
@@ -147,7 +146,7 @@ class TestSWS2_45_MaxStreamLength:
 # ---------------------------------------------------------------------------
 
 
-class TestSWS2_46_MessageMetadata:
+class TestSws246MessageMetadata:
     @pytest.mark.asyncio
     async def test_metadata_fields_present_in_stream(self):
         app = unique_app()
@@ -170,7 +169,7 @@ class TestSWS2_46_MessageMetadata:
 
             # Read the raw stream entry to inspect metadata
             stream_key = f"{app}:command:PingCommand"
-            client = aioredis.from_url(REDIS_URL, decode_responses=True)  # type: ignore[no-untyped-call]
+            client = aioredis.from_url(REDIS_URL, decode_responses=True)
             try:
                 entries = await client.xrange(stream_key, count=5)
             finally:
@@ -210,7 +209,6 @@ class TestSWS2_46_MessageMetadata:
 
             # Inject two entries with the same idempotency_key directly
             ikey = uuid.uuid4().hex
-            import json
 
             from message_bus.async_redis_bus import AsyncJsonSerializer, TypeRegistry
 
@@ -219,7 +217,7 @@ class TestSWS2_46_MessageMetadata:
             ser = AsyncJsonSerializer(reg)
             data = ser.dumps(PingCommand(payload="dup-test"))
 
-            client = aioredis.from_url(REDIS_URL, decode_responses=False)  # type: ignore[no-untyped-call]
+            client = aioredis.from_url(REDIS_URL, decode_responses=False)
             try:
                 for _ in range(2):
                     await client.xadd(
@@ -247,7 +245,7 @@ class TestSWS2_46_MessageMetadata:
 # ---------------------------------------------------------------------------
 
 
-class TestSWS2_47_QueryReply:
+class TestSws247QueryReply:
     @pytest.mark.asyncio
     async def test_send_query_returns_handler_result(self):
         app = unique_app()
@@ -304,7 +302,7 @@ class TestSWS2_47_QueryReply:
 # ---------------------------------------------------------------------------
 
 
-class TestSWS2_48_HOLBlocking:
+class TestSws248HolBlocking:
     @pytest.mark.asyncio
     async def test_fast_command_not_blocked_by_slow_command(self):
         app = unique_app()
@@ -349,7 +347,7 @@ class TestSWS2_48_HOLBlocking:
 # ---------------------------------------------------------------------------
 
 
-class TestSWS2_49_ReconnectConsumerGroup:
+class TestSws249ReconnectConsumerGroup:
     @pytest.mark.asyncio
     async def test_consumer_group_recreated_after_destroy(self):
         """Bus should auto-recreate consumer group if it's been deleted."""
@@ -377,7 +375,7 @@ class TestSWS2_49_ReconnectConsumerGroup:
 
         # Destroy the consumer group via redis-cli equivalent
         stream_key = f"{app}:command:PingCommand"
-        client = aioredis.from_url(REDIS_URL, decode_responses=False)  # type: ignore[no-untyped-call]
+        client = aioredis.from_url(REDIS_URL, decode_responses=False)
         try:
             await client.xgroup_destroy(stream_key, group)
         finally:
@@ -411,7 +409,7 @@ class TestSWS2_49_ReconnectConsumerGroup:
 # ---------------------------------------------------------------------------
 
 
-class TestSWS2_50_HealthCheck:
+class TestSws250HealthCheck:
     @pytest.mark.asyncio
     async def test_health_before_start(self):
         app = unique_app()
@@ -469,7 +467,7 @@ class TestSWS2_50_HealthCheck:
 # ---------------------------------------------------------------------------
 
 
-class TestSWS2_51_Metrics:
+class TestSws251Metrics:
     @pytest.mark.asyncio
     async def test_metrics_snapshot_after_processing(self):
         app = unique_app()
@@ -541,7 +539,7 @@ class TestSWS2_51_Metrics:
 # ---------------------------------------------------------------------------
 
 
-class TestSWS2_52_GracefulShutdown:
+class TestSws252GracefulShutdown:
     @pytest.mark.asyncio
     async def test_inflight_message_completes_during_shutdown(self):
         app = unique_app()
@@ -582,7 +580,7 @@ class TestSWS2_52_GracefulShutdown:
 # ---------------------------------------------------------------------------
 
 
-class TestSWS2_53_ConnectionPool:
+class TestSws253ConnectionPool:
     @pytest.mark.asyncio
     async def test_connection_pool_works(self):
         """Bus accepts an external ConnectionPool and processes messages normally."""
@@ -637,7 +635,7 @@ class TestSWS2_53_ConnectionPool:
 # ---------------------------------------------------------------------------
 
 
-class TestSWS2_54_PersistentDeadLetterStore:
+class TestSws254PersistentDeadLetterStore:
     @pytest.mark.asyncio
     async def test_failed_message_captured_in_dlq(self):
         app = unique_app()
