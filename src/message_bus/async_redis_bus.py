@@ -308,6 +308,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         "_pubsub",
         "_pending_queries",
         "_stream_key_cache",
+        # Observability: reconnect tracking
+        "_reconnect_count",
+        "_last_reconnect_at",
     )
 
     def __init__(
@@ -433,6 +436,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         # Shared Pub/Sub reply listener (correlation_id → Future)
         self._pubsub: Any = None
         self._pending_queries: dict[str, asyncio.Future[bytes]] = {}
+        # Observability: reconnect tracking
+        self._reconnect_count: int = 0
+        self._last_reconnect_at: float | None = None
         # Cached Lua script handle – registered on start() to avoid sending
         # the full script body on every EVAL call (EVALSHA after first load).
         self._lua_ack_and_dedup: Any = None
@@ -706,19 +712,11 @@ class AsyncRedisMessageBus(AsyncMessageBus):
 
         # Shared Pub/Sub reply listener – always started so that send() works
         # even on buses that have no local query handlers (producer-only).
-        self._pubsub = self._redis.pubsub()
-        reply_pattern = (
-            f"{{{self._app_name}}}:reply_ch:*"
-            if self._cluster_mode
-            else f"{self._app_name}:reply_ch:*"
-        )
         try:
-            await self._pubsub.psubscribe(reply_pattern)
+            await self._setup_pubsub()
         except Exception as exc:
-            await self._pubsub.aclose()
-            self._pubsub = None
             raise RuntimeError(
-                f"Failed to subscribe to Pub/Sub reply pattern {reply_pattern!r}: {exc}"
+                f"Failed to subscribe to Pub/Sub reply pattern: {exc}"
             ) from exc
         self._consumer_tasks.append(asyncio.create_task(self._run_pubsub_reply_listener()))
 
@@ -911,6 +909,14 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         * ``is_healthy`` (bool) – ``True`` iff both sub-checks pass.
         * ``redis_connected`` (bool)
         * ``consumer_loop_active`` (bool)
+        * ``pubsub_active`` (bool) – ``True`` when the shared Pub/Sub reply
+          listener has an active subscription (``PSUBSCRIBE`` succeeded and
+          the connection is live).
+        * ``reconnect_count`` (int) – number of times :meth:`_reconnect` has
+          been called since the bus was instantiated.
+        * ``last_reconnect_at`` (float | None) – UNIX timestamp of the most
+          recent :meth:`_reconnect` call, or ``None`` if no reconnect has
+          occurred.
         """
         redis_connected = False
         redis_error: str | None = None
@@ -943,11 +949,17 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 not t.done() for t in self._consumer_tasks
             )
 
+        pubsub_active = (
+            self._pubsub is not None and bool(getattr(self._pubsub, "subscribed", False))
+        )
         return {
             "is_healthy": redis_connected and consumer_loop_active,
             "redis_connected": redis_connected,
             "consumer_loop_active": consumer_loop_active,
             "redis_error": redis_error,
+            "pubsub_active": pubsub_active,
+            "reconnect_count": self._reconnect_count,
+            "last_reconnect_at": self._last_reconnect_at,
         }
 
     async def is_healthy(self) -> bool:
@@ -1848,33 +1860,59 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         receipt, eliminating idle-CPU polling overhead.  The task exits cleanly
         when ``close()`` calls ``punsubscribe()``, which causes ``listen()``
         to exit its ``while self.subscribed`` loop naturally.
+
+        On a transient connection error the listener fails all pending queries
+        immediately (so callers receive ``ConnectionError`` instead of timing
+        out), then automatically re-subscribes and continues.  This eliminates
+        the Pub/Sub reply listener as a SPOF: a single dropped TCP connection
+        no longer requires a full bus restart.
         """
-        try:
-            async for message in self._pubsub.listen():
+        _reconnect_delay = 1.0  # seconds to wait before re-subscribing
+
+        while self._running:
+            current_pubsub = self._pubsub
+            if current_pubsub is None:
+                await asyncio.sleep(_reconnect_delay)
+                continue
+            try:
+                async for message in current_pubsub.listen():
+                    if not self._running:
+                        return
+                    msg_type = message.get("type")
+                    if msg_type not in ("pmessage", "message"):
+                        continue  # skip subscribe/unsubscribe confirmations
+                    channel = message.get("channel", b"")
+                    if isinstance(channel, bytes):
+                        channel = channel.decode()
+                    # Extract correlation_id: last `:` segment of the channel name
+                    correlation_id = channel.rsplit(":", 1)[-1]
+                    future = self._pending_queries.get(correlation_id)
+                    if future is not None and not future.done():
+                        raw = message["data"]
+                        future.set_result(raw if isinstance(raw, bytes) else raw.encode())
+            except asyncio.CancelledError:
+                return
+            except (RedisConnectionError, RedisTimeoutError, OSError) as e:
+                logger.warning("Pub/Sub reply listener disconnected: %s", e)
+                # Fail all pending queries immediately so callers get ConnectionError
+                # rather than waiting until their individual timeouts expire.
+                conn_err = ConnectionError(f"Pub/Sub reply listener disconnected: {e}")
+                for fut in list(self._pending_queries.values()):
+                    if not fut.done():
+                        fut.set_exception(conn_err)
+
                 if not self._running:
                     return
-                msg_type = message.get("type")
-                if msg_type not in ("pmessage", "message"):
-                    continue  # skip subscribe/unsubscribe confirmations
-                channel = message.get("channel", b"")
-                if isinstance(channel, bytes):
-                    channel = channel.decode()
-                # Extract correlation_id: last `:` segment of the channel name
-                correlation_id = channel.rsplit(":", 1)[-1]
-                future = self._pending_queries.get(correlation_id)
-                if future is not None and not future.done():
-                    raw = message["data"]
-                    future.set_result(raw if isinstance(raw, bytes) else raw.encode())
-        except asyncio.CancelledError:
-            return
-        except (RedisConnectionError, RedisTimeoutError, OSError) as e:
-            logger.warning("Pub/Sub reply listener disconnected: %s", e)
-            # Fail all pending queries immediately so callers get ConnectionError
-            # rather than waiting until their individual timeouts expire.
-            conn_err = ConnectionError(f"Pub/Sub reply listener disconnected: {e}")
-            for fut in list(self._pending_queries.values()):
-                if not fut.done():
-                    fut.set_exception(conn_err)
+
+                await asyncio.sleep(_reconnect_delay)
+
+                # Re-subscribe only if _reconnect() hasn't already replaced self._pubsub.
+                if self._running and self._pubsub is current_pubsub:
+                    try:
+                        await self._setup_pubsub()
+                        logger.info("Pub/Sub reply listener re-subscribed successfully")
+                    except Exception as reset_err:
+                        logger.warning("Pub/Sub re-subscribe failed: %s", reset_err)
 
     async def _send_error_reply(
         self, reply_channel: str, error_type: str, error_message: str
@@ -2183,12 +2221,44 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             return f"cluster(url={self._redis_url})"
         return f"standalone(url={self._redis_url})"
 
+    async def _setup_pubsub(self) -> None:
+        """(Re)initialize the shared Pub/Sub reply listener connection.
+
+        Closes the existing ``_pubsub`` object if present, then creates a fresh
+        one from the current ``_redis`` client and (re)subscribes to the reply
+        pattern.  Called from :meth:`start` on first connect and from
+        :meth:`_reconnect` after a Redis failover.
+        """
+        if self._pubsub is not None:
+            try:
+                await self._pubsub.aclose()
+            except Exception as e:
+                logger.warning("Error closing Pub/Sub during reset: %s", e)
+            self._pubsub = None
+        reply_pattern = (
+            f"{{{self._app_name}}}:reply_ch:*"
+            if self._cluster_mode
+            else f"{self._app_name}:reply_ch:*"
+        )
+        new_pubsub = self._redis.pubsub()
+        try:
+            await new_pubsub.psubscribe(reply_pattern)
+        except Exception:
+            await new_pubsub.aclose()
+            raise
+        self._pubsub = new_pubsub
+
     async def _reconnect(self) -> None:
         """Replace the Redis client after a connection failure.
 
         Only transient network errors are suppressed; configuration or
         programming errors are re-raised so callers are not silently broken.
+
+        Also resets the Pub/Sub reply listener on the new connection and
+        updates observability counters (``reconnect_count``, ``last_reconnect_at``).
         """
+        self._reconnect_count += 1
+        self._last_reconnect_at = time.time()
         if self._redis is not None:
             try:
                 await self._redis.aclose()
@@ -2212,3 +2282,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 "Failed to recreate consumer groups after reconnect; "
                 "individual consumers will recover via NOGROUP handling"
             )
+        try:
+            await self._setup_pubsub()
+        except Exception:
+            logger.exception("Failed to reset Pub/Sub after reconnect")
