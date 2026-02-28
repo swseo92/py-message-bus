@@ -75,10 +75,10 @@ try:
     from redis.exceptions import ResponseError as RedisResponseError
     from redis.exceptions import TimeoutError as RedisTimeoutError
 except ImportError:
-    aioredis = None  # type: ignore[assignment]
-    RedisConnectionError = OSError  # type: ignore[assignment, misc]
-    RedisTimeoutError = TimeoutError  # type: ignore[assignment, misc]
-    RedisResponseError = _FallbackRedisResponseError  # type: ignore[assignment, misc]
+    aioredis = None
+    RedisConnectionError = OSError
+    RedisTimeoutError = TimeoutError
+    RedisResponseError = _FallbackRedisResponseError
 
 
 # ---------------------------------------------------------------------------
@@ -739,9 +739,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         try:
             await self._setup_pubsub()
         except Exception as exc:
-            raise RuntimeError(
-                f"Failed to subscribe to Pub/Sub reply pattern: {exc}"
-            ) from exc
+            raise RuntimeError(f"Failed to subscribe to Pub/Sub reply pattern: {exc}") from exc
         self._consumer_tasks.append(asyncio.create_task(self._run_pubsub_reply_listener()))
 
         # Dedicated consumer loop per event subscriber (fan-out)
@@ -973,8 +971,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 not t.done() for t in self._consumer_tasks
             )
 
-        pubsub_active = (
-            self._pubsub is not None and bool(getattr(self._pubsub, "subscribed", False))
+        pubsub_active = self._pubsub is not None and bool(
+            getattr(self._pubsub, "subscribed", False)
         )
         return {
             "is_healthy": redis_connected and consumer_loop_active,
@@ -1740,7 +1738,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                 await self._route_to_dlq_if_exhausted(
                                     stream_key, message_id, fields, subscriber_group
                                 )
-                                # handler 실패 → PEL 유지 (XAUTOCLAIM 재시도) unless already DLQ'd
+                                # Stays in PEL for XAUTOCLAIM retry (unless DLQ'd + ACKed above)
                     if ack_ids:
                         try:
                             await self._redis.xack(stream_key, subscriber_group, *ack_ids)

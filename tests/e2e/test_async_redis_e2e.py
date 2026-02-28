@@ -236,9 +236,7 @@ class TestSWS2_46_MessageMetadata:
                 await client.aclose()
 
             await asyncio.sleep(1.0)
-            assert handled_count == 1, (
-                f"Expected 1 handled (dedup), got {handled_count}"
-            )
+            assert handled_count == 1, f"Expected 1 handled (dedup), got {handled_count}"
         finally:
             await bus.close()
             await flush_keys(f"{app}:*")

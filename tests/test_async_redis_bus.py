@@ -3969,10 +3969,7 @@ class TestBatchDispatch:
         bus.register_command(CreateOrderCommand, handler)
         await bus.start()
 
-        cmds = [
-            CreateOrderCommand(order_id=f"ord-{i}", amount=Decimal("10.00"))
-            for i in range(5)
-        ]
+        cmds = [CreateOrderCommand(order_id=f"ord-{i}", amount=Decimal("10.00")) for i in range(5)]
         await bus.execute_many(cmds)
         await asyncio.sleep(0.5)
 
@@ -3991,9 +3988,7 @@ class TestBatchDispatch:
         await bus.start()
 
         evts = [
-            OrderCreatedEvent(
-                order_id=f"ord-{i}", created_at=datetime(2026, 1, 1, tzinfo=UTC)
-            )
+            OrderCreatedEvent(order_id=f"ord-{i}", created_at=datetime(2026, 1, 1, tzinfo=UTC))
             for i in range(4)
         ]
         await bus.publish_many(evts)
@@ -4014,8 +4009,7 @@ class TestBatchDispatch:
         await bus.start()
 
         tasks = [
-            ProcessPaymentTask(payment_id=f"pay-{i}", amount=Decimal("5.00"))
-            for i in range(3)
+            ProcessPaymentTask(payment_id=f"pay-{i}", amount=Decimal("5.00")) for i in range(3)
         ]
         await bus.dispatch_many(tasks)
         await asyncio.sleep(0.5)
@@ -4056,10 +4050,7 @@ class TestBatchDispatch:
         fake_redis.pipeline = counting_pipeline
         await bus.start()
 
-        cmds = [
-            CreateOrderCommand(order_id=f"ord-{i}", amount=Decimal("1.00"))
-            for i in range(3)
-        ]
+        cmds = [CreateOrderCommand(order_id=f"ord-{i}", amount=Decimal("1.00")) for i in range(3)]
         await bus.execute_many(cmds)
 
         # pipeline이 한 번만 호출되어야 함 (N개 XADD가 단일 RTT)
@@ -4078,10 +4069,7 @@ class TestBatchDispatch:
         )
         await bus.start()
 
-        cmds = [
-            CreateOrderCommand(order_id=f"ord-{i}", amount=Decimal("1.00"))
-            for i in range(3)
-        ]
+        cmds = [CreateOrderCommand(order_id=f"ord-{i}", amount=Decimal("1.00")) for i in range(3)]
         stream_key = bus._stream_key("command", "CreateOrderCommand")
         pairs = [(stream_key, cmd) for cmd in cmds]
         await bus._xadd_many(pairs, with_dedup=True)
@@ -4378,10 +4366,7 @@ class TestCrossFeatureIntegration:
         bus.register_command(CreateOrderCommand, handler)
         await bus.start()
 
-        cmds = [
-            CreateOrderCommand(order_id=f"xm-{i}", amount=Decimal("1.00"))
-            for i in range(4)
-        ]
+        cmds = [CreateOrderCommand(order_id=f"xm-{i}", amount=Decimal("1.00")) for i in range(4)]
         await bus.execute_many(cmds)
 
         deadline = asyncio.get_event_loop().time() + 2.0
@@ -4421,9 +4406,7 @@ class TestCrossFeatureIntegration:
         stream_key = bus._stream_key("command", "CreateOrderCommand")
         shared_ikey = "dup-ikey-cross-001"
         for i in range(3):
-            data = serializer.dumps(
-                CreateOrderCommand(order_id=f"dup-{i}", amount=Decimal("1.00"))
-            )
+            data = serializer.dumps(CreateOrderCommand(order_id=f"dup-{i}", amount=Decimal("1.00")))
             await fake_r.xadd(
                 stream_key,
                 {"data": data, "message_id": f"mid-{i}", "idempotency_key": shared_ikey},
@@ -4475,10 +4458,7 @@ class TestCrossFeatureIntegration:
         await producer.start()
         await consumer.start()
 
-        cmds = [
-            CreateOrderCommand(order_id=f"conc-{i}", amount=Decimal("1.00"))
-            for i in range(5)
-        ]
+        cmds = [CreateOrderCommand(order_id=f"conc-{i}", amount=Decimal("1.00")) for i in range(5)]
         execute_task = asyncio.create_task(producer.execute_many(cmds))
         query_result = await consumer.send(GetOrderQuery(order_id="q-001"))
 
@@ -4530,9 +4510,7 @@ class TestReleaseDeduplicKeyRetry:
         await bus.close()
 
     @pytest.mark.asyncio
-    async def test_release_dedup_key_retries_on_failure_then_succeeds(
-        self, fake_redis, caplog
-    ):
+    async def test_release_dedup_key_retries_on_failure_then_succeeds(self, fake_redis, caplog):
         """Redis 오류 후 재시도 성공: 2번째 시도에서 성공하면 warning 1회 발생."""
         import unittest.mock as mock
 
@@ -4600,9 +4578,7 @@ class TestMissingIdempotencyKeyWarning:
     """idempotency_key 미지정 시 경고 로그 테스트."""
 
     @pytest.mark.asyncio
-    async def test_command_missing_idempotency_key_emits_warning(
-        self, fake_redis_server, caplog
-    ):
+    async def test_command_missing_idempotency_key_emits_warning(self, fake_redis_server, caplog):
         """command_idempotency=True + idempotency_key 필드 없음 → WARNING 로그 발생."""
         import fakeredis
 
@@ -4640,9 +4616,7 @@ class TestMissingIdempotencyKeyWarning:
         )
 
     @pytest.mark.asyncio
-    async def test_task_missing_idempotency_key_emits_warning(
-        self, fake_redis_server, caplog
-    ):
+    async def test_task_missing_idempotency_key_emits_warning(self, fake_redis_server, caplog):
         """task_idempotency=True + idempotency_key 필드 없음 → WARNING 로그 발생."""
         import fakeredis
 
@@ -4679,9 +4653,7 @@ class TestMissingIdempotencyKeyWarning:
         )
 
     @pytest.mark.asyncio
-    async def test_command_with_idempotency_key_no_warning(
-        self, fake_redis_server, caplog
-    ):
+    async def test_command_with_idempotency_key_no_warning(self, fake_redis_server, caplog):
         """idempotency_key 필드가 있으면 경고 없이 정상 처리."""
         import fakeredis
 
@@ -4715,7 +4687,8 @@ class TestMissingIdempotencyKeyWarning:
 
         # idempotency_key 관련 경고 없어야 함
         dedup_warnings = [
-            r.message for r in caplog.records
+            r.message
+            for r in caplog.records
             if r.levelname == "WARNING"
             and "idempotency_key" in r.message
             and "dedup check skipped" in r.message
@@ -4912,8 +4885,7 @@ class TestConsumerLoopDirectDlq:
         await bus.close()
 
         assert len(dlq.records) == 0, (
-            "With max_retry=5 and only 1 delivery attempt "
-            "the consumer loop must NOT route to DLQ"
+            "With max_retry=5 and only 1 delivery attempt the consumer loop must NOT route to DLQ"
         )
 
     @pytest.mark.asyncio
