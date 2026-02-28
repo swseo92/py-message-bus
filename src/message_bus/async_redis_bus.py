@@ -1548,10 +1548,23 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                             result = await handler(msg)
                             result_data = self._serializer.dumps(result)
                             payload = json.dumps({"data": result_data.decode("utf-8")})
-                            await self._send_reply_and_ack(
-                                reply_channel, payload, stream_str, message_id
-                            )
-                            _handler_ok = True
+                            try:
+                                await self._send_reply_and_ack(
+                                    reply_channel, payload, stream_str, message_id
+                                )
+                                _handler_ok = True
+                            except Exception as pipeline_exc:
+                                logger.warning(
+                                    "Query reply pipeline failed (reply_channel=%s): %s",
+                                    reply_channel,
+                                    pipeline_exc,
+                                )
+                                await self._send_error_reply(
+                                    reply_channel,
+                                    type(pipeline_exc).__name__,
+                                    str(pipeline_exc),
+                                )
+                                await self._redis.xack(stream_str, self._consumer_group, message_id)
                         except Exception as exc:
                             logger.warning(
                                 "Query handler %s raised %s (reply_channel=%s): %s",

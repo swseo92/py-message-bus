@@ -5,6 +5,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -852,6 +853,51 @@ class TestAsyncRedisMessageBusQuery:
             assert result == "order-42"
         finally:
             await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_query_xack_guaranteed_on_pipeline_failure(
+        self, serializer: AsyncJsonSerializer, fake_redis: Any
+    ) -> None:
+        """XACK must be sent even when _send_reply_and_ack pipeline fails."""
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-grp",
+            app_name="test",
+            serializer=serializer,
+            _redis_client=fake_redis,
+            _block_ms=0,
+        )
+
+        async def handle_query(q: GetOrderQuery) -> str:
+            return f"order-{q.order_id}"
+
+        bus.register_query(GetOrderQuery, handle_query)
+
+        call_count = 0
+
+        async def failing_pipeline(
+            reply_stream: str, reply_fields: dict, stream_str: str, message_id: bytes
+        ) -> None:
+            nonlocal call_count
+            call_count += 1
+            raise OSError("Simulated pipeline failure")
+
+        bus._send_reply_and_ack = failing_pipeline  # type: ignore[method-assign]
+
+        await bus.start()
+        try:
+            with pytest.raises((RuntimeError, TimeoutError, asyncio.TimeoutError)):
+                await asyncio.wait_for(bus.send(GetOrderQuery(order_id="99")), timeout=1.0)
+        finally:
+            await bus.close()
+
+        assert call_count == 1, "Pipeline must have been attempted once"
+
+        stream_key = bus._stream_key("query", "GetOrderQuery")
+        pel = await fake_redis.xpending(stream_key, "test-grp")
+        assert pel["pending"] == 0, (
+            f"PEL must be empty after pipeline failure, got {pel['pending']}"
+        )
 
 
 # ---------------------------------------------------------------------------
