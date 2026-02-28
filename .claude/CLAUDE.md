@@ -59,7 +59,10 @@ src/message_bus/
 ├── retry.py         # 미들웨어: RetryMiddleware (exponential backoff retry)
 ├── timeout.py       # 미들웨어: TimeoutMiddleware (handler timeout enforcement)
 ├── dead_letter.py   # 미들웨어: DeadLetterMiddleware (실패 메시지 캡처)
+├── metrics.py       # 메트릭: MetricsSnapshot (처리량/에러 카운터)
 ├── testing.py       # 테스팅: FakeMessageBus, AsyncFakeMessageBus
+├── redis_bus.py     # 구현체: RedisMessageBus, RedisWorker (sync, optional)
+├── redis_dead_letter.py  # 구현체: RedisDeadLetterStore (Redis 기반 DLQ)
 ├── zmq_bus.py       # 구현체: ZmqMessageBus, ZmqWorker (optional, pyzmq 필요)
 ├── async_redis_bus.py  # 구현체: AsyncRedisMessageBus (optional, redis>=5.0.0 필요)
 └── lua/
@@ -112,7 +115,36 @@ class OrderService:
 | `DeadLetterMiddleware` | 실패 추적 | 실패한 메시지 캡처, DeadLetterStore에 저장 |
 | `FakeMessageBus` | 테스팅 유틸리티 | 핸들러 없이 메시지 녹화, assertion 헬퍼 |
 | `ZmqMessageBus` + `ZmqWorker` | 멀티프로세스 | PUSH/PULL, REQ/REP, PUB/SUB 패턴, pickle 직렬화 |
-| `AsyncRedisMessageBus` | 분산 async (Redis) | Redis Streams, Command/Task 경쟁 소비, Event fan-out, Query reply는 **Pub/Sub 2-RTT** (XADD→XREADGROUP→PUBLISH→push; shared PSUBSCRIBE + asyncio.Future), 자동 재연결; `query_reply_timeout` 파라미터로 대기시간 설정 (기본 30.0초); 헬스체크 API 제공 (`health_check()` → `{is_healthy, redis_connected, consumer_loop_active, redis_error}`, `is_healthy()` → bool); **`metadata_mode`** 파라미터 — `"standard"` (기본): `source_id`(캐싱된 hostname), `message_type`, `timestamp`(UNIX float) enrichment 포함 / `"none"` (opt-in): enrichment 비활성화, dedup 필드(`message_id`, `idempotency_key`)만 유지; **멱등성 파라미터** — `command_idempotency=True` (기본 ON), `task_idempotency=True` (기본 ON), `event_idempotency=False` (기본 OFF), `query_idempotency=False` (기본 OFF); `ack_and_dedup.lua` Lua 스크립트로 XACK + SET NX 원자 연산 (1 RTT 절감); **Consumer-level DLQ 직접 연동** — `dead_letter_store` 파라미터(기본 `None`)로 DLQ 스토어 설정, `max_retry` 초과 시 Consumer 루프에서 즉시 DLQ 라우팅 (XAUTOCLAIM 대기 없이); Circuit Breaker 미적용 (Redis Streams 내구성 보장 + 핸들러 레이어 권장) |
+| `AsyncRedisMessageBus` | 분산 async (Redis) | 아래 별도 섹션 참조 |
+
+### AsyncRedisMessageBus (async_redis_bus.py)
+
+Redis Streams 기반 분산 메시지 버스. Command/Task 경쟁 소비, Event fan-out, Query reply는 **Pub/Sub 2-RTT** (XADD→XREADGROUP→PUBLISH→push; shared PSUBSCRIBE + asyncio.Future).
+
+**핵심 파라미터:**
+
+| 파라미터 | 기본값 | 설명 |
+| -------- | ------ | ---- |
+| `query_reply_timeout` | `30.0` | Query 응답 대기 시간 (초) |
+| `metadata_mode` | `"standard"` | `"standard"`: source_id/message_type/timestamp enrichment / `"none"`: dedup 필드만 |
+| `command_idempotency` | `True` | Command 멱등성 ON |
+| `task_idempotency` | `True` | Task 멱등성 ON |
+| `event_idempotency` | `False` | Event 멱등성 OFF (기본) |
+| `query_idempotency` | `False` | Query 멱등성 OFF (기본) |
+| `dead_letter_store` | `None` | DLQ 스토어 설정 시 Consumer-level DLQ 직접 연동 활성화 |
+| `max_retry` | `3` | 최대 재시도 횟수 (초과 시 DLQ 라우팅) |
+
+**헬스체크 API:**
+- `health_check()` → `{is_healthy, redis_connected, consumer_loop_active, pubsub_active, reconnect_count, last_reconnect_at, redis_error}`
+- `is_healthy()` → `bool`
+
+**안정성 기능:**
+- 자동 재연결 (`_reconnect()`) — Redis + Pub/Sub 재구독 포함, `reconnect_count`/`last_reconnect_at` 추적
+- Pub/Sub Reply Listener 자동 재구독 — 연결 끊김 시 자동 복구 루프
+- `_release_dedup_key` exponential backoff retry (3회, 1s→2s→4s)
+- Consumer-level DLQ — `max_retry` 초과 시 Consumer 루프에서 즉시 DLQ 라우팅 (XAUTOCLAIM 대기 없이)
+- `ack_and_dedup.lua` Lua 스크립트로 XACK + SET NX 원자 연산 (1 RTT 절감)
+- Circuit Breaker 미적용 (Redis Streams 내구성 보장 + 핸들러 레이어 권장)
 
 ### 에러 규칙
 
@@ -156,6 +188,29 @@ store = JsonLineStore(directory=Path("./logs/bus"), max_runs=10)
 bus = RecordingBus(LocalMessageBus(), store)
 # 앱 종료 시 bus.close() 또는 context manager 사용
 ```
+
+## 테스트 구조
+
+```
+tests/
+├── test_local_bus.py          # LocalMessageBus 단위 테스트
+├── test_async_local_bus.py    # AsyncLocalMessageBus 단위 테스트
+├── test_async_redis_bus.py    # AsyncRedisMessageBus 단위 테스트 (fakeredis)
+├── test_redis_bus.py          # RedisMessageBus 단위 테스트 (실제 Redis 필요)
+├── test_bench_harness.py      # 벤치마크 통계 헬퍼 테스트
+├── e2e/
+│   └── test_async_redis_e2e.py  # E2E (실제 Redis 필요)
+├── integration/
+│   └── test_dead_letter_integration.py
+└── contract/
+    └── messages.py            # 공유 메시지 정의
+```
+
+## Gotchas
+
+- **`test_redis_bus.py` 전체 스위트 hang**: `test_send_query_returns_response`가 실제 Redis가 필요하여 fakeredis 환경에서 timeout → 전체 pytest 세션이 멈출 수 있음. 해결: `pytest tests/test_async_redis_bus.py` 처럼 특정 파일만 실행
+- **redis `py.typed` 호환성**: redis 7.2.1+ fresh install 시 `py.typed` 마커 포함 → 기존 `type: ignore` 주석이 `unused-ignore` 오류 발생. 이미 정리 완료 (PR #44)
+- **CI mypy `.` vs `src`**: CI는 `mypy .` (전체)을 실행하여 tests/benchmarks의 arg-type 오류도 검출됨. 로컬에서는 `mypy src`로 소스만 검사하는 것이 실용적
 
 ## 확장 계획
 
