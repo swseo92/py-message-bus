@@ -1193,7 +1193,15 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                     if await coro:
                                         ack_ids.append(message_id)
                         if ack_ids:
-                            await self._redis.xack(stream_key, self._consumer_group, *ack_ids)
+                            try:
+                                await self._redis.xack(stream_key, self._consumer_group, *ack_ids)
+                            except Exception as exc:
+                                logger.warning(
+                                    "Failed to batch XACK %d command messages for %s: %s",
+                                    len(ack_ids),
+                                    stream_key,
+                                    exc,
+                                )
                     else:
                         await asyncio.sleep(0)
                     retry_delay = 0.1
@@ -1346,7 +1354,15 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                     if await coro:
                                         ack_ids.append(message_id)
                         if ack_ids:
-                            await self._redis.xack(stream_key, self._consumer_group, *ack_ids)
+                            try:
+                                await self._redis.xack(stream_key, self._consumer_group, *ack_ids)
+                            except Exception as exc:
+                                logger.warning(
+                                    "Failed to batch XACK %d task messages for %s: %s",
+                                    len(ack_ids),
+                                    stream_key,
+                                    exc,
+                                )
                     else:
                         await asyncio.sleep(0)
                     retry_delay = 0.1
@@ -1557,9 +1573,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                 raw = fields.get(b"data") or fields.get("data")
                                 if raw is None:
                                     logger.warning(
-                                        "Event message missing 'data' field; skipping id=%s",
+                                        "Event message missing 'data' field; ACKing id=%s",
                                         message_id,
                                     )
+                                    ack_ids.append(message_id)  # poison msg → XACK
                                     continue
 
                                 ikey_raw = fields.get(b"idempotency_key") or fields.get(
@@ -1586,9 +1603,21 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                         )
                                         continue  # XACK already issued by Lua script
 
-                                event = self._serializer.loads(
-                                    raw if isinstance(raw, bytes) else raw.encode()
-                                )
+                                try:
+                                    event = self._serializer.loads(
+                                        raw if isinstance(raw, bytes) else raw.encode()
+                                    )
+                                except Exception:
+                                    logger.exception(
+                                        "Failed to deserialize event message id=%s", message_id
+                                    )
+                                    if self._metrics_collector is not None:
+                                        self._metrics_collector.record_failed(
+                                            f"{stream_key}:{subscriber_group}"
+                                        )
+                                    ack_ids.append(message_id)  # poison msg → XACK
+                                    continue
+
                                 if isinstance(event, Event):
                                     try:
                                         await handler(event)
@@ -1617,14 +1646,24 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                             f"{stream_key}:{subscriber_group}"
                                         )
                                     logger.warning(
-                                        "Received non-Event payload (type=%s); skipping id=%s",
+                                        "Received non-Event payload (type=%s); ACKing id=%s",
                                         type(event).__name__,
                                         message_id,
                                     )
+                                    ack_ids.append(message_id)  # poison msg → XACK
                             except Exception:
                                 logger.exception("Error processing event message id=%s", message_id)
+                                # handler 실패 → PEL 유지 (XAUTOCLAIM 재시도)
                     if ack_ids:
-                        await self._redis.xack(stream_key, subscriber_group, *ack_ids)
+                        try:
+                            await self._redis.xack(stream_key, subscriber_group, *ack_ids)
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed to batch XACK %d event messages for %s: %s",
+                                len(ack_ids),
+                                stream_key,
+                                exc,
+                            )
                 else:
                     # Yield to event loop to avoid busy-wait (critical when block_ms=0)
                     await asyncio.sleep(0)
