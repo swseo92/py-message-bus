@@ -805,6 +805,59 @@ class TestAsyncRedisMessageBusQuery:
             await bus.close()
 
     @pytest.mark.asyncio
+    async def test_pubsub_listener_disconnection_fails_pending_queries(
+        self, fake_redis_server, serializer
+    ):
+        """When listen() raises a connection error, pending queries must get ConnectionError.
+
+        A Redis connection failure during the listen() loop should immediately
+        fail all pending send() callers rather than leaving them to time out.
+        """
+        import fakeredis
+
+        client = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="svc",
+            app_name="test_disconnect",
+            serializer=serializer,
+            _block_ms=0,
+            _redis_client=client,
+            query_reply_timeout=5.0,
+        )
+        await bus.start()
+
+        # Async generator that immediately raises an OS-level connection error
+        async def _failing_listen():
+            raise OSError("simulated disconnect")
+            yield  # required to make this an async generator
+
+        try:
+            # Swap listen() on the live pubsub instance; cancel the existing listener
+            bus._pubsub.listen = _failing_listen
+            for task in bus._consumer_tasks:
+                task.cancel()
+            await asyncio.gather(*bus._consumer_tasks, return_exceptions=True)
+            bus._consumer_tasks.clear()
+
+            # Register a pending future before starting the doomed listener
+            correlation_id = uuid.uuid4().hex
+            future: asyncio.Future[bytes] = asyncio.get_event_loop().create_future()
+            bus._pending_queries[correlation_id] = future
+
+            # The new listener task should hit OSError and fail all pending futures
+            listener_task = asyncio.create_task(bus._run_pubsub_reply_listener())
+            bus._consumer_tasks.append(listener_task)
+
+            with pytest.raises(ConnectionError, match="simulated disconnect"):
+                await asyncio.wait_for(future, timeout=2.0)
+
+            await asyncio.wait_for(listener_task, timeout=1.0)
+        finally:
+            bus._pending_queries.clear()
+            await bus.close()
+
+    @pytest.mark.asyncio
     async def test_concurrent_queries_routed_correctly(self, fake_redis_server, serializer):
         """Concurrent send() calls must each receive their own reply via correlation_id."""
         import fakeredis

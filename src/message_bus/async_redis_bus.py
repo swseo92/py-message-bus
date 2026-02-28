@@ -722,8 +722,13 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         if self._pubsub is not None:
             try:
                 await asyncio.wait_for(self._pubsub.punsubscribe(), timeout=2.0)
-            except Exception as e:
-                logger.warning("Error unsubscribing Pub/Sub during shutdown: %s", e)
+            except (TimeoutError, RedisConnectionError, RedisTimeoutError, OSError) as e:
+                logger.warning(
+                    "[%s] Error unsubscribing Pub/Sub during shutdown (%s): %s",
+                    self._app_name,
+                    type(e).__name__,
+                    e,
+                )
         if self._consumer_tasks:
             done, pending = await asyncio.wait(
                 self._consumer_tasks,
