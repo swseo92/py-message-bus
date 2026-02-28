@@ -2729,3 +2729,135 @@ class TestConnectionModes:
             # Should not raise – transient error is logged and swallowed
             await bus._reconnect()
         assert bus._redis is None  # client stays None after transient failure
+
+
+# AsyncRedisMessageBus – health check tests (SWS2-50)
+# ---------------------------------------------------------------------------
+
+
+class TestHealthCheck:
+    """Tests for health_check() and is_healthy()."""
+
+    def _make_bus(
+        self,
+        fake_redis,
+        serializer=None,
+        consumer_group: str = "hc-group",
+    ) -> AsyncRedisMessageBus:
+        kwargs: dict = {
+            "redis_url": "redis://localhost",
+            "consumer_group": consumer_group,
+            "app_name": "test",
+            "consumer_name": "hc-consumer",
+            "_block_ms": 0,
+            "_redis_client": fake_redis,
+        }
+        if serializer is not None:
+            kwargs["serializer"] = serializer
+        return AsyncRedisMessageBus(**kwargs)
+
+    @pytest.mark.asyncio
+    async def test_not_started_is_unhealthy(self, fake_redis):
+        """Bus not started → consumer_loop_active False → is_healthy False.
+
+        The injected redis client is still reachable (redis_connected True),
+        but the bus is not running so overall health is False.
+        """
+        bus = self._make_bus(fake_redis)
+        result = await bus.health_check()
+        assert result["is_healthy"] is False
+        assert result["consumer_loop_active"] is False
+        assert result["redis_connected"] is True  # injected client can be pinged
+        assert result["redis_error"] is None
+
+    @pytest.mark.asyncio
+    async def test_started_no_handlers_is_healthy(self, fake_redis):
+        """Started bus with no handlers → redis reachable, no consumers needed → healthy."""
+        bus = self._make_bus(fake_redis)
+        async with bus:
+            result = await bus.health_check()
+        assert result["is_healthy"] is True
+        assert result["redis_connected"] is True
+        assert result["consumer_loop_active"] is True
+
+    @pytest.mark.asyncio
+    async def test_started_with_command_handler_is_healthy(self, fake_redis, serializer):
+        """Started bus with a command handler → consumer tasks alive → healthy."""
+        bus = self._make_bus(fake_redis, serializer)
+
+        async def handle_cmd(cmd: CreateOrderCommand) -> None:
+            pass
+
+        bus.register_command(CreateOrderCommand, handle_cmd)
+        async with bus:
+            result = await bus.health_check()
+        assert result["is_healthy"] is True
+        assert result["redis_connected"] is True
+        assert result["consumer_loop_active"] is True
+
+    @pytest.mark.asyncio
+    async def test_closed_bus_is_unhealthy(self, fake_redis):
+        """After close() → redis is None → redis_connected False → is_healthy False."""
+        bus = self._make_bus(fake_redis)
+        async with bus:
+            pass  # start then immediately close
+        result = await bus.health_check()
+        assert result["is_healthy"] is False
+        assert result["redis_connected"] is False
+        assert result["consumer_loop_active"] is False
+
+    @pytest.mark.asyncio
+    async def test_is_healthy_returns_true_when_running(self, fake_redis):
+        """is_healthy() is a bool convenience wrapper around health_check()."""
+        bus = self._make_bus(fake_redis)
+        async with bus:
+            assert await bus.is_healthy() is True
+
+    @pytest.mark.asyncio
+    async def test_is_healthy_returns_false_when_closed(self, fake_redis):
+        """is_healthy() returns False after close."""
+        bus = self._make_bus(fake_redis)
+        async with bus:
+            pass
+        assert await bus.is_healthy() is False
+
+    @pytest.mark.asyncio
+    async def test_consumer_loop_inactive_when_tasks_cancelled(self, fake_redis, serializer):
+        """Cancelling consumer tasks → consumer_loop_active False → is_healthy False."""
+        bus = self._make_bus(fake_redis, serializer)
+
+        async def handle_cmd(cmd: CreateOrderCommand) -> None:
+            pass
+
+        bus.register_command(CreateOrderCommand, handle_cmd)
+        await bus.start()
+        try:
+            for task in bus._consumer_tasks:
+                task.cancel()
+            await asyncio.sleep(0)  # let cancellations propagate
+
+            result = await bus.health_check()
+            assert result["consumer_loop_active"] is False
+            assert result["is_healthy"] is False
+        finally:
+            await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_health_check_redis_unreachable(self, fake_redis):
+        """When Redis ping fails → redis_connected False → is_healthy False."""
+        bus = self._make_bus(fake_redis)
+        await bus.start()
+        try:
+            # Simulate Redis ping failure
+            async def failing_ping(*args, **kwargs):
+                raise ConnectionError("Redis down")
+
+            bus._redis.ping = failing_ping
+
+            result = await bus.health_check()
+            assert result["redis_connected"] is False
+            assert result["is_healthy"] is False
+            assert result["redis_error"] is not None
+            assert "ConnectionError" in result["redis_error"]
+        finally:
+            await bus.close()

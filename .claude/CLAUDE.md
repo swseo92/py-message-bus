@@ -99,7 +99,7 @@ class OrderService:
 | `DeadLetterMiddleware` | 실패 추적 | 실패한 메시지 캡처, DeadLetterStore에 저장 |
 | `FakeMessageBus` | 테스팅 유틸리티 | 핸들러 없이 메시지 녹화, assertion 헬퍼 |
 | `ZmqMessageBus` + `ZmqWorker` | 멀티프로세스 | PUSH/PULL, REQ/REP, PUB/SUB 패턴, pickle 직렬화 |
-| `AsyncRedisMessageBus` | 분산 async (Redis) | Redis Streams, Command/Task 경쟁 소비, Event fan-out, Query correlation_id request-reply, 자동 재연결; `query_reply_timeout` 파라미터로 대기시간 설정 (기본 30.0초) |
+| `AsyncRedisMessageBus` | 분산 async (Redis) | Redis Streams, Command/Task 경쟁 소비, Event fan-out, Query correlation_id request-reply, 자동 재연결; `query_reply_timeout` 파라미터로 대기시간 설정 (기본 30.0초); 헬스체크 API 제공 (`health_check()` → `{is_healthy, redis_connected, consumer_loop_active, redis_error}`, `is_healthy()` → bool) |
 
 ### 에러 규칙
 
