@@ -3785,3 +3785,205 @@ class TestBatchDispatch:
 
         assert len(received_order) == 2
         assert len(received_cancel) == 1
+
+
+# ---------------------------------------------------------------------------
+# Batch XACK tests
+# ---------------------------------------------------------------------------
+
+
+class TestBatchXack:
+    """배치 XACK: 순차 처리 경로에서 N개 성공 메시지를 단일 xack 호출로 처리."""
+
+    def _make_bus(self, fake_redis, serializer, **kwargs):
+        return AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="batch-xack-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+            command_idempotency=False,
+            task_idempotency=False,
+            **kwargs,
+        )
+
+    @pytest.mark.asyncio
+    async def test_command_sequential_uses_single_xack_for_batch(
+        self, fake_redis_server, serializer
+    ):
+        """순차 처리 시 성공 메시지 5개를 단일 xack 호출로 처리해야 한다.
+
+        개별 xack 5회가 아닌, *ids 배치로 1회만 호출되어야 RTT를 절감한다.
+        """
+        import fakeredis
+
+        processed: list[str] = []
+
+        async def handler(cmd: CreateOrderCommand) -> None:
+            processed.append(cmd.order_id)
+
+        fake_r = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = self._make_bus(fake_r, serializer)
+        bus.register_command(CreateOrderCommand, handler)
+
+        stream_key = bus._stream_key("command", "CreateOrderCommand")
+        await fake_r.xgroup_create(stream_key, "batch-xack-test", id="0", mkstream=True)
+        for i in range(5):
+            data = serializer.dumps(CreateOrderCommand(order_id=f"order-{i}", amount=Decimal("1")))
+            await fake_r.xadd(stream_key, {"data": data})
+
+        xack_calls: list[tuple] = []
+        original_xack = fake_r.xack
+
+        async def spy_xack(stream, group, *ids):
+            xack_calls.append((stream, group, ids))
+            return await original_xack(stream, group, *ids)
+
+        fake_r.xack = spy_xack
+
+        await bus.start()
+        deadline = asyncio.get_event_loop().time() + 2.0
+        while len(processed) < 5 and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.05)
+        await bus.close()
+
+        assert len(processed) == 5, f"Expected 5 processed, got {len(processed)}"
+
+        # 5개 메시지를 1번 xack 호출로 처리해야 함 (배치 XACK)
+        total_acked_ids = sum(len(c[2]) for c in xack_calls)
+        assert total_acked_ids == 5, f"Expected 5 total ACKed IDs, got {total_acked_ids}"
+        assert len(xack_calls) == 1, (
+            f"Expected 1 xack call for 5 sequential messages, got {len(xack_calls)}"
+        )
+        assert len(xack_calls[0][2]) == 5, (
+            f"Expected single xack with 5 IDs, got {len(xack_calls[0][2])}"
+        )
+
+        # PEL이 비어 있어야 함
+        pending = await fake_r.xpending(stream_key, "batch-xack-test")
+        assert pending["pending"] == 0
+
+    @pytest.mark.asyncio
+    async def test_command_failed_message_excluded_from_batch_xack(
+        self, fake_redis_server, serializer
+    ):
+        """실패한 메시지 ID는 배치 XACK에 포함되지 않고 PEL에 남아야 한다."""
+        import fakeredis
+
+        call_count = 0
+
+        async def flaky_handler(cmd: CreateOrderCommand) -> None:
+            nonlocal call_count
+            call_count += 1
+            if cmd.order_id == "order-2":
+                raise RuntimeError("handler error")
+
+        fake_r = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = self._make_bus(fake_r, serializer)
+        bus.register_command(CreateOrderCommand, handler=flaky_handler)
+
+        stream_key = bus._stream_key("command", "CreateOrderCommand")
+        await fake_r.xgroup_create(stream_key, "batch-xack-test", id="0", mkstream=True)
+        for i in range(3):
+            data = serializer.dumps(CreateOrderCommand(order_id=f"order-{i}", amount=Decimal("1")))
+            await fake_r.xadd(stream_key, {"data": data})
+
+        await bus.start()
+        deadline = asyncio.get_event_loop().time() + 2.0
+        while call_count < 3 and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.05)
+        await bus.close()
+
+        # 실패한 메시지 1개가 PEL에 남아야 함
+        pending = await fake_r.xpending(stream_key, "batch-xack-test")
+        assert pending["pending"] == 1, (
+            f"Failed message must remain in PEL, expected 1, got {pending['pending']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_task_sequential_uses_single_xack_for_batch(self, fake_redis_server, serializer):
+        """Task consumer 순차 경로에서도 성공 N개를 단일 xack 호출로 처리해야 한다."""
+        import fakeredis
+
+        processed: list[str] = []
+
+        async def handler(task: ProcessPaymentTask) -> None:
+            processed.append(task.payment_id)
+
+        fake_r = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = self._make_bus(fake_r, serializer)
+        bus.register_task(ProcessPaymentTask, handler)
+
+        stream_key = bus._stream_key("task", "ProcessPaymentTask")
+        await fake_r.xgroup_create(stream_key, "batch-xack-test", id="0", mkstream=True)
+        for i in range(4):
+            data = serializer.dumps(ProcessPaymentTask(payment_id=f"pay-{i}", amount=Decimal("1")))
+            await fake_r.xadd(stream_key, {"data": data})
+
+        xack_calls: list[tuple] = []
+        original_xack = fake_r.xack
+
+        async def spy_xack(stream, group, *ids):
+            xack_calls.append((stream, group, ids))
+            return await original_xack(stream, group, *ids)
+
+        fake_r.xack = spy_xack
+
+        await bus.start()
+        deadline = asyncio.get_event_loop().time() + 2.0
+        while len(processed) < 4 and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.05)
+        await bus.close()
+
+        assert len(processed) == 4
+        assert len(xack_calls) == 1, (
+            f"Expected 1 xack call for 4 sequential task messages, got {len(xack_calls)}"
+        )
+        assert len(xack_calls[0][2]) == 4
+
+    @pytest.mark.asyncio
+    async def test_event_consumer_uses_batch_xack(self, fake_redis_server, serializer):
+        """Event consumer에서도 배치 내 성공 메시지를 단일 xack 호출로 처리해야 한다."""
+        from datetime import UTC, datetime
+
+        import fakeredis
+
+        processed: list[str] = []
+
+        async def handler(evt: OrderCreatedEvent) -> None:
+            processed.append(evt.order_id)
+
+        fake_r = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = self._make_bus(fake_r, serializer, event_idempotency=False)
+        bus.subscribe(OrderCreatedEvent, handler)
+
+        stream_key = bus._stream_key("event", "OrderCreatedEvent")
+        subscriber_group = "batch-xack-test:evt:OrderCreatedEvent:0"
+        await fake_r.xgroup_create(stream_key, subscriber_group, id="0", mkstream=True)
+        now = datetime.now(UTC)
+        for i in range(4):
+            data = serializer.dumps(OrderCreatedEvent(order_id=f"evt-{i}", created_at=now))
+            await fake_r.xadd(stream_key, {"data": data})
+
+        xack_calls: list[tuple] = []
+        original_xack = fake_r.xack
+
+        async def spy_xack(stream, group, *ids):
+            xack_calls.append((stream, group, ids))
+            return await original_xack(stream, group, *ids)
+
+        fake_r.xack = spy_xack
+
+        await bus.start()
+        deadline = asyncio.get_event_loop().time() + 2.0
+        while len(processed) < 4 and asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(0.05)
+        await bus.close()
+
+        assert len(processed) == 4
+        assert len(xack_calls) == 1, (
+            f"Expected 1 xack call for 4 event messages, got {len(xack_calls)}"
+        )
+        assert len(xack_calls[0][2]) == 4

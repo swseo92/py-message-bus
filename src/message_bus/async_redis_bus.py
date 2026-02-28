@@ -1165,7 +1165,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         """
         await self._ensure_group(stream_key, self._consumer_group)
 
-        concurrent_tasks: set[asyncio.Task[None]] = set()
+        concurrent_tasks: set[asyncio.Task[Any]] = set()
         retry_delay = 0.1
         _graceful = False
         try:
@@ -1179,6 +1179,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                         block=self._block_ms,
                     )
                     if messages:
+                        ack_ids: list[Any] = []
                         for _, stream_msgs in messages:
                             for message_id, fields in stream_msgs:
                                 coro = self._process_command_message(
@@ -1189,7 +1190,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                     concurrent_tasks.add(task)
                                     task.add_done_callback(concurrent_tasks.discard)
                                 else:
-                                    await coro
+                                    if await coro:
+                                        ack_ids.append(message_id)
+                        if ack_ids:
+                            await self._redis.xack(stream_key, self._consumer_group, *ack_ids)
                     else:
                         await asyncio.sleep(0)
                     retry_delay = 0.1
@@ -1236,13 +1240,18 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         fields: dict[Any, Any],
         handler: Callable[[Command], Awaitable[None]],
         semaphore: asyncio.Semaphore | None = None,
-    ) -> None:
-        """단일 Command 메시지를 처리하고 ACK한다. 실패 시 PEL에 남겨 XAUTOCLAIM이 재시도."""
+    ) -> bool:
+        """단일 Command 메시지를 처리한다.
+
+        Returns:
+            True  — 순차 경로(semaphore=None)에서 성공. caller가 배치 XACK 담당.
+            False — 이미 개별 XACK 완료(early-exit·concurrency 경로) 또는 실패(PEL 유지).
+        """
         raw: bytes | None = fields.get(b"data") or fields.get("data")
         if raw is None:
             logger.warning("Command message missing 'data' field; ACKing id=%s", message_id)
             await self._redis.xack(stream_key, self._consumer_group, message_id)
-            return
+            return False
 
         ikey_raw = fields.get(b"idempotency_key") or fields.get("idempotency_key")
         ikey: str | None = None
@@ -1252,7 +1261,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 logger.info(
                     "Skipping duplicate command (idempotency_key=%s) id=%s", ikey, message_id
                 )
-                return  # XACK already issued atomically by Lua script
+                return False  # XACK already issued atomically by Lua script
 
         try:
             msg = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
@@ -1261,7 +1270,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             if self._metrics_collector is not None:
                 self._metrics_collector.record_failed(stream_key)
             await self._redis.xack(stream_key, self._consumer_group, message_id)
-            return
+            return False
 
         if not isinstance(msg, Command):
             logger.warning(
@@ -1272,7 +1281,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             if self._metrics_collector is not None:
                 self._metrics_collector.record_failed(stream_key)
             await self._redis.xack(stream_key, self._consumer_group, message_id)
-            return
+            return False
 
         try:
             if semaphore is not None:
@@ -1290,11 +1299,15 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 await self._release_dedup_key(ikey, scope=stream_key)
             if self._metrics_collector is not None:
                 self._metrics_collector.record_failed(stream_key)
-            return  # Leave in PEL for XAUTOCLAIM retry
+            return False  # Leave in PEL for XAUTOCLAIM retry
 
         if self._metrics_collector is not None:
             self._metrics_collector.record_processed(stream_key)
-        await self._redis.xack(stream_key, self._consumer_group, message_id)
+        if semaphore is not None:
+            # Concurrency 경로: asyncio.Task로 독립 실행 — 즉시 개별 XACK
+            await self._redis.xack(stream_key, self._consumer_group, message_id)
+            return False
+        return True  # 순차 경로: caller가 ack_ids 수집 후 배치 XACK
 
     async def _run_single_task_consumer(
         self,
@@ -1305,7 +1318,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         """Per-type task consumer: 독립 실행으로 HOL Blocking을 방지한다."""
         await self._ensure_group(stream_key, self._consumer_group)
 
-        concurrent_tasks: set[asyncio.Task[None]] = set()
+        concurrent_tasks: set[asyncio.Task[Any]] = set()
         retry_delay = 0.1
         _graceful = False
         try:
@@ -1319,6 +1332,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                         block=self._block_ms,
                     )
                     if messages:
+                        ack_ids: list[Any] = []
                         for _, stream_msgs in messages:
                             for message_id, fields in stream_msgs:
                                 coro = self._process_task_message(
@@ -1329,7 +1343,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                     concurrent_tasks.add(task)
                                     task.add_done_callback(concurrent_tasks.discard)
                                 else:
-                                    await coro
+                                    if await coro:
+                                        ack_ids.append(message_id)
+                        if ack_ids:
+                            await self._redis.xack(stream_key, self._consumer_group, *ack_ids)
                     else:
                         await asyncio.sleep(0)
                     retry_delay = 0.1
@@ -1376,13 +1393,18 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         fields: dict[Any, Any],
         handler: Callable[[Task], Awaitable[None]],
         semaphore: asyncio.Semaphore | None = None,
-    ) -> None:
-        """단일 Task 메시지를 처리하고 ACK한다. 실패 시 PEL에 남겨 XAUTOCLAIM이 재시도."""
+    ) -> bool:
+        """단일 Task 메시지를 처리한다.
+
+        Returns:
+            True  — 순차 경로(semaphore=None)에서 성공. caller가 배치 XACK 담당.
+            False — 이미 개별 XACK 완료(early-exit·concurrency 경로) 또는 실패(PEL 유지).
+        """
         raw: bytes | None = fields.get(b"data") or fields.get("data")
         if raw is None:
             logger.warning("Task message missing 'data' field; ACKing id=%s", message_id)
             await self._redis.xack(stream_key, self._consumer_group, message_id)
-            return
+            return False
 
         ikey_raw = fields.get(b"idempotency_key") or fields.get("idempotency_key")
         ikey: str | None = None
@@ -1390,7 +1412,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             ikey = ikey_raw.decode() if isinstance(ikey_raw, bytes) else ikey_raw
             if not await self._claim_or_ack_dedup(stream_key, message_id, ikey):
                 logger.info("Skipping duplicate task (idempotency_key=%s) id=%s", ikey, message_id)
-                return  # XACK already issued atomically by Lua script
+                return False  # XACK already issued atomically by Lua script
 
         try:
             msg = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
@@ -1399,7 +1421,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             if self._metrics_collector is not None:
                 self._metrics_collector.record_failed(stream_key)
             await self._redis.xack(stream_key, self._consumer_group, message_id)
-            return
+            return False
 
         if not isinstance(msg, Task):
             logger.warning(
@@ -1410,7 +1432,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             if self._metrics_collector is not None:
                 self._metrics_collector.record_failed(stream_key)
             await self._redis.xack(stream_key, self._consumer_group, message_id)
-            return
+            return False
 
         try:
             if semaphore is not None:
@@ -1428,11 +1450,15 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 await self._release_dedup_key(ikey, scope=stream_key)
             if self._metrics_collector is not None:
                 self._metrics_collector.record_failed(stream_key)
-            return  # Leave in PEL for XAUTOCLAIM retry
+            return False  # Leave in PEL for XAUTOCLAIM retry
 
         if self._metrics_collector is not None:
             self._metrics_collector.record_processed(stream_key)
-        await self._redis.xack(stream_key, self._consumer_group, message_id)
+        if semaphore is not None:
+            # Concurrency 경로: asyncio.Task로 독립 실행 — 즉시 개별 XACK
+            await self._redis.xack(stream_key, self._consumer_group, message_id)
+            return False
+        return True  # 순차 경로: caller가 ack_ids 수집 후 배치 XACK
 
     async def _handle_command_task_batch(self, stream_str: str, batch: list[Any]) -> None:
         for message_id, fields in batch:
@@ -1524,6 +1550,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                     block=self._block_ms,
                 )
                 if messages:
+                    ack_ids: list[Any] = []
                     for _, stream_msgs in messages:
                         for message_id, fields in stream_msgs:
                             try:
@@ -1579,7 +1606,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                         self._metrics_collector.record_processed(
                                             f"{stream_key}:{subscriber_group}"
                                         )
-                                    await self._redis.xack(stream_key, subscriber_group, message_id)
+                                    ack_ids.append(message_id)
                                 else:
                                     if evt_ikey is not None:
                                         await self._release_dedup_key(
@@ -1596,6 +1623,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                     )
                             except Exception:
                                 logger.exception("Error processing event message id=%s", message_id)
+                    if ack_ids:
+                        await self._redis.xack(stream_key, subscriber_group, *ack_ids)
                 else:
                     # Yield to event loop to avoid busy-wait (critical when block_ms=0)
                     await asyncio.sleep(0)
