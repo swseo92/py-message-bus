@@ -2525,6 +2525,39 @@ class TestGracefulShutdown:
 
         assert handled.is_set(), "Task handler should be called after NOGROUP recovery"
 
+    @pytest.mark.asyncio
+    async def test_pubsub_reply_listener_exits_without_delay_on_close(
+        self, fake_redis_server, serializer
+    ):
+        """close() must not wait for shutdown_timeout just for the Pub/Sub listener.
+
+        The listener uses listen() and exits cleanly when punsubscribe() is called
+        at the start of close(), without needing task cancellation.
+        """
+        import time
+
+        long_timeout = 5.0
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="grp",
+            app_name="test_listener_close_fast",
+            serializer=serializer,
+            shutdown_timeout=long_timeout,
+            _block_ms=0,
+            _redis_client=fakeredis.aioredis.FakeRedis(server=fake_redis_server),
+        )
+        await bus.start()
+
+        start = time.monotonic()
+        await bus.close()
+        elapsed = time.monotonic() - start
+
+        # Listener exits via punsubscribe, not after waiting for shutdown_timeout (5s)
+        assert elapsed < 1.0, (
+            f"close() took {elapsed:.2f}s but should exit well before "
+            f"shutdown_timeout={long_timeout}s"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Connection Pool / Sentinel / Cluster mode tests
