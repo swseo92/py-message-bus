@@ -21,6 +21,8 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import math
+import statistics
 import sys
 import time
 from dataclasses import dataclass
@@ -51,7 +53,8 @@ class OrderCommand(Command):
 
 ITERATIONS = 5_000
 WARMUP = 500
-ROUNDS = 5
+ROUNDS = 10  # minimum 10 rounds for statistical reliability (SWS2-60)
+CI_Z = 1.96  # z-score for 95% confidence interval
 TARGET_MSGS = 12_000
 TARGET_OVERHEAD = 5.0
 
@@ -153,28 +156,42 @@ async def run_benchmark() -> None:
             legacy_results.append(lg)
             standard_results.append(s)
             none_results.append(n)
-            print(
-                f"Round {i + 1}: legacy={lg:>8,.0f}  standard={s:>8,.0f}"
-                f"  none={n:>8,.0f}  msg/s"
-            )
+            print(f"Round {i + 1}: legacy={lg:>8,.0f}  standard={s:>8,.0f}  none={n:>8,.0f}  msg/s")
 
-        avg_legacy = sum(legacy_results) / ROUNDS
-        avg_standard = sum(standard_results) / ROUNDS
-        avg_none = sum(none_results) / ROUNDS
+        avg_legacy = statistics.mean(legacy_results)
+        avg_standard = statistics.mean(standard_results)
+        avg_none = statistics.mean(none_results)
+
+        std_legacy = statistics.stdev(legacy_results) if ROUNDS > 1 else 0.0
+        std_standard = statistics.stdev(standard_results) if ROUNDS > 1 else 0.0
+        std_none = statistics.stdev(none_results) if ROUNDS > 1 else 0.0
+
+        ci95_legacy = CI_Z * std_legacy / math.sqrt(ROUNDS)
+        ci95_standard = CI_Z * std_standard / math.sqrt(ROUNDS)
+        ci95_none = CI_Z * std_none / math.sqrt(ROUNDS)
 
         overhead_vs_none = (avg_none - avg_standard) / avg_none * 100
         improvement_vs_legacy = (avg_standard - avg_legacy) / avg_legacy * 100
 
-        print(f"\n{'─' * 65}")
-        print(f"{'Mode':<12} {'Avg msg/s':>14}  {'vs none':>10}  {'vs legacy':>10}")
-        print(f"{'─' * 65}")
-        print(f"{'legacy':<12} {avg_legacy:>14,.0f}  {'n/a':>10}  {'baseline':>10}")
+        print(f"\n{'─' * 80}")
         print(
-            f"{'standard':<12} {avg_standard:>14,.0f}  "
-            f"{overhead_vs_none:>9.2f}%  {improvement_vs_legacy:>+9.1f}%"
+            f"{'Mode':<12} {'Avg msg/s':>14}  {'±stddev':>10}  {'CI95±':>10}"
+            f"  {'vs none':>10}  {'vs legacy':>10}"
         )
-        print(f"{'none':<12} {avg_none:>14,.0f}  {'0.00%':>10}  {'n/a':>10}")
-        print(f"{'─' * 65}")
+        print(f"{'─' * 80}")
+        print(
+            f"{'legacy':<12} {avg_legacy:>14,.0f}  {std_legacy:>10,.0f}  {ci95_legacy:>10,.0f}"
+            f"  {'n/a':>10}  {'baseline':>10}"
+        )
+        print(
+            f"{'standard':<12} {avg_standard:>14,.0f}  {std_standard:>10,.0f}"
+            f"  {ci95_standard:>10,.0f}  {overhead_vs_none:>9.2f}%  {improvement_vs_legacy:>+9.1f}%"
+        )
+        print(
+            f"{'none':<12} {avg_none:>14,.0f}  {std_none:>10,.0f}  {ci95_none:>10,.0f}"
+            f"  {'0.00%':>10}  {'n/a':>10}"
+        )
+        print(f"{'─' * 80}")
 
         passed = True
         if avg_standard >= TARGET_MSGS:
@@ -193,9 +210,7 @@ async def run_benchmark() -> None:
             passed = False
 
         if improvement_vs_legacy > 0:
-            print(
-                f"✓ Improvement: standard is {improvement_vs_legacy:+.1f}% faster than legacy"
-            )
+            print(f"✓ Improvement: standard is {improvement_vs_legacy:+.1f}% faster than legacy")
 
         print(f"\n{'PASS' if passed else 'TARGETS NOT MET — see 재논의 note above'}")
         sys.exit(0 if passed else 1)
