@@ -43,6 +43,14 @@ class MaxRetriesExceededError(Exception):
         self.max_retry = max_retry
 
 
+class _FallbackRedisResponseError(Exception):
+    """Narrow sentinel used as RedisResponseError when redis is not installed.
+
+    Using a specific class (instead of the broad ``Exception``) prevents
+    :meth:`health_check` from accidentally swallowing unrelated runtime errors.
+    """
+
+
 try:
     import redis.asyncio as aioredis
     from redis.exceptions import ConnectionError as RedisConnectionError
@@ -52,7 +60,7 @@ except ImportError:
     aioredis = None  # type: ignore[assignment]
     RedisConnectionError = OSError  # type: ignore[assignment, misc]
     RedisTimeoutError = TimeoutError  # type: ignore[assignment, misc]
-    RedisResponseError = Exception  # type: ignore[assignment, misc]
+    RedisResponseError = _FallbackRedisResponseError  # type: ignore[assignment, misc]
 
 
 # ---------------------------------------------------------------------------
@@ -796,12 +804,20 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         * ``consumer_loop_active`` (bool)
         """
         redis_connected = False
+        redis_error: str | None = None
         if self._redis is not None:
             try:
                 await self._redis.ping()
                 redis_connected = True
-            except (RedisConnectionError, RedisTimeoutError, RedisResponseError, OSError):
+            except (RedisConnectionError, RedisTimeoutError, RedisResponseError, OSError) as exc:
                 redis_connected = False
+                redis_error = f"{type(exc).__name__}: {exc}"
+                logger.warning(
+                    "health_check ping failed redis_url=%s consumer=%s error=%s",
+                    self._redis_url,
+                    self._consumer_name,
+                    redis_error,
+                )
 
         has_handlers = bool(
             self._command_handlers
@@ -822,6 +838,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             "is_healthy": redis_connected and consumer_loop_active,
             "redis_connected": redis_connected,
             "consumer_loop_active": consumer_loop_active,
+            "redis_error": redis_error,
         }
 
     async def is_healthy(self) -> bool:

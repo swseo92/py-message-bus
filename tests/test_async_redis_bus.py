@@ -2758,11 +2758,17 @@ class TestHealthCheck:
 
     @pytest.mark.asyncio
     async def test_not_started_is_unhealthy(self, fake_redis):
-        """Bus not started → consumer_loop_active False → is_healthy False."""
+        """Bus not started → consumer_loop_active False → is_healthy False.
+
+        The injected redis client is still reachable (redis_connected True),
+        but the bus is not running so overall health is False.
+        """
         bus = self._make_bus(fake_redis)
         result = await bus.health_check()
         assert result["is_healthy"] is False
         assert result["consumer_loop_active"] is False
+        assert result["redis_connected"] is True  # injected client can be pinged
+        assert result["redis_error"] is None
 
     @pytest.mark.asyncio
     async def test_started_no_handlers_is_healthy(self, fake_redis):
@@ -2851,5 +2857,7 @@ class TestHealthCheck:
             result = await bus.health_check()
             assert result["redis_connected"] is False
             assert result["is_healthy"] is False
+            assert result["redis_error"] is not None
+            assert "ConnectionError" in result["redis_error"]
         finally:
             await bus.close()
