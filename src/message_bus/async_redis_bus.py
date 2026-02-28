@@ -705,14 +705,30 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         """Gracefully stop consumers and close the Redis connection.
 
         Sets the shutdown flag to prevent new messages from being fetched, then
-        waits up to ``shutdown_timeout`` seconds for in-flight messages to
-        complete before cancelling any remaining consumer tasks.
+        unsubscribes the shared Pub/Sub reply listener so its ``listen()`` loop
+        exits naturally before waiting up to ``shutdown_timeout`` seconds for
+        in-flight messages to complete.  Any tasks that do not finish within
+        the timeout are cancelled.
 
         Messages that did not finish within the timeout remain in the Redis
         Streams PEL (Pending Entry List) and will be reclaimed by XAUTOCLAIM
         when the next consumer starts.
         """
         self._running = False
+        # Unsubscribe before waiting for tasks so the Pub/Sub listener task
+        # exits its ``listen()`` loop naturally (listen() exits when the
+        # subscribed count drops to zero) rather than being cancelled after
+        # shutdown_timeout.
+        if self._pubsub is not None:
+            try:
+                await asyncio.wait_for(self._pubsub.punsubscribe(), timeout=2.0)
+            except (TimeoutError, RedisConnectionError, RedisTimeoutError, OSError) as e:
+                logger.warning(
+                    "[%s] Error unsubscribing Pub/Sub during shutdown (%s): %s",
+                    self._app_name,
+                    type(e).__name__,
+                    e,
+                )
         if self._consumer_tasks:
             done, pending = await asyncio.wait(
                 self._consumer_tasks,
@@ -737,7 +753,6 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         self._consumer_tasks.clear()
         if self._pubsub is not None:
             try:
-                await self._pubsub.punsubscribe()
                 await self._pubsub.aclose()
             except Exception as e:
                 logger.warning("Error closing Pub/Sub connection: %s", e)
@@ -1678,17 +1693,15 @@ class AsyncRedisMessageBus(AsyncMessageBus):
 
         Uses PSUBSCRIBE on ``{app_name}:reply_ch:*`` so a single connection
         serves all concurrent ``send()`` callers without per-call subscribe
-        overhead.  Polls via ``get_message()`` so that ``_running=False``
-        causes a clean exit on the next iteration.
+        overhead.  Uses the blocking ``listen()`` iterator for event-driven
+        receipt, eliminating idle-CPU polling overhead.  The task exits cleanly
+        when ``close()`` calls ``punsubscribe()``, which causes ``listen()``
+        to exit its ``while self.subscribed`` loop naturally.
         """
         try:
-            while self._running:
-                message = await self._pubsub.get_message(
-                    ignore_subscribe_messages=True, timeout=0.01
-                )
-                if message is None:
-                    await asyncio.sleep(0)
-                    continue
+            async for message in self._pubsub.listen():
+                if not self._running:
+                    return
                 msg_type = message.get("type")
                 if msg_type not in ("pmessage", "message"):
                     continue  # skip subscribe/unsubscribe confirmations
