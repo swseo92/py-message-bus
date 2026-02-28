@@ -8,11 +8,12 @@ import json
 import logging
 import math
 import socket
+import time
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import datetime
 from decimal import Decimal
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from message_bus.dead_letter import DeadLetterStore
 from message_bus.latency import LatencyStats
@@ -277,6 +278,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         "_sentinel_service_name",
         "_sentinel_kwargs",
         "_cluster_mode",
+        # Metadata mode
+        "_metadata_mode",
+        "_source_id",
     )
 
     def __init__(
@@ -300,6 +304,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         sentinel_service_name: str | None = None,
         sentinel_kwargs: dict[str, Any] | None = None,
         cluster_mode: bool = False,
+        metadata_mode: Literal["standard", "none"] = "standard",
         _block_ms: int = 100,
         _redis_client: Any | None = None,
     ) -> None:
@@ -360,6 +365,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         self._sentinel_service_name: str | None = sentinel_service_name
         self._sentinel_kwargs: dict[str, Any] = sentinel_kwargs or {}
         self._cluster_mode: bool = cluster_mode
+        # Metadata mode: "standard" (lightweight fields) or "none" (data only)
+        self._metadata_mode: Literal["standard", "none"] = metadata_mode
+        self._source_id: str = socket.gethostname()
         # Injected client takes priority (used in tests with fakeredis)
         self._redis: Any = _redis_client
 
@@ -861,18 +869,37 @@ class AsyncRedisMessageBus(AsyncMessageBus):
     async def _xadd(
         self, stream_key: str, message: Any, idempotency_key: str | None = None
     ) -> None:
-        """Serialize *message* and append it to *stream_key* with audit metadata."""
+        """Serialize *message* and append it to *stream_key*.
+
+        ``metadata_mode="standard"`` (default): dedup fields plus
+        lightweight enrichment — ``message_id``, ``idempotency_key``,
+        ``source_id`` (cached hostname), ``message_type``, and
+        ``timestamp`` (UNIX float string).
+
+        ``metadata_mode="none"``: dedup fields only (``message_id`` and
+        ``idempotency_key``).  Enrichment metadata is omitted for
+        maximum producer throughput while preserving idempotency.
+        """
         data = self._serializer.dumps(message)
         msg_id = uuid.uuid4().hex
-        await self._redis.xadd(
-            stream_key,
-            {
+        if self._metadata_mode == "none":
+            fields: dict[str, Any] = {
                 "data": data,
                 "message_id": msg_id,
-                "producer_id": self._consumer_name,
                 "idempotency_key": idempotency_key or msg_id,
-                "enqueue_timestamp": datetime.now(UTC).isoformat(),
-            },
+            }
+        else:
+            fields = {
+                "data": data,
+                "message_id": msg_id,
+                "idempotency_key": idempotency_key or msg_id,
+                "source_id": self._source_id,
+                "message_type": type(message).__name__,
+                "timestamp": str(time.time()),
+            }
+        await self._redis.xadd(
+            stream_key,
+            fields,
             maxlen=self._max_stream_length,
             approximate=True,
         )
