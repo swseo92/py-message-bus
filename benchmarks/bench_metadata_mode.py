@@ -170,8 +170,10 @@ async def run_benchmark() -> None:
         ci95_standard = CI_Z * std_standard / math.sqrt(ROUNDS)
         ci95_none = CI_Z * std_none / math.sqrt(ROUNDS)
 
-        overhead_vs_none = (avg_none - avg_standard) / avg_none * 100
-        improvement_vs_legacy = (avg_standard - avg_legacy) / avg_legacy * 100
+        overhead_vs_none = (avg_none - avg_standard) / avg_none * 100 if avg_none > 0 else 0.0
+        improvement_vs_legacy = (
+            (avg_standard - avg_legacy) / avg_legacy * 100 if avg_legacy > 0 else 0.0
+        )
 
         print(f"\n{'─' * 80}")
         print(

@@ -33,10 +33,16 @@ pip install -e ".[dev]"
 # ZMQ 지원 설치
 pip install -e ".[zmq]"
 
+# 벤치마크 (AsyncRedisMessageBus 성능 프로파일링, ROUNDS=10 다중 라운드 통계)
+# 출력: mean/stddev/p95/p99/CV/CI95 칼럼 포함, Markdown 보고서 자동 생성
+python benchmarks/bench_async_redis.py
 # 벤치마크 (AsyncRedisMessageBus 메타데이터 모드 오버헤드 검증)
+# 출력: legacy/standard/none 모드별 mean/stddev/CI95 비교 (ROUNDS=10)
 python benchmarks/bench_metadata_mode.py
 # 벤치마크 (AsyncRedisMessageBus 멱등성 오버헤드 검증)
 python benchmarks/benchmark_idempotency.py
+# 벤치마크 하네스 단위 테스트 (percentile, compute_stats, BenchStats 통계 헬퍼)
+pytest tests/test_bench_harness.py
 ```
 
 ## 아키텍처

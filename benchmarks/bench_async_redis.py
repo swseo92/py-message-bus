@@ -84,6 +84,8 @@ class ComplexMessage(Command):
 def percentile(data: list[float], p: float) -> float:
     if not data:
         return 0.0
+    if not (0 <= p <= 100):
+        raise ValueError(f"Percentile must be in [0, 100], got {p}")
     sorted_data = sorted(data)
     k = (len(sorted_data) - 1) * p / 100
     f = int(k)
@@ -106,11 +108,18 @@ class BenchStats:
 
 
 def compute_stats(samples: list[float]) -> BenchStats:
-    """Compute mean, stddev, p95, p99, CV, and 95% CI from a list of samples."""
+    """Compute mean, stddev, p95, p99, CV, and 95% CI from a list of samples.
+
+    Edge cases:
+    - Empty samples: all fields are 0.0 (sentinel; not meaningful).
+    - Single sample: stddev/cv/ci95 are 0.0 due to insufficient data,
+      NOT because the measurement is perfectly stable.
+    """
     if not samples:
         return BenchStats(mean=0.0, stddev=0.0, p95=0.0, p99=0.0, cv=0.0, ci95=0.0)
     if len(samples) == 1:
         v = samples[0]
+        # stddev/cv/ci95 = 0.0: insufficient data for variance, not zero variance
         return BenchStats(mean=v, stddev=0.0, p95=v, p99=v, cv=0.0, ci95=0.0)
     mean = statistics.mean(samples)
     stddev = statistics.stdev(samples)
@@ -447,7 +456,11 @@ async def bench_consumer_throughput(concurrency: int) -> float:
         try:
             await asyncio.wait_for(done_event.wait(), timeout=30.0)
         except TimeoutError:
-            pass
+            print(
+                f"  [WARN] Throughput benchmark timed out after 30 s "
+                f"({len(consumed)}/{n_messages} messages consumed). "
+                "Results reflect partial consumption."
+            )
 
     elapsed = (consumed[-1] - t0) if consumed else 1.0
     actual_consumed = len(consumed)
