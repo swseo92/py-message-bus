@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 from message_bus.dead_letter import DeadLetterStore
@@ -29,6 +30,22 @@ from message_bus.ports import (
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+# Lua script: atomically dedup-check + XACK on duplicate (10 lines or fewer).
+# Loaded once at import time from the co-located lua/ directory.
+def _load_lua_script() -> str:
+    lua_path = Path(__file__).parent / "lua" / "ack_and_dedup.lua"
+    try:
+        return lua_path.read_text()
+    except OSError as exc:
+        raise OSError(
+            f"Failed to load Lua script '{lua_path}'. "
+            "Ensure 'lua/ack_and_dedup.lua' is included in the installed package."
+        ) from exc
+
+
+_LUA_ACK_AND_DEDUP: str = _load_lua_script()
 
 
 class MaxRetriesExceededError(Exception):
@@ -270,6 +287,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         "_dead_letter_store",
         "_max_stream_length",
         "_idempotency_ttl",
+        "_command_idempotency",
+        "_task_idempotency",
+        "_event_idempotency",
+        "_query_idempotency",
         "_concurrency_config",
         "_shutdown_timeout",
         "_metrics_collector",
@@ -302,6 +323,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         dead_letter_store: DeadLetterStore | None = None,
         max_stream_length: int = 10_000,
         idempotency_ttl: int = 86400,
+        command_idempotency: bool = True,
+        task_idempotency: bool = True,
+        event_idempotency: bool = False,
+        query_idempotency: bool = False,
         shutdown_timeout: float = 5.0,
         metrics_collector: BusMetricsCollector | None = None,
         latency_stats: LatencyStats | None = None,
@@ -362,6 +387,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         if idempotency_ttl <= 0:
             raise ValueError(f"idempotency_ttl must be a positive integer (got {idempotency_ttl})")
         self._idempotency_ttl = idempotency_ttl
+        self._command_idempotency = command_idempotency
+        self._task_idempotency = task_idempotency
+        self._event_idempotency = event_idempotency
+        self._query_idempotency = query_idempotency
         if not (shutdown_timeout > 0 and math.isfinite(shutdown_timeout)):
             raise ValueError(
                 f"shutdown_timeout must be a finite positive number, got {shutdown_timeout!r}"
@@ -897,7 +926,11 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         return f"{self._app_name}:reply_ch:{correlation_id}"
 
     async def _xadd(
-        self, stream_key: str, message: Any, idempotency_key: str | None = None
+        self,
+        stream_key: str,
+        message: Any,
+        idempotency_key: str | None = None,
+        with_dedup: bool = False,
     ) -> None:
         """Serialize *message* and append it to *stream_key*.
 
@@ -909,30 +942,42 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         ``metadata_mode="none"``: dedup fields only (``message_id`` and
         ``idempotency_key``).  Enrichment metadata is omitted for
         maximum producer throughput while preserving idempotency.
+
+        When *with_dedup* is ``True``, a ``SET NX EX`` for the dedup key is
+        pipelined together with ``XADD`` so both commands travel in a single
+        round-trip, eliminating an extra RTT on the publish path.
         """
         data = self._serializer.dumps(message)
         msg_id = uuid.uuid4().hex
+        ikey = idempotency_key or msg_id
         if self._metadata_mode == "none":
             fields: dict[str, Any] = {
                 "data": data,
                 "message_id": msg_id,
-                "idempotency_key": idempotency_key or msg_id,
+                "idempotency_key": ikey,
             }
         else:
             fields = {
                 "data": data,
                 "message_id": msg_id,
-                "idempotency_key": idempotency_key or msg_id,
+                "idempotency_key": ikey,
                 "source_id": self._source_id,
                 "message_type": type(message).__name__,
                 "timestamp": str(time.time()),
             }
-        await self._redis.xadd(
-            stream_key,
-            fields,
-            maxlen=self._max_stream_length,
-            approximate=True,
-        )
+        if with_dedup:
+            dedup_key = self._dedup_key(ikey, scope=stream_key)
+            async with self._redis.pipeline(transaction=False) as pipe:
+                pipe.xadd(stream_key, fields, maxlen=self._max_stream_length, approximate=True)
+                pipe.set(dedup_key, "1", nx=True, ex=self._idempotency_ttl)
+                await pipe.execute()
+        else:
+            await self._redis.xadd(
+                stream_key,
+                fields,
+                maxlen=self._max_stream_length,
+                approximate=True,
+            )
 
     def _dedup_key(self, idempotency_key: str, scope: str = "") -> str:
         prefix = f"{scope}:" if scope else ""
@@ -971,6 +1016,37 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 scope,
                 e,
             )
+
+    async def _claim_or_ack_dedup(
+        self,
+        stream_key: str,
+        message_id: Any,
+        idempotency_key: str,
+        scope: str = "",
+        consumer_group: str | None = None,
+    ) -> bool:
+        """Atomically dedup-check via Lua script.
+
+        Uses ``ack_and_dedup.lua``: on duplicate (key already set) the script
+        issues XACK atomically and returns 0, saving one round-trip compared to
+        a separate ``SET NX`` + ``XACK`` pair.
+
+        Returns ``True`` when the key was newly claimed (first processing).
+        Returns ``False`` when the key already existed (duplicate); the Lua
+        script has already issued XACK so the caller must not ACK again.
+        """
+        dedup_key = self._dedup_key(idempotency_key, scope=scope or stream_key)
+        group = consumer_group or self._consumer_group
+        result = await self._redis.eval(
+            _LUA_ACK_AND_DEDUP,
+            3,
+            dedup_key,
+            stream_key,
+            group,
+            message_id,
+            self._idempotency_ttl,
+        )
+        return bool(result)
 
     async def _ensure_group(self, stream_key: str, group: str) -> None:
         """Create consumer group (and stream) if they do not yet exist."""
@@ -1074,14 +1150,13 @@ class AsyncRedisMessageBus(AsyncMessageBus):
 
         ikey_raw = fields.get(b"idempotency_key") or fields.get("idempotency_key")
         ikey: str | None = None
-        if ikey_raw is not None:
+        if ikey_raw is not None and self._command_idempotency:
             ikey = ikey_raw.decode() if isinstance(ikey_raw, bytes) else ikey_raw
-            if not await self._try_claim_dedup(ikey, scope=stream_key):
+            if not await self._claim_or_ack_dedup(stream_key, message_id, ikey):
                 logger.info(
                     "Skipping duplicate command (idempotency_key=%s) id=%s", ikey, message_id
                 )
-                await self._redis.xack(stream_key, self._consumer_group, message_id)
-                return
+                return  # XACK already issued atomically by Lua script
 
         try:
             msg = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
@@ -1215,12 +1290,11 @@ class AsyncRedisMessageBus(AsyncMessageBus):
 
         ikey_raw = fields.get(b"idempotency_key") or fields.get("idempotency_key")
         ikey: str | None = None
-        if ikey_raw is not None:
+        if ikey_raw is not None and self._task_idempotency:
             ikey = ikey_raw.decode() if isinstance(ikey_raw, bytes) else ikey_raw
-            if not await self._try_claim_dedup(ikey, scope=stream_key):
+            if not await self._claim_or_ack_dedup(stream_key, message_id, ikey):
                 logger.info("Skipping duplicate task (idempotency_key=%s) id=%s", ikey, message_id)
-                await self._redis.xack(stream_key, self._consumer_group, message_id)
-                return
+                return  # XACK already issued atomically by Lua script
 
         try:
             msg = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
@@ -1274,26 +1348,18 @@ class AsyncRedisMessageBus(AsyncMessageBus):
 
                 ikey_raw = fields.get(b"idempotency_key") or fields.get("idempotency_key")
                 ikey: str | None = None
-                if ikey_raw is not None:
+                use_idempotency = (":command:" in stream_str and self._command_idempotency) or (
+                    ":task:" in stream_str and self._task_idempotency
+                )
+                if ikey_raw is not None and use_idempotency:
                     ikey = ikey_raw.decode() if isinstance(ikey_raw, bytes) else ikey_raw
-                    if not await self._try_claim_dedup(ikey, scope=stream_str):
+                    if not await self._claim_or_ack_dedup(stream_str, message_id, ikey):
                         logger.info(
                             "Skipping duplicate message (idempotency_key=%s) id=%s",
                             ikey,
                             message_id,
                         )
-                        try:
-                            await self._redis.xack(stream_str, self._consumer_group, message_id)
-                        except Exception as e:
-                            logger.warning(
-                                "XACK failed for duplicate message id=%s "
-                                "(idempotency_key=%s stream=%s): %s",
-                                message_id,
-                                ikey,
-                                stream_str,
-                                e,
-                            )
-                        continue
+                        continue  # XACK already issued atomically by Lua script
 
                 msg = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
 
@@ -1377,34 +1443,25 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                     "idempotency_key"
                                 )
                                 evt_ikey: str | None = None
-                                if ikey_raw is not None:
+                                if ikey_raw is not None and self._event_idempotency:
                                     evt_ikey = (
                                         ikey_raw.decode()
                                         if isinstance(ikey_raw, bytes)
                                         else ikey_raw
                                     )
-                                    if not await self._try_claim_dedup(
-                                        evt_ikey, scope=subscriber_group
+                                    if not await self._claim_or_ack_dedup(
+                                        stream_key,
+                                        message_id,
+                                        evt_ikey,
+                                        scope=subscriber_group,
+                                        consumer_group=subscriber_group,
                                     ):
                                         logger.info(
                                             "Skipping duplicate event (idempotency_key=%s) id=%s",
                                             evt_ikey,
                                             message_id,
                                         )
-                                        try:
-                                            await self._redis.xack(
-                                                stream_key, subscriber_group, message_id
-                                            )
-                                        except Exception as e:
-                                            logger.warning(
-                                                "XACK failed for duplicate event id=%s "
-                                                "(idempotency_key=%s group=%s): %s",
-                                                message_id,
-                                                evt_ikey,
-                                                subscriber_group,
-                                                e,
-                                            )
-                                        continue
+                                        continue  # XACK already issued by Lua script
 
                                 event = self._serializer.loads(
                                     raw if isinstance(raw, bytes) else raw.encode()
@@ -1860,16 +1917,21 @@ class AsyncRedisMessageBus(AsyncMessageBus):
 
             ikey_raw = fields.get(b"idempotency_key") or fields.get("idempotency_key")
             reprocess_ikey: str | None = None
-            if ikey_raw is not None:
+            if ikey_raw is not None and self._event_idempotency:
                 reprocess_ikey = ikey_raw.decode() if isinstance(ikey_raw, bytes) else ikey_raw
-                if not await self._try_claim_dedup(reprocess_ikey, scope=group):
+                if not await self._claim_or_ack_dedup(
+                    stream_key,
+                    message_id,
+                    reprocess_ikey,
+                    scope=group,
+                    consumer_group=group,
+                ):
                     logger.info(
                         "Skipping duplicate claimed event (idempotency_key=%s) id=%s",
                         reprocess_ikey,
                         message_id,
                     )
-                    await self._redis.xack(stream_key, group, message_id)
-                    return
+                    return  # XACK already issued atomically by Lua script
 
             event = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
             if not isinstance(event, Event):
