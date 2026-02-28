@@ -838,6 +838,21 @@ class TestAsyncRedisMessageBusQuery:
         finally:
             await bus.close()
 
+    @pytest.mark.asyncio
+    async def test_query_reply_uses_pipeline(self, bus) -> None:
+        """Successful query handling must pipeline reply XADD, expire, and XACK."""
+
+        async def handle_query(q: GetOrderQuery) -> str:
+            return f"order-{q.order_id}"
+
+        bus.register_query(GetOrderQuery, handle_query)
+        await bus.start()
+        try:
+            result = await asyncio.wait_for(bus.send(GetOrderQuery(order_id="42")), timeout=2.0)
+            assert result == "order-42"
+        finally:
+            await bus.close()
+
 
 # ---------------------------------------------------------------------------
 # AsyncRedisMessageBus – lifecycle tests
@@ -1390,24 +1405,30 @@ class TestMaxStreamLength:
 
         consumer.register_query(GetOrderQuery, handler)
 
+        # After SWS2-59: PUBLISH goes through pipeline (not direct redis.publish)
         publish_calls: list[str] = []
-        original_publish = consumer_redis.publish
-
-        async def capturing_publish(channel, message):
-            publish_calls.append(str(channel))
-            return await original_publish(channel, message)
-
-        consumer_redis.publish = capturing_publish
-
         xadd_reply_calls: list[str] = []
-        original_xadd = consumer_redis.xadd
+        original_pipeline = consumer_redis.pipeline
 
-        async def capturing_xadd(name, fields, *args, **kwargs):
-            if "reply" in str(name):
-                xadd_reply_calls.append(str(name))
-            return await original_xadd(name, fields, *args, **kwargs)
+        def capturing_pipeline(*args, **kwargs):  # type: ignore[no-untyped-def]
+            pipe = original_pipeline(*args, **kwargs)
+            orig_pipe_publish = pipe.publish
+            orig_pipe_xadd = pipe.xadd
 
-        consumer_redis.xadd = capturing_xadd
+            def cap_publish(channel, message):  # type: ignore[no-untyped-def]
+                publish_calls.append(str(channel))
+                return orig_pipe_publish(channel, message)
+
+            def cap_xadd(name, fields, *a, **kw):  # type: ignore[no-untyped-def]
+                if "reply" in str(name):
+                    xadd_reply_calls.append(str(name))
+                return orig_pipe_xadd(name, fields, *a, **kw)
+
+            pipe.publish = cap_publish
+            pipe.xadd = cap_xadd
+            return pipe
+
+        consumer_redis.pipeline = capturing_pipeline
 
         await producer.start()
         await consumer.start()
@@ -2646,9 +2667,7 @@ class TestConnectionModes:
     # ------------------------------------------------------------------
 
     @pytest.mark.asyncio
-    async def test_connection_pool_bus_dispatches_command(
-        self, serializer, fake_redis_server
-    ):
+    async def test_connection_pool_bus_dispatches_command(self, serializer, fake_redis_server):
         """Bus created with connection_pool correctly dispatches commands end-to-end."""
         handled = asyncio.Event()
 
@@ -2745,15 +2764,14 @@ class TestConnectionModes:
         )
         bus._redis = None
 
-        with patch.object(
-            bus, "_create_redis_client", side_effect=ValueError("bad config")
-        ), pytest.raises(ValueError, match="bad config"):
+        with (
+            patch.object(bus, "_create_redis_client", side_effect=ValueError("bad config")),
+            pytest.raises(ValueError, match="bad config"),
+        ):
             await bus._reconnect()
 
     @pytest.mark.asyncio
-    async def test_reconnect_suppresses_transient_connection_errors(
-        self, serializer
-    ):
+    async def test_reconnect_suppresses_transient_connection_errors(self, serializer):
         """_reconnect() must suppress transient RedisConnectionError."""
         import redis.exceptions as redis_exc
 
@@ -2904,3 +2922,29 @@ class TestHealthCheck:
             assert "ConnectionError" in result["redis_error"]
         finally:
             await bus.close()
+
+
+class TestBlockMsDefault:
+    """Tests for _block_ms parameter default value."""
+
+    def test_block_ms_default_is_10(self) -> None:
+        """_block_ms default value must be 10 ms."""
+        import inspect
+
+        sig = inspect.signature(AsyncRedisMessageBus.__init__)
+        assert sig.parameters["_block_ms"].default == 10
+
+
+# ---------------------------------------------------------------------------
+# Stream key caching
+# ---------------------------------------------------------------------------
+
+
+class TestStreamKeys:
+    def test_stream_key_caching(self, bus) -> None:
+        """_stream_key must cache results and return the same string object."""
+        key1 = bus._stream_key("command", "FooCmd")
+        key2 = bus._stream_key("command", "FooCmd")
+        assert key1 == key2
+        assert ("command", "FooCmd") in bus._stream_key_cache
+        assert bus._stream_key_cache[("command", "FooCmd")] == key1

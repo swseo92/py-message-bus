@@ -286,6 +286,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         # Shared Pub/Sub reply listener
         "_pubsub",
         "_pending_queries",
+        "_stream_key_cache",
     )
 
     def __init__(
@@ -342,9 +343,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             )
         if sentinel_urls is not None:
             if not sentinel_urls:
-                raise ValueError(
-                    "sentinel_urls must contain at least one (host, port) tuple."
-                )
+                raise ValueError("sentinel_urls must contain at least one (host, port) tuple.")
             if not sentinel_service_name:
                 raise ValueError(
                     "sentinel_service_name is required when sentinel_urls is provided."
@@ -378,6 +377,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         # Metadata mode: "standard" (lightweight fields) or "none" (data only)
         self._metadata_mode: Literal["standard", "none"] = metadata_mode
         self._source_id: str = socket.gethostname()
+        self._stream_key_cache: dict[tuple[str, str], str] = {}
         # Injected client takes priority (used in tests with fakeredis)
         self._redis: Any = _redis_client
 
@@ -882,12 +882,16 @@ class AsyncRedisMessageBus(AsyncMessageBus):
     # ------------------------------------------------------------------
 
     def _stream_key(self, prefix: str, name: str) -> str:
+        cache_key = (prefix, name)
+        cached = self._stream_key_cache.get(cache_key)
+        if cached is not None:
+            return cached
         if self._cluster_mode:
-            # Hash tag ensures all stream keys land on the same slot in Cluster mode.
-            # Redis Streams consumer groups (XREADGROUP) require all keys used by a
-            # given consumer group to be in the same hash slot.
-            return f"{{{self._app_name}}}:{prefix}:{name}"
-        return f"{self._app_name}:{prefix}:{name}"
+            result = f"{{{self._app_name}}}:{prefix}:{name}"
+        else:
+            result = f"{self._app_name}:{prefix}:{name}"
+        self._stream_key_cache[cache_key] = result
+        return result
 
     def _reply_channel_key(self, correlation_id: str) -> str:
         """Return the Pub/Sub channel name for a query reply."""
@@ -1544,7 +1548,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                             result = await handler(msg)
                             result_data = self._serializer.dumps(result)
                             payload = json.dumps({"data": result_data.decode("utf-8")})
-                            await self._redis.publish(reply_channel, payload)
+                            await self._send_reply_and_ack(
+                                reply_channel, payload, stream_str, message_id
+                            )
                             _handler_ok = True
                         except Exception as exc:
                             logger.warning(
@@ -1559,9 +1565,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                             await self._send_error_reply(
                                 reply_channel, type(exc).__name__, str(exc)
                             )
+                            await self._redis.xack(stream_str, self._consumer_group, message_id)
                         if _handler_ok and self._metrics_collector is not None:
                             self._metrics_collector.record_processed(stream_str)
-                        await self._redis.xack(stream_str, self._consumer_group, message_id)
                     else:
                         logger.warning(
                             "No handler for query %s; leaving in PEL for retry",
@@ -1585,6 +1591,19 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                     await self._redis.xack(stream_str, self._consumer_group, message_id)
                 except Exception as e:
                     logger.warning("Failed to XACK query message id=%s: %s", message_id, e)
+
+    async def _send_reply_and_ack(
+        self,
+        reply_channel: str,
+        payload: str,
+        stream_str: str,
+        message_id: bytes,
+    ) -> None:
+        """Pipeline PUBLISH reply + XACK into a single Redis round trip."""
+        async with self._redis.pipeline(transaction=False) as pipe:
+            pipe.publish(reply_channel, payload)
+            pipe.xack(stream_str, self._consumer_group, message_id)
+            await pipe.execute()
 
     async def _run_pubsub_reply_listener(self) -> None:
         """Background coroutine: receive PUBLISH-ed query replies and dispatch to futures.
