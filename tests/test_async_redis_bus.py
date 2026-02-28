@@ -3604,3 +3604,184 @@ class TestIdempotencyDefaults:
         # query_idempotency=True로 오버라이드 가능
         bus_with_idem = self._make_bus(fake_redis, query_idempotency=True)
         assert bus_with_idem._query_idempotency is True
+
+
+# ===========================================================================
+# Batch produce API (SWS2-64)
+# ===========================================================================
+
+
+class TestBatchDispatch:
+    """execute_many / publish_many / dispatch_many 배치 API 테스트."""
+
+    @pytest.mark.asyncio
+    async def test_execute_many_calls_handler_for_each_command(self, bus):
+        """execute_many: N개 Command가 모두 핸들러에 전달됨."""
+        received: list[CreateOrderCommand] = []
+
+        async def handler(cmd: CreateOrderCommand) -> None:
+            received.append(cmd)
+
+        bus.register_command(CreateOrderCommand, handler)
+        await bus.start()
+
+        cmds = [
+            CreateOrderCommand(order_id=f"ord-{i}", amount=Decimal("10.00"))
+            for i in range(5)
+        ]
+        await bus.execute_many(cmds)
+        await asyncio.sleep(0.5)
+
+        assert len(received) == 5
+        assert {c.order_id for c in received} == {f"ord-{i}" for i in range(5)}
+
+    @pytest.mark.asyncio
+    async def test_publish_many_calls_handler_for_each_event(self, bus):
+        """publish_many: N개 Event가 모두 구독자에게 전달됨."""
+        received: list[OrderCreatedEvent] = []
+
+        async def handler(evt: OrderCreatedEvent) -> None:
+            received.append(evt)
+
+        bus.subscribe(OrderCreatedEvent, handler)
+        await bus.start()
+
+        evts = [
+            OrderCreatedEvent(
+                order_id=f"ord-{i}", created_at=datetime(2026, 1, 1, tzinfo=UTC)
+            )
+            for i in range(4)
+        ]
+        await bus.publish_many(evts)
+        await asyncio.sleep(0.5)
+
+        assert len(received) == 4
+        assert {e.order_id for e in received} == {f"ord-{i}" for i in range(4)}
+
+    @pytest.mark.asyncio
+    async def test_dispatch_many_calls_handler_for_each_task(self, bus):
+        """dispatch_many: N개 Task가 모두 워커 핸들러에 전달됨."""
+        received: list[ProcessPaymentTask] = []
+
+        async def handler(t: ProcessPaymentTask) -> None:
+            received.append(t)
+
+        bus.register_task(ProcessPaymentTask, handler)
+        await bus.start()
+
+        tasks = [
+            ProcessPaymentTask(payment_id=f"pay-{i}", amount=Decimal("5.00"))
+            for i in range(3)
+        ]
+        await bus.dispatch_many(tasks)
+        await asyncio.sleep(0.5)
+
+        assert len(received) == 3
+        assert {t.payment_id for t in received} == {f"pay-{i}" for i in range(3)}
+
+    @pytest.mark.asyncio
+    async def test_execute_many_empty_list_is_noop(self, bus):
+        """execute_many: 빈 리스트는 예외 없이 무시됨."""
+        await bus.start()
+        await bus.execute_many([])  # 예외 없어야 함
+
+    @pytest.mark.asyncio
+    async def test_publish_many_empty_list_is_noop(self, bus):
+        """publish_many: 빈 리스트는 예외 없이 무시됨."""
+        await bus.start()
+        await bus.publish_many([])
+
+    @pytest.mark.asyncio
+    async def test_dispatch_many_empty_list_is_noop(self, bus):
+        """dispatch_many: 빈 리스트는 예외 없이 무시됨."""
+        await bus.start()
+        await bus.dispatch_many([])
+
+    @pytest.mark.asyncio
+    async def test_execute_many_uses_pipeline(self, bus, fake_redis):
+        """execute_many는 내부적으로 pipeline(transaction=False)을 사용한다."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        pipeline_calls: list[int] = []
+
+        original_pipeline = fake_redis.pipeline
+
+        def counting_pipeline(transaction=True):
+            pipeline_calls.append(1)
+            return original_pipeline(transaction=transaction)
+
+        fake_redis.pipeline = counting_pipeline
+        await bus.start()
+
+        cmds = [
+            CreateOrderCommand(order_id=f"ord-{i}", amount=Decimal("1.00"))
+            for i in range(3)
+        ]
+        await bus.execute_many(cmds)
+
+        # pipeline이 한 번만 호출되어야 함 (N개 XADD가 단일 RTT)
+        assert len(pipeline_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_xadd_many_with_dedup_sets_dedup_keys(self, fake_redis_server, serializer):
+        """_xadd_many(with_dedup=True): 각 메시지마다 dedup 키가 Redis에 설정됨."""
+        fake_r = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-batch-dedup",
+            serializer=serializer,
+            _block_ms=0,
+            _redis_client=fake_r,
+        )
+        await bus.start()
+
+        cmds = [
+            CreateOrderCommand(order_id=f"ord-{i}", amount=Decimal("1.00"))
+            for i in range(3)
+        ]
+        stream_key = bus._stream_key("command", "CreateOrderCommand")
+        pairs = [(stream_key, cmd) for cmd in cmds]
+        await bus._xadd_many(pairs, with_dedup=True)
+
+        # 스트림에 3개 메시지 추가됨
+        stream_len = await fake_r.xlen(stream_key)
+        assert stream_len == 3
+
+        # dedup 키 3개 모두 설정됨
+        # (message_id 기반 키이므로 스트림 메시지에서 확인)
+        messages = await fake_r.xrange(stream_key)
+        for _mid, fields in messages:
+            ikey = fields.get(b"idempotency_key") or fields.get("idempotency_key")
+            ikey_str = ikey.decode() if isinstance(ikey, bytes) else ikey
+            dedup_key = bus._dedup_key(ikey_str, scope=stream_key)
+            exists = await fake_r.exists(dedup_key)
+            assert exists == 1, f"dedup key missing for idempotency_key={ikey_str}"
+
+        await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_execute_many_multiple_types_in_one_call(self, bus):
+        """execute_many: 서로 다른 Command 타입도 같은 배치에서 처리됨."""
+        received_order: list[CreateOrderCommand] = []
+        received_cancel: list[CancelOrderCommand] = []
+
+        async def order_handler(cmd: CreateOrderCommand) -> None:
+            received_order.append(cmd)
+
+        async def cancel_handler(cmd: CancelOrderCommand) -> None:
+            received_cancel.append(cmd)
+
+        bus.register_command(CreateOrderCommand, order_handler)
+        bus.register_command(CancelOrderCommand, cancel_handler)
+        await bus.start()
+
+        cmds = [
+            CreateOrderCommand(order_id="ord-1", amount=Decimal("10.00")),
+            CancelOrderCommand(order_id="ord-1"),
+            CreateOrderCommand(order_id="ord-2", amount=Decimal("20.00")),
+        ]
+        await bus.execute_many(cmds)
+        await asyncio.sleep(0.5)
+
+        assert len(received_order) == 2
+        assert len(received_cancel) == 1

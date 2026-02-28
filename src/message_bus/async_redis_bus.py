@@ -10,7 +10,7 @@ import math
 import socket
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -581,6 +581,39 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         stream_key = self._stream_key("task", type(task).__name__)
         await self._xadd(stream_key, task)
 
+    async def execute_many(self, commands: Sequence[Command]) -> None:
+        """Batch-publish N commands in a single pipeline RTT.
+
+        All ``XADD`` calls are queued in one ``pipeline(transaction=False)``
+        and flushed in a single round-trip, reducing N RTTs to 1.
+        """
+        if not commands:
+            return
+        pairs = [(self._stream_key("command", type(cmd).__name__), cmd) for cmd in commands]
+        await self._xadd_many(pairs)
+
+    async def publish_many(self, events: Sequence[Event]) -> None:
+        """Batch-publish N events in a single pipeline RTT.
+
+        All ``XADD`` calls are queued in one ``pipeline(transaction=False)``
+        and flushed in a single round-trip, reducing N RTTs to 1.
+        """
+        if not events:
+            return
+        pairs = [(self._stream_key("event", type(evt).__name__), evt) for evt in events]
+        await self._xadd_many(pairs)
+
+    async def dispatch_many(self, tasks: Sequence[Task]) -> None:
+        """Batch-dispatch N tasks in a single pipeline RTT.
+
+        All ``XADD`` calls are queued in one ``pipeline(transaction=False)``
+        and flushed in a single round-trip, reducing N RTTs to 1.
+        """
+        if not tasks:
+            return
+        pairs = [(self._stream_key("task", type(t).__name__), t) for t in tasks]
+        await self._xadd_many(pairs)
+
     # ------------------------------------------------------------------
     # Connection factory
     # ------------------------------------------------------------------
@@ -993,6 +1026,54 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 maxlen=self._max_stream_length,
                 approximate=True,
             )
+
+    async def _xadd_many(
+        self,
+        messages: list[tuple[str, Any]],
+        with_dedup: bool = False,
+    ) -> None:
+        """Serialize *messages* and batch-append via a single pipeline RTT.
+
+        Uses ``pipeline(transaction=False)`` so all ``XADD`` commands (and
+        optional dedup ``SET NX EX`` commands when *with_dedup* is ``True``)
+        are sent to Redis in one network round-trip.
+
+        Parameters
+        ----------
+        messages:
+            Sequence of ``(stream_key, message)`` pairs.
+        with_dedup:
+            When ``True``, a ``SET NX EX`` for each dedup key is queued in
+            the same pipeline as its ``XADD``, reusing the pattern validated
+            in :meth:`_xadd`.
+        """
+        if not messages:
+            return
+        async with self._redis.pipeline(transaction=False) as pipe:
+            for stream_key, message in messages:
+                data = self._serializer.dumps(message)
+                msg_id = uuid.uuid4().hex
+                ikey = msg_id
+                if self._metadata_mode == "none":
+                    fields: dict[str, Any] = {
+                        "data": data,
+                        "message_id": msg_id,
+                        "idempotency_key": ikey,
+                    }
+                else:
+                    fields = {
+                        "data": data,
+                        "message_id": msg_id,
+                        "idempotency_key": ikey,
+                        "source_id": self._source_id,
+                        "message_type": type(message).__name__,
+                        "timestamp": str(time.time()),
+                    }
+                pipe.xadd(stream_key, fields, maxlen=self._max_stream_length, approximate=True)
+                if with_dedup:
+                    dedup_key = self._dedup_key(ikey, scope=stream_key)
+                    pipe.set(dedup_key, "1", nx=True, ex=self._idempotency_ttl)
+            await pipe.execute()
 
     def _dedup_key(self, idempotency_key: str, scope: str = "") -> str:
         prefix = f"{scope}:" if scope else ""

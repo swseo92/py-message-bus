@@ -1,7 +1,7 @@
 """Message bus interfaces (ports)."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
@@ -142,6 +142,33 @@ class AsyncMessageDispatcher(ABC):
     async def dispatch(self, task: Task) -> None:
         """Dispatch a task to one worker asynchronously."""
         ...
+
+    async def execute_many(self, commands: Sequence[Command]) -> None:
+        """Execute multiple commands as a batch.
+
+        Default implementation dispatches sequentially. Implementations
+        may override to send all commands in a single network round-trip.
+        """
+        for command in commands:
+            await self.execute(command)
+
+    async def publish_many(self, events: Sequence[Event]) -> None:
+        """Publish multiple events as a batch.
+
+        Default implementation publishes sequentially. Implementations
+        may override to send all events in a single network round-trip.
+        """
+        for event in events:
+            await self.publish(event)
+
+    async def dispatch_many(self, tasks: Sequence[Task]) -> None:
+        """Dispatch multiple tasks as a batch.
+
+        Default implementation dispatches sequentially. Implementations
+        may override to send all tasks in a single network round-trip.
+        """
+        for task in tasks:
+            await self.dispatch(task)
 
 
 class AsyncHandlerRegistry(ABC):
