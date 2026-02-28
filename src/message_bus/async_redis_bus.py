@@ -772,6 +772,64 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         )
 
     # ------------------------------------------------------------------
+    # Health check
+    # ------------------------------------------------------------------
+
+    async def health_check(self) -> dict[str, Any]:
+        """Return a health status snapshot of the bus.
+
+        Checks
+        ------
+        * **redis_connected** – whether :meth:`ping` succeeds on the current
+          Redis client.  ``False`` when the client is ``None`` (bus not started
+          or already closed) or when the ping raises a connection error.
+        * **consumer_loop_active** – whether background consumer tasks are
+          alive.  Evaluates to ``True`` when no handlers are registered (no
+          consumer tasks are needed).
+
+        Returns
+        -------
+        dict with keys:
+
+        * ``is_healthy`` (bool) – ``True`` iff both sub-checks pass.
+        * ``redis_connected`` (bool)
+        * ``consumer_loop_active`` (bool)
+        """
+        redis_connected = False
+        if self._redis is not None:
+            try:
+                await self._redis.ping()
+                redis_connected = True
+            except (RedisConnectionError, RedisTimeoutError, RedisResponseError, OSError):
+                redis_connected = False
+
+        has_handlers = bool(
+            self._command_handlers
+            or self._task_handlers
+            or self._event_subscriptions
+            or self._query_handlers
+        )
+        if not self._running:
+            consumer_loop_active = False
+        elif not has_handlers:
+            consumer_loop_active = True  # no consumers needed
+        else:
+            consumer_loop_active = bool(self._consumer_tasks) and all(
+                not t.done() for t in self._consumer_tasks
+            )
+
+        return {
+            "is_healthy": redis_connected and consumer_loop_active,
+            "redis_connected": redis_connected,
+            "consumer_loop_active": consumer_loop_active,
+        }
+
+    async def is_healthy(self) -> bool:
+        """Return ``True`` if :meth:`health_check` reports overall health."""
+        result = await self.health_check()
+        return bool(result["is_healthy"])
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
