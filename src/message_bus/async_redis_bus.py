@@ -519,7 +519,12 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         finally:
             self._pending_queries.pop(correlation_id, None)
 
-        payload = json.loads(raw_payload)
+        try:
+            payload = json.loads(raw_payload)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Malformed reply on channel {reply_channel!r}: invalid JSON"
+            ) from exc
         error_type = payload.get("error_type")
         if error_type:
             error_message = payload.get("error_message", "")
@@ -642,7 +647,14 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             if self._cluster_mode
             else f"{self._app_name}:reply_ch:*"
         )
-        await self._pubsub.psubscribe(reply_pattern)
+        try:
+            await self._pubsub.psubscribe(reply_pattern)
+        except Exception as exc:
+            await self._pubsub.aclose()
+            self._pubsub = None
+            raise RuntimeError(
+                f"Failed to subscribe to Pub/Sub reply pattern {reply_pattern!r}: {exc}"
+            ) from exc
         self._consumer_tasks.append(
             asyncio.create_task(self._run_pubsub_reply_listener())
         )
@@ -1606,6 +1618,12 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             return
         except (RedisConnectionError, RedisTimeoutError, OSError) as e:
             logger.warning("Pub/Sub reply listener disconnected: %s", e)
+            # Fail all pending queries immediately so callers get ConnectionError
+            # rather than waiting until their individual timeouts expire.
+            conn_err = ConnectionError(f"Pub/Sub reply listener disconnected: {e}")
+            for fut in list(self._pending_queries.values()):
+                if not fut.done():
+                    fut.set_exception(conn_err)
 
     async def _send_error_reply(
         self, reply_channel: str, error_type: str, error_message: str

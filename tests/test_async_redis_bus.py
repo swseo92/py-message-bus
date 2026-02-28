@@ -803,6 +803,41 @@ class TestAsyncRedisMessageBusQuery:
         finally:
             await bus.close()
 
+    @pytest.mark.asyncio
+    async def test_concurrent_queries_routed_correctly(self, fake_redis_server, serializer):
+        """Concurrent send() calls must each receive their own reply via correlation_id."""
+        import fakeredis
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="svc",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="worker",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+
+        async def handler(q: GetOrderQuery) -> str:
+            return f"reply:{q.order_id}"
+
+        bus.register_query(GetOrderQuery, handler)
+        await bus.start()
+
+        try:
+            # Fire 5 queries concurrently; each must receive its own reply.
+            order_ids = [f"order-{i}" for i in range(5)]
+            results = await asyncio.gather(
+                *[bus.send(GetOrderQuery(order_id=oid)) for oid in order_ids]
+            )
+            for oid, result in zip(order_ids, results, strict=True):
+                assert result == f"reply:{oid}", (
+                    f"Query {oid!r} got wrong reply: {result!r}"
+                )
+        finally:
+            await bus.close()
+
 
 # ---------------------------------------------------------------------------
 # AsyncRedisMessageBus – lifecycle tests
