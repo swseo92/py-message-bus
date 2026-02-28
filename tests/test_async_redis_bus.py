@@ -1,6 +1,7 @@
 """Tests for AsyncRedisMessageBus using fakeredis."""
 
 import asyncio
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -3139,6 +3140,217 @@ class TestHealthCheck:
         finally:
             await bus.close()
 
+    @pytest.mark.asyncio
+    async def test_health_check_pubsub_active_when_started(self, fake_redis):
+        """Started bus → pubsub_active True because PSUBSCRIBE succeeded."""
+        bus = self._make_bus(fake_redis)
+        async with bus:
+            result = await bus.health_check()
+        assert result["pubsub_active"] is True
+
+    @pytest.mark.asyncio
+    async def test_health_check_pubsub_active_false_before_start(self, fake_redis):
+        """Bus not yet started → pubsub_active False (no pubsub object)."""
+        bus = self._make_bus(fake_redis)
+        result = await bus.health_check()
+        assert result["pubsub_active"] is False
+
+    @pytest.mark.asyncio
+    async def test_health_check_pubsub_active_false_after_close(self, fake_redis):
+        """After close(), pubsub is cleaned up → pubsub_active False."""
+        bus = self._make_bus(fake_redis)
+        async with bus:
+            pass
+        result = await bus.health_check()
+        assert result["pubsub_active"] is False
+
+    @pytest.mark.asyncio
+    async def test_health_check_reconnect_count_starts_at_zero(self, fake_redis):
+        """reconnect_count must be 0 before any reconnect."""
+        bus = self._make_bus(fake_redis)
+        async with bus:
+            result = await bus.health_check()
+        assert result["reconnect_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_health_check_last_reconnect_at_none_initially(self, fake_redis):
+        """last_reconnect_at must be None before any reconnect."""
+        bus = self._make_bus(fake_redis)
+        async with bus:
+            result = await bus.health_check()
+        assert result["last_reconnect_at"] is None
+
+
+class TestReconnectObservability:
+    """SWS2-65: _reconnect() must update reconnect_count and last_reconnect_at."""
+
+    def _make_bus(self, fake_redis, serializer=None) -> AsyncRedisMessageBus:
+        kwargs: dict = {
+            "redis_url": "redis://localhost",
+            "consumer_group": "obs-group",
+            "app_name": "test",
+            "consumer_name": "obs-consumer",
+            "_block_ms": 0,
+            "_redis_client": fake_redis,
+        }
+        if serializer is not None:
+            kwargs["serializer"] = serializer
+        return AsyncRedisMessageBus(**kwargs)
+
+    @pytest.mark.asyncio
+    async def test_reconnect_increments_count(self, fake_redis):
+        """Each _reconnect() call must increment reconnect_count by 1."""
+        bus = self._make_bus(fake_redis)
+        await bus.start()
+        try:
+            assert bus._reconnect_count == 0
+            await bus._reconnect()
+            assert bus._reconnect_count == 1
+            await bus._reconnect()
+            assert bus._reconnect_count == 2
+        finally:
+            await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_sets_last_reconnect_at(self, fake_redis):
+        """_reconnect() must set last_reconnect_at to a recent UNIX timestamp."""
+        bus = self._make_bus(fake_redis)
+        await bus.start()
+        try:
+            assert bus._last_reconnect_at is None
+            before = time.time()
+            await bus._reconnect()
+            after = time.time()
+            assert bus._last_reconnect_at is not None
+            assert before <= bus._last_reconnect_at <= after
+        finally:
+            await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_count_visible_in_health_check(self, fake_redis):
+        """health_check() must reflect the current reconnect_count."""
+        bus = self._make_bus(fake_redis)
+        await bus.start()
+        try:
+            await bus._reconnect()
+            result = await bus.health_check()
+            assert result["reconnect_count"] == 1
+            assert result["last_reconnect_at"] is not None
+        finally:
+            await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_resets_pubsub(self, fake_redis):
+        """_reconnect() must re-establish the Pub/Sub subscription."""
+        bus = self._make_bus(fake_redis)
+        await bus.start()
+        try:
+            old_pubsub = bus._pubsub
+            await bus._reconnect()
+            # A new pubsub object must be created with an active subscription
+            assert bus._pubsub is not None
+            assert bus._pubsub is not old_pubsub
+            result = await bus.health_check()
+            assert result["pubsub_active"] is True
+        finally:
+            await bus.close()
+
+
+class TestPubSubAutoReconnect:
+    """SWS2-65: Pub/Sub reply listener must auto-resubscribe after disconnect."""
+
+    def _make_bus(self, fake_redis, serializer=None) -> AsyncRedisMessageBus:
+        return AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="psub-group",
+            app_name="test_psub",
+            consumer_name="psub-consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+            **({"serializer": serializer} if serializer else {}),
+        )
+
+    @pytest.mark.asyncio
+    async def test_listener_resubscribes_after_disconnect(self, fake_redis):
+        """After a simulated disconnect, the listener must re-subscribe and keep running."""
+        bus = self._make_bus(fake_redis)
+        await bus.start()
+        try:
+            resubscribed = asyncio.Event()
+            real_setup_pubsub = bus._setup_pubsub.__func__
+
+            async def patched_setup_pubsub(self_inner):
+                await real_setup_pubsub(self_inner)
+                resubscribed.set()
+
+            bus._setup_pubsub = lambda: patched_setup_pubsub(bus)  # type: ignore[method-assign]
+
+            # Cancel existing listener task and inject a failing listen()
+            for task in bus._consumer_tasks:
+                task.cancel()
+            await asyncio.gather(*bus._consumer_tasks, return_exceptions=True)
+            bus._consumer_tasks.clear()
+
+            call_count = 0
+
+            async def _once_failing_listen():
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    raise OSError("simulated disconnect")
+                # On second call, yield nothing (simulate idle connection)
+                while True:
+                    await asyncio.sleep(0.01)
+                    if not bus._running:
+                        return
+                    yield  # pragma: no cover
+
+            bus._pubsub.listen = _once_failing_listen
+
+            listener_task = asyncio.create_task(bus._run_pubsub_reply_listener())
+            bus._consumer_tasks.append(listener_task)
+
+            # Wait for auto-resubscription
+            await asyncio.wait_for(resubscribed.wait(), timeout=5.0)
+            assert not listener_task.done(), "Listener must keep running after reconnect"
+        finally:
+            bus._consumer_tasks.clear()
+            await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_listener_fails_pending_queries_on_disconnect(self, fake_redis):
+        """On disconnect, all pending send() futures must get ConnectionError immediately."""
+        bus = self._make_bus(fake_redis)
+        await bus.start()
+        try:
+            for task in bus._consumer_tasks:
+                task.cancel()
+            await asyncio.gather(*bus._consumer_tasks, return_exceptions=True)
+            bus._consumer_tasks.clear()
+
+            async def _failing_listen():
+                raise OSError("simulated disconnect")
+                yield  # make it an async generator
+
+            bus._pubsub.listen = _failing_listen
+
+            correlation_id = "test-corr-id"
+            future: asyncio.Future[bytes] = asyncio.get_event_loop().create_future()
+            bus._pending_queries[correlation_id] = future
+
+            listener_task = asyncio.create_task(bus._run_pubsub_reply_listener())
+            bus._consumer_tasks.append(listener_task)
+
+            with pytest.raises(ConnectionError, match="simulated disconnect"):
+                await asyncio.wait_for(future, timeout=3.0)
+        finally:
+            bus._pending_queries.clear()
+            for task in bus._consumer_tasks:
+                task.cancel()
+            await asyncio.gather(*bus._consumer_tasks, return_exceptions=True)
+            bus._consumer_tasks.clear()
+            await bus.close()
+
 
 class TestBlockMsDefault:
     """Tests for _block_ms parameter default value."""
@@ -3832,7 +4044,6 @@ class TestBatchDispatch:
     @pytest.mark.asyncio
     async def test_execute_many_uses_pipeline(self, bus, fake_redis):
         """execute_many는 내부적으로 pipeline(transaction=False)을 사용한다."""
-        from unittest.mock import AsyncMock, MagicMock, patch
 
         pipeline_calls: list[int] = []
 
