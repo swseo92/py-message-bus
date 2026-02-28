@@ -317,10 +317,15 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 "Only one connection mode can be active at a time: "
                 "connection_pool, sentinel_urls, or cluster_mode."
             )
-        if sentinel_urls is not None and not sentinel_service_name:
-            raise ValueError(
-                "sentinel_service_name is required when sentinel_urls is provided."
-            )
+        if sentinel_urls is not None:
+            if not sentinel_urls:
+                raise ValueError(
+                    "sentinel_urls must contain at least one (host, port) tuple."
+                )
+            if not sentinel_service_name:
+                raise ValueError(
+                    "sentinel_service_name is required when sentinel_urls is provided."
+                )
         self._redis_url = redis_url
         self._consumer_group = consumer_group
         self._app_name = app_name
@@ -561,9 +566,12 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         if self._connection_pool is not None:
             return aioredis.Redis(connection_pool=self._connection_pool, decode_responses=False)
         if self._sentinel_urls is not None:
+            # sentinel_kwargs is for authenticating/configuring sentinel-node connections;
+            # __init__ validation guarantees _sentinel_service_name is set.
+            assert self._sentinel_service_name is not None
             sentinel = aioredis.Sentinel(
                 self._sentinel_urls,
-                **self._sentinel_kwargs,
+                sentinel_kwargs=self._sentinel_kwargs if self._sentinel_kwargs else None,
             )
             return sentinel.master_for(self._sentinel_service_name, decode_responses=False)
         if self._cluster_mode:
@@ -1745,18 +1753,38 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             )
         return True
 
+    def _connection_mode_description(self) -> str:
+        """Return a human-readable description of the active connection mode."""
+        if self._connection_pool is not None:
+            return "connection_pool"
+        if self._sentinel_urls is not None:
+            return f"sentinel(service={self._sentinel_service_name})"
+        if self._cluster_mode:
+            return f"cluster(url={self._redis_url})"
+        return f"standalone(url={self._redis_url})"
+
     async def _reconnect(self) -> None:
-        """Replace the Redis client after a connection failure."""
+        """Replace the Redis client after a connection failure.
+
+        Only transient network errors are suppressed; configuration or
+        programming errors are re-raised so callers are not silently broken.
+        """
         if self._redis is not None:
             try:
                 await self._redis.aclose()
             except Exception as e:
                 logger.warning("Error closing Redis connection during reconnect: %s", e)
+        mode = self._connection_mode_description()
         try:
             self._redis = self._create_redis_client()
-        except Exception:
-            logger.exception("Failed to reconnect to Redis")
+        except (RedisConnectionError, RedisTimeoutError, OSError):
+            logger.exception("Failed to reconnect to Redis (mode=%s)", mode)
             return
+        except Exception:
+            logger.exception(
+                "Non-transient error while reconnecting to Redis (mode=%s); re-raising", mode
+            )
+            raise
         try:
             await self._ensure_all_groups()
         except Exception:

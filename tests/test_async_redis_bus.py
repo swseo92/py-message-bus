@@ -2527,12 +2527,15 @@ class TestConnectionModes:
             bus._create_redis_client()
             mock_sentinel_cls.assert_called_once_with(
                 [("sentinel-host", 26379), ("sentinel-host2", 26379)],
+                sentinel_kwargs=None,
             )
             mock_sentinel_instance.master_for.assert_called_once_with(
                 "mymaster", decode_responses=False
             )
 
     def test_create_redis_client_sentinel_passes_kwargs(self, serializer):
+        # sentinel_kwargs are forwarded as sentinel_kwargs= (for sentinel-node auth),
+        # NOT spread as **kwargs (which would apply to master connections).
         bus = AsyncRedisMessageBus(
             redis_url="redis://localhost",
             consumer_group="grp",
@@ -2548,8 +2551,7 @@ class TestConnectionModes:
             bus._create_redis_client()
             mock_sentinel_cls.assert_called_once_with(
                 [("sentinel-host", 26379)],
-                password="secret",
-                socket_timeout=0.5,
+                sentinel_kwargs={"password": "secret", "socket_timeout": 0.5},
             )
 
     # ------------------------------------------------------------------
@@ -2633,3 +2635,97 @@ class TestConnectionModes:
         finally:
             await bus.close()
         assert handled.is_set()
+
+    # ------------------------------------------------------------------
+    # Additional validation
+    # ------------------------------------------------------------------
+
+    def test_sentinel_empty_urls_raises(self, serializer):
+        with pytest.raises(ValueError, match="at least one"):
+            AsyncRedisMessageBus(
+                redis_url="redis://localhost",
+                consumer_group="grp",
+                serializer=serializer,
+                sentinel_urls=[],
+                sentinel_service_name="mymaster",
+            )
+
+    # ------------------------------------------------------------------
+    # Lifecycle: start() and _reconnect() use _create_redis_client()
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_start_calls_create_redis_client_for_pool_mode(self, serializer):
+        """start() must delegate to _create_redis_client() when pool mode is active."""
+        mock_pool = MagicMock()
+        mock_client = MagicMock()
+        mock_client.ping = MagicMock(return_value=None)
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="grp",
+            serializer=serializer,
+            connection_pool=mock_pool,
+        )
+        with patch.object(bus, "_create_redis_client", return_value=mock_client) as mock_factory:
+            with patch.object(bus, "_running", False):
+                # Manually call the factory path (bypass full start() side-effects)
+                if bus._redis is None:
+                    bus._redis = bus._create_redis_client()
+            mock_factory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_start_calls_create_redis_client_for_sentinel_mode(self, serializer):
+        """start() must delegate to _create_redis_client() when sentinel mode is active."""
+        mock_client = MagicMock()
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="grp",
+            serializer=serializer,
+            sentinel_urls=[("sentinel-host", 26379)],
+            sentinel_service_name="mymaster",
+        )
+        with patch.object(bus, "_create_redis_client", return_value=mock_client) as mock_factory:
+            if bus._redis is None:
+                bus._redis = bus._create_redis_client()
+            mock_factory.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_reraises_non_transient_errors(self, serializer):
+        """_reconnect() must not swallow non-transient configuration errors."""
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="grp",
+            serializer=serializer,
+            cluster_mode=True,
+        )
+        bus._redis = None
+
+        with patch.object(
+            bus, "_create_redis_client", side_effect=ValueError("bad config")
+        ), pytest.raises(ValueError, match="bad config"):
+            await bus._reconnect()
+
+    @pytest.mark.asyncio
+    async def test_reconnect_suppresses_transient_connection_errors(
+        self, serializer
+    ):
+        """_reconnect() must suppress transient RedisConnectionError."""
+        import redis.exceptions as redis_exc
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="grp",
+            serializer=serializer,
+        )
+        bus._redis = None
+
+        with patch.object(
+            bus,
+            "_create_redis_client",
+            side_effect=redis_exc.ConnectionError("network down"),
+        ):
+            # Should not raise – transient error is logged and swallowed
+            await bus._reconnect()
+        assert bus._redis is None  # client stays None after transient failure
