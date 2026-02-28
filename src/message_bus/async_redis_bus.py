@@ -248,6 +248,30 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         **Testing only.** Inject a pre-built async Redis client
         (e.g. ``fakeredis.aioredis.FakeRedis()``). When provided, the
         *redis_url* is ignored during :meth:`start`.
+    event_idempotency:
+        Enable consumer-side dedup for Events (fan-out streams).
+        Defaults to ``False``.
+
+        .. warning::
+            ``event_idempotency`` is ``False`` by default because Event
+            fan-out uses *per-subscriber* consumer groups — duplicate
+            delivery via XAUTOCLAIM is possible but typically safe to
+            process more than once.  Set ``event_idempotency=True`` only
+            when your event handlers are **not** naturally idempotent;
+            be aware this adds a Redis ``SET NX`` round-trip per message
+            and requires producers to set an explicit ``idempotency_key``.
+    command_idempotency / task_idempotency:
+        Enable consumer-side dedup for Commands and Tasks respectively.
+        Both default to ``True``.
+
+        .. note::
+            Dedup is only applied when the incoming stream message contains
+            an ``idempotency_key`` field.  If the field is absent (e.g. the
+            message was produced by an external system), the dedup check is
+            silently skipped even when ``command_idempotency=True``.  A
+            ``WARNING`` is emitted in that case.  Producers using
+            ``AsyncRedisMessageBus.execute()`` always set the field
+            automatically; external producers must add it explicitly.
 
     Lifecycle
     ---------
@@ -1118,16 +1142,42 @@ class AsyncRedisMessageBus(AsyncMessageBus):
 
         Must be called when a handler raises an exception **before** returning,
         so that XAUTOCLAIM can re-deliver the message to another consumer.
+
+        Retries up to 3 times with exponential backoff (1 s → 2 s → 4 s) before
+        giving up.  A permanent failure means the dedup key will persist until
+        TTL expiry, causing re-deliveries to be permanently skipped — hence the
+        aggressive retry and final ``error``-level log.
         """
-        try:
-            await self._redis.delete(self._dedup_key(idempotency_key, scope))
-        except Exception as e:
-            logger.warning(
-                "Failed to release dedup key for idempotency_key=%s scope=%s: %s",
-                idempotency_key,
-                scope,
-                e,
-            )
+        max_retries = 3
+        delay = 1.0
+        for attempt in range(max_retries):
+            try:
+                await self._redis.delete(self._dedup_key(idempotency_key, scope))
+                return
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(
+                        "Failed to release dedup key for idempotency_key=%s scope=%s "
+                        "(attempt %d/%d, retrying in %.1fs): %s",
+                        idempotency_key,
+                        scope,
+                        attempt + 1,
+                        max_retries,
+                        delay,
+                        e,
+                    )
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                else:
+                    logger.error(
+                        "Failed to release dedup key for idempotency_key=%s scope=%s "
+                        "after %d attempts: %s — key will persist until TTL expiry; "
+                        "re-delivery of this message may be permanently skipped.",
+                        idempotency_key,
+                        scope,
+                        max_retries,
+                        e,
+                    )
 
     async def _claim_or_ack_dedup(
         self,
@@ -1284,6 +1334,13 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                     "Skipping duplicate command (idempotency_key=%s) id=%s", ikey, message_id
                 )
                 return False  # XACK already issued atomically by Lua script
+        elif ikey_raw is None and self._command_idempotency:
+            logger.warning(
+                "command_idempotency=True but message id=%s has no 'idempotency_key' field; "
+                "dedup check skipped.  Ensure producers set an explicit idempotency_key "
+                "for reliable exactly-once delivery.",
+                message_id,
+            )
 
         try:
             msg = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
@@ -1443,6 +1500,13 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             if not await self._claim_or_ack_dedup(stream_key, message_id, ikey):
                 logger.info("Skipping duplicate task (idempotency_key=%s) id=%s", ikey, message_id)
                 return False  # XACK already issued atomically by Lua script
+        elif ikey_raw is None and self._task_idempotency:
+            logger.warning(
+                "task_idempotency=True but message id=%s has no 'idempotency_key' field; "
+                "dedup check skipped.  Ensure producers set an explicit idempotency_key "
+                "for reliable exactly-once delivery.",
+                message_id,
+            )
 
         try:
             msg = self._serializer.loads(raw if isinstance(raw, bytes) else raw.encode())
