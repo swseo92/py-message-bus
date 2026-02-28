@@ -1977,6 +1977,93 @@ class TestMalformedPayloadHandling:
             f"Malformed task message must be ACKed (pending={pending['pending']})"
         )
 
+    @pytest.mark.asyncio
+    async def test_event_missing_data_field_is_acked(self, fake_redis_server, serializer):
+        """Event 스트림에서 'data' 필드 누락 시 ACK되어 재전달 루프가 없어야 한다.
+
+        SWS2-63 버그 수정: 기존 코드는 missing data에서 continue만 하고 XACK를 하지 않아
+        PEL에 메시지가 남아 무한 재전달 루프가 발생했다.
+        """
+        import fakeredis
+
+        handler_called = False
+
+        async def handler(evt: OrderCreatedEvent) -> None:
+            nonlocal handler_called
+            handler_called = True
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="malformed-event-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        bus.subscribe(OrderCreatedEvent, handler)
+
+        stream_key = "test:event:OrderCreatedEvent"
+        subscriber_group = "malformed-event-test:evt:OrderCreatedEvent:0"
+        await fake_redis.xgroup_create(stream_key, subscriber_group, id="0", mkstream=True)
+        await fake_redis.xadd(stream_key, {"garbage": "no_data_field"})
+
+        await bus.start()
+        await asyncio.sleep(0.3)
+        await bus.close()
+
+        assert not handler_called, "Handler must not be called for event missing 'data' field"
+
+        pending = await fake_redis.xpending(stream_key, subscriber_group)
+        assert pending["pending"] == 0, (
+            f"Malformed event message must be ACKed (pending={pending['pending']})"
+        )
+
+    @pytest.mark.asyncio
+    async def test_event_deserialization_failure_is_acked(self, fake_redis_server, serializer):
+        """Event 스트림에서 역직렬화 실패 메시지는 ACK되어 PEL에 남지 않아야 한다.
+
+        SWS2-63 버그 수정: 역직렬화 실패 시 XACK를 수행하여 poison message가
+        무한 재전달되는 문제를 방지한다.
+        """
+        import fakeredis
+
+        handler_called = False
+
+        async def handler(evt: OrderCreatedEvent) -> None:
+            nonlocal handler_called
+            handler_called = True
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="malformed-deser-test",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="consumer",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+        bus.subscribe(OrderCreatedEvent, handler)
+
+        stream_key = "test:event:OrderCreatedEvent"
+        subscriber_group = "malformed-deser-test:evt:OrderCreatedEvent:0"
+        await fake_redis.xgroup_create(stream_key, subscriber_group, id="0", mkstream=True)
+        # 역직렬화 불가능한 쓰레기 바이트를 data 필드에 주입
+        await fake_redis.xadd(stream_key, {"data": b"not-valid-pickle-data-\xff\xfe"})
+
+        await bus.start()
+        await asyncio.sleep(0.3)
+        await bus.close()
+
+        assert not handler_called, "Handler must not be called for undeserializable event"
+
+        pending = await fake_redis.xpending(stream_key, subscriber_group)
+        assert pending["pending"] == 0, (
+            f"Undeserializable event must be ACKed (pending={pending['pending']})"
+        )
+
 
 # ---------------------------------------------------------------------------
 # SWS2-49: Reconnect consumer group recreation + NOGROUP handling
