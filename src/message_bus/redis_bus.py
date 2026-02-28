@@ -30,10 +30,10 @@ try:
     from redis.exceptions import ConnectionError as RedisConnectionError
     from redis.exceptions import TimeoutError as RedisTimeoutError
 except ImportError:
-    redis = None  # type: ignore[assignment]
-    Redis = None  # type: ignore[assignment,misc]
-    RedisConnectionError = None  # type: ignore[assignment,misc]
-    RedisTimeoutError = None  # type: ignore[assignment,misc]
+    redis = None
+    Redis = None
+    RedisConnectionError = None
+    RedisTimeoutError = None
 
 T = TypeVar("T")
 
@@ -243,7 +243,7 @@ class RedisMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher, Handler
                     continue
 
                 # Type: ignore for redis-py sync/async union type
-                for stream, stream_messages in messages:  # type: ignore[union-attr]
+                for stream, stream_messages in messages:
                     self._process_stream_message(stream, stream_messages)
 
             except (RedisConnectionError, RedisTimeoutError):
@@ -430,7 +430,7 @@ class RedisMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher, Handler
                 )
 
                 if messages:
-                    for _, stream_messages in messages:  # type: ignore[union-attr]
+                    for _, stream_messages in messages:
                         for message_id, response_fields in stream_messages:
                             # Ack and delete
                             self._redis.xack(response_key, "response", message_id)
@@ -494,7 +494,7 @@ class RedisMessageBus(QueryDispatcher, QueryRegistry, MessageDispatcher, Handler
         """Dispatch a task to one worker."""
         stream_key = self._stream_key("task", type(task).__name__)
         fields = _serialize_message(task, self._serializer)
-        self._redis.xadd(stream_key, fields)  # type: ignore[arg-type]
+        self._redis.xadd(stream_key, fields)
 
     def close(self) -> None:
         """Close connections and stop workers."""
@@ -675,7 +675,7 @@ class RedisWorker(HandlerRegistry):
         messages = self._redis.xreadgroup(
             groupname=self._consumer_group,
             consumername=self._consumer_name,
-            streams=streams_dict,  # type: ignore[arg-type]
+            streams=streams_dict,
             count=10,
             block=100,
         )
@@ -683,7 +683,7 @@ class RedisWorker(HandlerRegistry):
         if not messages:
             return
 
-        for stream, stream_messages in messages:  # type: ignore[union-attr]
+        for stream, stream_messages in messages:
             stream_name = stream.decode("utf-8") if isinstance(stream, bytes) else stream
 
             for message_id, fields in stream_messages:

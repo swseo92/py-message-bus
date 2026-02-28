@@ -45,8 +45,8 @@ try:
     from redis.exceptions import TimeoutError as RedisTimeoutError
 except ImportError:
     _redis_module = None
-    RedisConnectionError = OSError  # type: ignore[assignment, misc]
-    RedisTimeoutError = TimeoutError  # type: ignore[assignment, misc]
+    RedisConnectionError = OSError
+    RedisTimeoutError = TimeoutError
 
 redis = _redis_module  # module-level name for monkeypatching in tests
 

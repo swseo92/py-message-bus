@@ -75,10 +75,10 @@ try:
     from redis.exceptions import ResponseError as RedisResponseError
     from redis.exceptions import TimeoutError as RedisTimeoutError
 except ImportError:
-    aioredis = None  # type: ignore[assignment]
-    RedisConnectionError = OSError  # type: ignore[assignment, misc]
-    RedisTimeoutError = TimeoutError  # type: ignore[assignment, misc]
-    RedisResponseError = _FallbackRedisResponseError  # type: ignore[assignment, misc]
+    aioredis = None
+    RedisConnectionError = OSError
+    RedisTimeoutError = TimeoutError
+    RedisResponseError = _FallbackRedisResponseError
 
 
 # ---------------------------------------------------------------------------
@@ -739,9 +739,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         try:
             await self._setup_pubsub()
         except Exception as exc:
-            raise RuntimeError(
-                f"Failed to subscribe to Pub/Sub reply pattern: {exc}"
-            ) from exc
+            raise RuntimeError(f"Failed to subscribe to Pub/Sub reply pattern: {exc}") from exc
         self._consumer_tasks.append(asyncio.create_task(self._run_pubsub_reply_listener()))
 
         # Dedicated consumer loop per event subscriber (fan-out)
@@ -973,8 +971,8 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 not t.done() for t in self._consumer_tasks
             )
 
-        pubsub_active = (
-            self._pubsub is not None and bool(getattr(self._pubsub, "subscribed", False))
+        pubsub_active = self._pubsub is not None and bool(
+            getattr(self._pubsub, "subscribed", False)
         )
         return {
             "is_healthy": redis_connected and consumer_loop_active,
@@ -1313,11 +1311,11 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         handler: Callable[[Command], Awaitable[None]],
         semaphore: asyncio.Semaphore | None = None,
     ) -> bool:
-        """단일 Command 메시지를 처리한다.
+        """Process a single Command message.
 
         Returns:
-            True  — 순차 경로(semaphore=None)에서 성공. caller가 배치 XACK 담당.
-            False — 이미 개별 XACK 완료(early-exit·concurrency 경로) 또는 실패(PEL 유지).
+            True  — sequential path (semaphore=None), success; caller is responsible for batch XACK.
+            False — already individually ACKed (early-exit / concurrency path) or failed (in PEL).
         """
         raw: bytes | None = fields.get(b"data") or fields.get("data")
         if raw is None:
@@ -1378,15 +1376,18 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 await self._release_dedup_key(ikey, scope=stream_key)
             if self._metrics_collector is not None:
                 self._metrics_collector.record_failed(stream_key)
-            return False  # Leave in PEL for XAUTOCLAIM retry
+            await self._route_to_dlq_if_exhausted(
+                stream_key, message_id, fields, self._consumer_group
+            )
+            return False  # Leave in PEL for XAUTOCLAIM retry (or already DLQ'd and ACKed)
 
         if self._metrics_collector is not None:
             self._metrics_collector.record_processed(stream_key)
         if semaphore is not None:
-            # Concurrency 경로: asyncio.Task로 독립 실행 — 즉시 개별 XACK
+            # Concurrency path: runs as an independent asyncio.Task — XACK immediately
             await self._redis.xack(stream_key, self._consumer_group, message_id)
             return False
-        return True  # 순차 경로: caller가 ack_ids 수집 후 배치 XACK
+        return True  # Sequential path: caller collects ack_ids for batch XACK
 
     async def _run_single_task_consumer(
         self,
@@ -1481,11 +1482,11 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         handler: Callable[[Task], Awaitable[None]],
         semaphore: asyncio.Semaphore | None = None,
     ) -> bool:
-        """단일 Task 메시지를 처리한다.
+        """Process a single Task message.
 
         Returns:
-            True  — 순차 경로(semaphore=None)에서 성공. caller가 배치 XACK 담당.
-            False — 이미 개별 XACK 완료(early-exit·concurrency 경로) 또는 실패(PEL 유지).
+            True  — sequential path (semaphore=None), success; caller is responsible for batch XACK.
+            False — already individually ACKed (early-exit / concurrency path) or failed (in PEL).
         """
         raw: bytes | None = fields.get(b"data") or fields.get("data")
         if raw is None:
@@ -1544,15 +1545,18 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 await self._release_dedup_key(ikey, scope=stream_key)
             if self._metrics_collector is not None:
                 self._metrics_collector.record_failed(stream_key)
-            return False  # Leave in PEL for XAUTOCLAIM retry
+            await self._route_to_dlq_if_exhausted(
+                stream_key, message_id, fields, self._consumer_group
+            )
+            return False  # Leave in PEL for XAUTOCLAIM retry (or already DLQ'd and ACKed)
 
         if self._metrics_collector is not None:
             self._metrics_collector.record_processed(stream_key)
         if semaphore is not None:
-            # Concurrency 경로: asyncio.Task로 독립 실행 — 즉시 개별 XACK
+            # Concurrency path: runs as an independent asyncio.Task — XACK immediately
             await self._redis.xack(stream_key, self._consumer_group, message_id)
             return False
-        return True  # 순차 경로: caller가 ack_ids 수집 후 배치 XACK
+        return True  # Sequential path: caller collects ack_ids for batch XACK
 
     async def _handle_command_task_batch(self, stream_str: str, batch: list[Any]) -> None:
         for message_id, fields in batch:
@@ -1731,7 +1735,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                     ack_ids.append(message_id)  # poison msg → XACK
                             except Exception:
                                 logger.exception("Error processing event message id=%s", message_id)
-                                # handler 실패 → PEL 유지 (XAUTOCLAIM 재시도)
+                                await self._route_to_dlq_if_exhausted(
+                                    stream_key, message_id, fields, subscriber_group
+                                )
+                                # Stays in PEL for XAUTOCLAIM retry (unless DLQ'd + ACKed above)
                     if ack_ids:
                         try:
                             await self._redis.xack(stream_key, subscriber_group, *ack_ids)
@@ -2157,6 +2164,74 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             msg_id_str,
             self._max_retry,
         )
+
+    async def _route_to_dlq_if_exhausted(
+        self,
+        stream_key: str,
+        message_id: Any,
+        fields: dict[bytes | str, Any],
+        group: str,
+    ) -> bool:
+        """Directly route a message to the DLQ from the consumer loop when max_retry is exceeded.
+
+        Called on handler exception to short-circuit the XAUTOCLAIM wait: without
+        this, a failed message would sit in the PEL for up to
+        ``claim_idle_ms × max_retry`` milliseconds before the XAUTOCLAIM loop
+        detects the retry exhaustion.
+
+        The delivery count is read from the PEL via ``XPENDING_RANGE`` with an
+        exact message-ID filter (O(log N) in Redis).
+
+        Note on Circuit Breaker
+        -----------------------
+        A circuit breaker was evaluated as part of SWS2-67 but rejected because:
+
+        * Redis Streams already provides durable storage — messages are never
+          lost during a hypothetical circuit-open period; they accumulate in PEL.
+        * The existing retry + DLQ pattern already isolates persistent failures.
+        * Circuit breakers are better applied at the *application* layer (inside
+          the handler) where domain context determines the failure threshold.
+        * The added state-machine complexity offers no proportional benefit.
+
+        Returns
+        -------
+        bool
+            ``True``  — message was routed to DLQ (and ACKed via
+            :meth:`_send_to_dead_letter`).
+            ``False`` — delivery count is at or below ``max_retry``, no
+            ``dead_letter_store`` is configured, or the PEL query failed
+            (message left in PEL for XAUTOCLAIM).
+        """
+        if self._dead_letter_store is None:
+            return False
+
+        msg_id_str = message_id.decode() if isinstance(message_id, bytes) else str(message_id)
+        try:
+            pending = await self._redis.xpending_range(
+                name=stream_key,
+                groupname=group,
+                min=msg_id_str,
+                max=msg_id_str,
+                count=1,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to query PEL for direct DLQ routing (stream=%s id=%s); "
+                "leaving in PEL for XAUTOCLAIM",
+                stream_key,
+                msg_id_str,
+            )
+            return False
+
+        if not pending:
+            return False
+
+        delivery_count = int(pending[0]["times_delivered"])
+        if delivery_count <= self._max_retry:
+            return False
+
+        await self._send_to_dead_letter(stream_key, group, message_id, fields, delivery_count)
+        return True
 
     async def _reprocess_event_message(
         self,
