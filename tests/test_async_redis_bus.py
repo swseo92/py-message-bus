@@ -833,9 +833,7 @@ class TestAsyncRedisMessageBusQuery:
                 *[bus.send(GetOrderQuery(order_id=oid)) for oid in order_ids]
             )
             for oid, result in zip(order_ids, results, strict=True):
-                assert result == f"reply:{oid}", (
-                    f"Query {oid!r} got wrong reply: {result!r}"
-                )
+                assert result == f"reply:{oid}", f"Query {oid!r} got wrong reply: {result!r}"
         finally:
             await bus.close()
 
@@ -1490,8 +1488,7 @@ class TestMaxStreamLength:
         )
         # XADD must NOT be used for reply
         assert not xadd_reply_calls, (
-            f"XADD must not be used for reply (Pub/Sub replaces it), "
-            f"but got: {xadd_reply_calls}"
+            f"XADD must not be used for reply (Pub/Sub replaces it), but got: {xadd_reply_calls}"
         )
 
     def test_invalid_max_stream_length_raises(self, serializer, fake_redis):

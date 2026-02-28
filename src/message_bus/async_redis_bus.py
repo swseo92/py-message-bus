@@ -513,8 +513,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 )
             except TimeoutError:
                 raise TimeoutError(
-                    f"Query {type(query).__name__!r} timed out "
-                    f"after {self._query_reply_timeout}s"
+                    f"Query {type(query).__name__!r} timed out after {self._query_reply_timeout}s"
                 ) from None
         finally:
             self._pending_queries.pop(correlation_id, None)
@@ -655,9 +654,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             raise RuntimeError(
                 f"Failed to subscribe to Pub/Sub reply pattern {reply_pattern!r}: {exc}"
             ) from exc
-        self._consumer_tasks.append(
-            asyncio.create_task(self._run_pubsub_reply_listener())
-        )
+        self._consumer_tasks.append(asyncio.create_task(self._run_pubsub_reply_listener()))
 
         # Dedicated consumer loop per event subscriber (fan-out)
         for event_type, subscriber_group, event_handler in self._event_subscriptions:
@@ -1543,6 +1540,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 if isinstance(msg, Query):
                     handler = self._query_handlers.get(type(msg))
                     if handler is not None:
+                        assert reply_channel is not None  # checked at field-validation above
                         _handler_ok = False
                         try:
                             result = await handler(msg)
@@ -1906,12 +1904,18 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         Called at startup and after reconnect to ensure groups exist on the
         current Redis master (e.g. after a failover that promoted a new master).
         """
-        for t in self._command_handlers:
-            await self._ensure_group(self._stream_key("command", t.__name__), self._consumer_group)
-        for t in self._task_handlers:
-            await self._ensure_group(self._stream_key("task", t.__name__), self._consumer_group)
-        for t in self._query_handlers:
-            await self._ensure_group(self._stream_key("query", t.__name__), self._consumer_group)
+        for cmd_t in self._command_handlers:
+            await self._ensure_group(
+                self._stream_key("command", cmd_t.__name__), self._consumer_group
+            )
+        for task_t in self._task_handlers:
+            await self._ensure_group(
+                self._stream_key("task", task_t.__name__), self._consumer_group
+            )
+        for query_t in self._query_handlers:
+            await self._ensure_group(
+                self._stream_key("query", query_t.__name__), self._consumer_group
+            )
         for event_type, subscriber_group, _ in self._event_subscriptions:
             await self._ensure_group(
                 self._stream_key("event", event_type.__name__), subscriber_group
