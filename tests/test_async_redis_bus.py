@@ -4724,3 +4724,248 @@ class TestMissingIdempotencyKeyWarning:
             f"No dedup warning expected when idempotency_key is set, got: {dedup_warnings}"
         )
         assert "ok1" in processed
+
+
+# ---------------------------------------------------------------------------
+# Consumer-loop direct DLQ routing (SWS2-67)
+# ---------------------------------------------------------------------------
+
+
+class TestConsumerLoopDirectDlq:
+    """Consumer loop routes messages to DLQ immediately when max_retry is exhausted.
+
+    Without this feature, a failed message would sit in the PEL for
+    ``claim_idle_ms × max_retry`` ms before the XAUTOCLAIM loop detects
+    exhaustion.  With ``max_retry=0`` the first delivery triggers DLQ routing
+    directly from the consumer loop.
+
+    Circuit Breaker evaluation (SWS2-67):
+        Rejected — Redis Streams guarantees message durability; the existing
+        retry + DLQ pattern already isolates persistent failures; a circuit
+        breaker is better applied at the application (handler) layer.
+    """
+
+    @pytest.mark.asyncio
+    async def test_command_consumer_routes_to_dlq_immediately_when_max_retry_zero(
+        self, fake_redis_server, serializer
+    ):
+        """max_retry=0: first delivery (delivery_count=1 > 0) is DLQ'd by the consumer
+        loop — claim_idle_ms=60s ensures XAUTOCLAIM cannot be responsible."""
+        import fakeredis
+
+        from message_bus.dead_letter import MemoryDeadLetterStore
+
+        dlq = MemoryDeadLetterStore()
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-direct-dlq-cmd",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            max_retry=0,
+            claim_idle_ms=60_000,  # Too long for XAUTOCLAIM to fire in this test
+            dead_letter_store=dlq,
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+
+        async def always_fails(cmd: CreateOrderCommand) -> None:
+            raise RuntimeError("Consumer-loop DLQ test")
+
+        bus.register_command(CreateOrderCommand, always_fails)
+        await bus.start()
+
+        cmd = CreateOrderCommand(order_id="direct-dlq-cmd-1", amount=Decimal("1.00"))
+        await bus.execute(cmd)
+
+        await asyncio.sleep(0.3)
+        await bus.close()
+
+        assert len(dlq.records) == 1, (
+            "Command should be DLQ'd by the consumer loop on first failure "
+            "(claim_idle_ms=60s rules out XAUTOCLAIM)"
+        )
+        assert dlq.records[0].message == cmd
+
+    @pytest.mark.asyncio
+    async def test_task_consumer_routes_to_dlq_immediately_when_max_retry_zero(
+        self, fake_redis_server, serializer
+    ):
+        """max_retry=0: task consumer DLQ's on first failure without XAUTOCLAIM."""
+        import fakeredis
+
+        from message_bus.dead_letter import MemoryDeadLetterStore
+
+        dlq = MemoryDeadLetterStore()
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-direct-dlq-task",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            max_retry=0,
+            claim_idle_ms=60_000,
+            dead_letter_store=dlq,
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+
+        async def always_fails(task: ProcessPaymentTask) -> None:
+            raise RuntimeError("Task consumer-loop DLQ test")
+
+        bus.register_task(ProcessPaymentTask, always_fails)
+        await bus.start()
+
+        task = ProcessPaymentTask(payment_id="direct-dlq-task-1", amount=Decimal("5.00"))
+        await bus.dispatch(task)
+
+        await asyncio.sleep(0.3)
+        await bus.close()
+
+        assert len(dlq.records) == 1, "Task should be DLQ'd by consumer loop on first failure"
+        assert dlq.records[0].message == task
+
+    @pytest.mark.asyncio
+    async def test_event_consumer_routes_to_dlq_immediately_when_max_retry_zero(
+        self, fake_redis_server, serializer
+    ):
+        """max_retry=0: event consumer DLQ's on first failure without XAUTOCLAIM."""
+        import fakeredis
+
+        from message_bus.dead_letter import MemoryDeadLetterStore
+
+        dlq = MemoryDeadLetterStore()
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-direct-dlq-evt",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            max_retry=0,
+            claim_idle_ms=60_000,
+            dead_letter_store=dlq,
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+
+        async def always_fails(event: OrderCreatedEvent) -> None:
+            raise RuntimeError("Event consumer-loop DLQ test")
+
+        bus.subscribe(OrderCreatedEvent, always_fails)
+        await bus.start()
+
+        evt = OrderCreatedEvent(
+            order_id="direct-dlq-evt-1", created_at=datetime(2026, 1, 1, tzinfo=UTC)
+        )
+        await bus.publish(evt)
+
+        await asyncio.sleep(0.3)
+        await bus.close()
+
+        assert len(dlq.records) == 1, "Event should be DLQ'd by consumer loop on first failure"
+        assert dlq.records[0].message == evt
+
+    @pytest.mark.asyncio
+    async def test_consumer_loop_does_not_dlq_when_below_max_retry(
+        self, fake_redis_server, serializer
+    ):
+        """delivery_count(1) <= max_retry(5): consumer loop must NOT route to DLQ.
+
+        Message stays in PEL for XAUTOCLAIM to handle after further retries.
+        """
+        import fakeredis
+
+        from message_bus.dead_letter import MemoryDeadLetterStore
+
+        dlq = MemoryDeadLetterStore()
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-no-direct-dlq",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="test-consumer",
+            max_retry=5,
+            claim_idle_ms=60_000,
+            dead_letter_store=dlq,
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+
+        async def always_fails(cmd: CreateOrderCommand) -> None:
+            raise RuntimeError("Should stay in PEL")
+
+        bus.register_command(CreateOrderCommand, always_fails)
+        await bus.start()
+
+        cmd = CreateOrderCommand(order_id="no-direct-dlq-1", amount=Decimal("1.00"))
+        await bus.execute(cmd)
+
+        await asyncio.sleep(0.3)
+        await bus.close()
+
+        assert len(dlq.records) == 0, (
+            "With max_retry=5 and only 1 delivery attempt "
+            "the consumer loop must NOT route to DLQ"
+        )
+
+    @pytest.mark.asyncio
+    async def test_route_to_dlq_if_exhausted_returns_false_without_dead_letter_store(
+        self, fake_redis_server, serializer
+    ):
+        """_route_to_dlq_if_exhausted short-circuits immediately when no store is set."""
+        import fakeredis
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-no-store",
+            app_name="test",
+            serializer=serializer,
+            dead_letter_store=None,
+            _redis_client=fake_redis,
+        )
+        bus._redis = fake_redis
+
+        result = await bus._route_to_dlq_if_exhausted("some:stream", b"1234-0", {}, "grp")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_route_to_dlq_if_exhausted_returns_false_when_message_not_in_pel(
+        self, fake_redis_server, serializer
+    ):
+        """_route_to_dlq_if_exhausted returns False gracefully when PEL has no entry."""
+        import fakeredis
+
+        from message_bus.dead_letter import MemoryDeadLetterStore
+
+        dlq = MemoryDeadLetterStore()
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="test-pel-empty",
+            app_name="test",
+            serializer=serializer,
+            max_retry=0,
+            dead_letter_store=dlq,
+            _redis_client=fake_redis,
+        )
+        bus._redis = fake_redis
+        # Ensure the stream/group exist so xpending_range doesn't raise NOGROUP
+        await fake_redis.xgroup_create("ghost:stream", "test-pel-empty", id="0", mkstream=True)
+
+        # No message in PEL — xpending_range returns empty list
+        result = await bus._route_to_dlq_if_exhausted(
+            "ghost:stream", b"9999-0", {}, "test-pel-empty"
+        )
+        assert result is False
+        assert len(dlq.records) == 0

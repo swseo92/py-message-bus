@@ -1378,7 +1378,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 await self._release_dedup_key(ikey, scope=stream_key)
             if self._metrics_collector is not None:
                 self._metrics_collector.record_failed(stream_key)
-            return False  # Leave in PEL for XAUTOCLAIM retry
+            await self._route_to_dlq_if_exhausted(
+                stream_key, message_id, fields, self._consumer_group
+            )
+            return False  # Leave in PEL for XAUTOCLAIM retry (or already DLQ'd and ACKed)
 
         if self._metrics_collector is not None:
             self._metrics_collector.record_processed(stream_key)
@@ -1544,7 +1547,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 await self._release_dedup_key(ikey, scope=stream_key)
             if self._metrics_collector is not None:
                 self._metrics_collector.record_failed(stream_key)
-            return False  # Leave in PEL for XAUTOCLAIM retry
+            await self._route_to_dlq_if_exhausted(
+                stream_key, message_id, fields, self._consumer_group
+            )
+            return False  # Leave in PEL for XAUTOCLAIM retry (or already DLQ'd and ACKed)
 
         if self._metrics_collector is not None:
             self._metrics_collector.record_processed(stream_key)
@@ -1731,7 +1737,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                                     ack_ids.append(message_id)  # poison msg → XACK
                             except Exception:
                                 logger.exception("Error processing event message id=%s", message_id)
-                                # handler 실패 → PEL 유지 (XAUTOCLAIM 재시도)
+                                await self._route_to_dlq_if_exhausted(
+                                    stream_key, message_id, fields, subscriber_group
+                                )
+                                # handler 실패 → PEL 유지 (XAUTOCLAIM 재시도) unless already DLQ'd
                     if ack_ids:
                         try:
                             await self._redis.xack(stream_key, subscriber_group, *ack_ids)
@@ -2157,6 +2166,74 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             msg_id_str,
             self._max_retry,
         )
+
+    async def _route_to_dlq_if_exhausted(
+        self,
+        stream_key: str,
+        message_id: Any,
+        fields: dict[bytes | str, Any],
+        group: str,
+    ) -> bool:
+        """Directly route a message to the DLQ from the consumer loop when max_retry is exceeded.
+
+        Called on handler exception to short-circuit the XAUTOCLAIM wait: without
+        this, a failed message would sit in the PEL for up to
+        ``claim_idle_ms × max_retry`` milliseconds before the XAUTOCLAIM loop
+        detects the retry exhaustion.
+
+        The delivery count is read from the PEL via ``XPENDING_RANGE`` with an
+        exact message-ID filter (O(log N) in Redis).
+
+        Note on Circuit Breaker
+        -----------------------
+        A circuit breaker was evaluated as part of SWS2-67 but rejected because:
+
+        * Redis Streams already provides durable storage — messages are never
+          lost during a hypothetical circuit-open period; they accumulate in PEL.
+        * The existing retry + DLQ pattern already isolates persistent failures.
+        * Circuit breakers are better applied at the *application* layer (inside
+          the handler) where domain context determines the failure threshold.
+        * The added state-machine complexity offers no proportional benefit.
+
+        Returns
+        -------
+        bool
+            ``True``  — message was routed to DLQ (and ACKed via
+            :meth:`_send_to_dead_letter`).
+            ``False`` — delivery count is at or below ``max_retry``, no
+            ``dead_letter_store`` is configured, or the PEL query failed
+            (message left in PEL for XAUTOCLAIM).
+        """
+        if self._dead_letter_store is None:
+            return False
+
+        msg_id_str = message_id.decode() if isinstance(message_id, bytes) else str(message_id)
+        try:
+            pending = await self._redis.xpending_range(
+                name=stream_key,
+                groupname=group,
+                min=msg_id_str,
+                max=msg_id_str,
+                count=1,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to query PEL for direct DLQ routing (stream=%s id=%s); "
+                "leaving in PEL for XAUTOCLAIM",
+                stream_key,
+                msg_id_str,
+            )
+            return False
+
+        if not pending:
+            return False
+
+        delivery_count = int(pending[0]["times_delivered"])
+        if delivery_count <= self._max_retry:
+            return False
+
+        await self._send_to_dead_letter(stream_key, group, message_id, fields, delivery_count)
+        return True
 
     async def _reprocess_event_message(
         self,
