@@ -3659,7 +3659,10 @@ class TestIdempotencyDefaults:
 
     @pytest.mark.asyncio
     async def test_lua_script_failure_propagates(self, fake_redis_server, serializer):
-        """redis.eval 실패 시 예외가 상위로 전파됨 (silent failure 없음)."""
+        """Lua 스크립트 실행 실패 시 예외가 상위로 전파됨 (silent failure 없음).
+
+        EVALSHA 전환 후 _lua_ack_and_dedup 핸들을 직접 모킹한다.
+        """
         from unittest.mock import AsyncMock
 
         fake_r = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
@@ -3671,10 +3674,52 @@ class TestIdempotencyDefaults:
         msgs = await fake_r.xreadgroup("test-group", "c", {stream_key: ">"}, count=1)
         mid = msgs[0][1][0][0]
 
-        bus._redis.eval = AsyncMock(side_effect=RuntimeError("Redis eval error"))
+        # EVALSHA 경로: _lua_ack_and_dedup 핸들을 직접 교체
+        bus._lua_ack_and_dedup = AsyncMock(side_effect=RuntimeError("Redis eval error"))
 
         with pytest.raises(RuntimeError, match="Redis eval error"):
             await bus._claim_or_ack_dedup(stream_key, mid, "fail-ikey")
+
+    @pytest.mark.asyncio
+    async def test_start_registers_lua_script(self, fake_redis_server, serializer):
+        """start()에서 register_script()로 Lua 스크립트를 사전 등록한다 (EVALSHA 경로).
+
+        start() 호출 전에는 _lua_ack_and_dedup가 None이어야 하고,
+        start() 호출 후에는 None이 아닌 스크립트 핸들이어야 한다.
+        """
+        fake_r = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = self._make_bus(fake_r, serializer)
+
+        assert bus._lua_ack_and_dedup is None, "start() 호출 전에는 None이어야 함"
+
+        await bus.start()
+        assert bus._lua_ack_and_dedup is not None, "start() 호출 후에는 스크립트 핸들이 있어야 함"
+        await bus.close()
+
+    @pytest.mark.asyncio
+    async def test_lazy_init_registers_lua_script_without_start(
+        self, fake_redis_server, serializer
+    ):
+        """start()를 거치지 않고 _claim_or_ack_dedup를 직접 호출할 때 lazy init이 동작한다.
+
+        단위 테스트처럼 start()를 우회하는 경로에서 _lua_ack_and_dedup가
+        자동 초기화되는지 검증한다.
+        """
+        fake_r = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = self._make_bus(fake_r, serializer)
+
+        assert bus._lua_ack_and_dedup is None
+
+        stream_key = "test:lazy-init:stream"
+        await fake_r.xadd(stream_key, {"d": "x"})
+        await fake_r.xgroup_create(stream_key, "test-group", id="0", mkstream=True)
+        msgs = await fake_r.xreadgroup("test-group", "c", {stream_key: ">"}, count=1)
+        mid = msgs[0][1][0][0]
+
+        # start() 없이 직접 호출 → lazy init
+        await bus._claim_or_ack_dedup(stream_key, mid, "lazy-ikey")
+
+        assert bus._lua_ack_and_dedup is not None, "lazy init 후 스크립트 핸들이 설정되어야 함"
 
     # -----------------------------------------------------------------------
     # Important: Query idempotency (OFF by default — documented behavior)

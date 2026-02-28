@@ -433,6 +433,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         # Shared Pub/Sub reply listener (correlation_id → Future)
         self._pubsub: Any = None
         self._pending_queries: dict[str, asyncio.Future[bytes]] = {}
+        # Cached Lua script handle – registered on start() to avoid sending
+        # the full script body on every EVAL call (EVALSHA after first load).
+        self._lua_ack_and_dedup: Any = None
 
     # ------------------------------------------------------------------
     # Registration (sync) – AsyncHandlerRegistry + AsyncQueryRegistry
@@ -666,6 +669,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             return  # Already started – idempotent
         if self._redis is None:
             self._redis = self._create_redis_client()
+        self._lua_ack_and_dedup = self._redis.register_script(_LUA_ACK_AND_DEDUP)
         self._running = True
 
         # Per-message-type independent consumers (HOL Blocking 해소)
@@ -1133,14 +1137,12 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         """
         dedup_key = self._dedup_key(idempotency_key, scope=scope or stream_key)
         group = consumer_group or self._consumer_group
-        result = await self._redis.eval(
-            _LUA_ACK_AND_DEDUP,
-            3,
-            dedup_key,
-            stream_key,
-            group,
-            message_id,
-            self._idempotency_ttl,
+        if self._lua_ack_and_dedup is None:
+            # Lazy init for code paths that bypass start() (e.g. unit tests).
+            self._lua_ack_and_dedup = self._redis.register_script(_LUA_ACK_AND_DEDUP)
+        result = await self._lua_ack_and_dedup(
+            keys=[dedup_key, stream_key, group],
+            args=[message_id, self._idempotency_ttl],
         )
         return bool(result)
 
