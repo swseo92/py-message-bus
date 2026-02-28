@@ -31,9 +31,21 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+
 # Lua script: atomically dedup-check + XACK on duplicate (10 lines or fewer).
 # Loaded once at import time from the co-located lua/ directory.
-_LUA_ACK_AND_DEDUP: str = (Path(__file__).parent / "lua" / "ack_and_dedup.lua").read_text()
+def _load_lua_script() -> str:
+    lua_path = Path(__file__).parent / "lua" / "ack_and_dedup.lua"
+    try:
+        return lua_path.read_text()
+    except OSError as exc:
+        raise OSError(
+            f"Failed to load Lua script '{lua_path}'. "
+            "Ensure 'lua/ack_and_dedup.lua' is included in the installed package."
+        ) from exc
+
+
+_LUA_ACK_AND_DEDUP: str = _load_lua_script()
 
 
 class MaxRetriesExceededError(Exception):

@@ -18,7 +18,6 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from decimal import Decimal
 
 from message_bus import AsyncRedisMessageBus
 from message_bus.ports import Command, Task
@@ -43,7 +42,10 @@ class BenchTask(Task):
 # Helpers
 # ---------------------------------------------------------------------------
 
-async def _drain(bus: AsyncRedisMessageBus, target: list[int], n: int, timeout: float = 10.0) -> None:
+
+async def _drain(
+    bus: AsyncRedisMessageBus, target: list[int], n: int, timeout: float = 10.0
+) -> None:
     deadline = time.monotonic() + timeout
     while len(target) < n:
         if time.monotonic() > deadline:
@@ -83,8 +85,9 @@ async def _bench_consumer_throughput(idempotency_on: bool) -> float:
         await _drain(bus, received, N_MESSAGES)
         elapsed = time.monotonic() - t0
 
-    tps = len(received) / elapsed
-    print(f"  Command idempotency {label}: {tps:,.0f} msg/s  ({len(received)} msgs in {elapsed:.3f}s)")
+    tps = len(received) / elapsed if elapsed > 0 else 0.0
+    n_recv = len(received)
+    print(f"  Command idempotency {label}: {tps:,.0f} msg/s  ({n_recv} msgs in {elapsed:.3f}s)")
     return tps
 
 
@@ -111,7 +114,7 @@ async def _bench_publish_pipeline(with_pipeline: bool) -> float:
     finally:
         await bus.close()
 
-    tps = N_MESSAGES / elapsed
+    tps = N_MESSAGES / elapsed if elapsed > 0 else 0.0
     print(f"  Publish {label:12s}: {tps:,.0f} XADD/s  ({N_MESSAGES} msgs in {elapsed:.3f}s)")
     return tps
 
@@ -129,8 +132,9 @@ async def _bench_lua_vs_separate(use_lua: bool) -> float:
         await r.xadd(stream_key, {"data": "x"})
     try:
         await r.xgroup_create(stream_key, group, id="0", mkstream=False)
-    except Exception:
-        pass
+    except Exception as exc:
+        if "BUSYGROUP" not in str(exc):
+            raise
 
     msgs = await r.xreadgroup(group, "bench-consumer", {stream_key: ">"}, count=N_MESSAGES + WARMUP)
     all_ids = [mid for _, batch in msgs for mid, _ in batch]
@@ -160,27 +164,27 @@ async def _bench_lua_vs_separate(use_lua: bool) -> float:
     elapsed = time.monotonic() - t0
 
     await r.aclose()
-    tps = N_MESSAGES / elapsed
+    tps = N_MESSAGES / elapsed if elapsed > 0 else 0.0
     label = "Lua (1 RTT)" if use_lua else "separate  "
     print(f"  Dedup {label}: {tps:,.0f} ops/s  ({N_MESSAGES} ops in {elapsed:.3f}s)")
     return tps
 
 
 async def main() -> None:
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"SWS2-57 Benchmark  (N={N_MESSAGES}, warmup={WARMUP})")
     print(f"Redis: {REDIS_URL}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     print("[1] Consumer throughput: idempotency OFF vs ON")
     tps_off = await _bench_consumer_throughput(idempotency_on=False)
-    tps_on  = await _bench_consumer_throughput(idempotency_on=True)
+    tps_on = await _bench_consumer_throughput(idempotency_on=True)
     if tps_off > 0:
         delta = (tps_off - tps_on) / tps_off * 100
         print(f"  → Overhead of idempotency ON: {delta:+.1f}%\n")
 
     print("[2] Publish path: XADD+SET NX pipeline vs plain XADD")
-    tps_plain    = await _bench_publish_pipeline(with_pipeline=False)
+    tps_plain = await _bench_publish_pipeline(with_pipeline=False)
     tps_pipeline = await _bench_publish_pipeline(with_pipeline=True)
     if tps_plain > 0:
         delta = (tps_pipeline - tps_plain) / tps_plain * 100
@@ -188,7 +192,7 @@ async def main() -> None:
 
     print("[3] Consume dedup: Lua (1 RTT) vs separate SET NX + XACK (2 RTT)")
     tps_separate = await _bench_lua_vs_separate(use_lua=False)
-    tps_lua      = await _bench_lua_vs_separate(use_lua=True)
+    tps_lua = await _bench_lua_vs_separate(use_lua=True)
     if tps_separate > 0:
         delta = (tps_lua - tps_separate) / tps_separate * 100
         print(f"  → Lua speedup over separate calls: {delta:+.1f}%\n")

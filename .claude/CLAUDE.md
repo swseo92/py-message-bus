@@ -35,6 +35,8 @@ pip install -e ".[zmq]"
 
 # 벤치마크 (AsyncRedisMessageBus 메타데이터 모드 오버헤드 검증)
 python benchmarks/bench_metadata_mode.py
+# 벤치마크 (AsyncRedisMessageBus 멱등성 오버헤드 검증)
+python benchmarks/benchmark_idempotency.py
 ```
 
 ## 아키텍처
@@ -53,7 +55,9 @@ src/message_bus/
 ├── dead_letter.py   # 미들웨어: DeadLetterMiddleware (실패 메시지 캡처)
 ├── testing.py       # 테스팅: FakeMessageBus, AsyncFakeMessageBus
 ├── zmq_bus.py       # 구현체: ZmqMessageBus, ZmqWorker (optional, pyzmq 필요)
-└── async_redis_bus.py  # 구현체: AsyncRedisMessageBus (optional, redis>=5.0.0 필요)
+├── async_redis_bus.py  # 구현체: AsyncRedisMessageBus (optional, redis>=5.0.0 필요)
+└── lua/
+    └── ack_and_dedup.lua  # Lua 스크립트: XACK + SET NX 원자 연산 (멱등성 dedup)
 ```
 
 ### Interface Segregation (ports.py)
@@ -102,7 +106,7 @@ class OrderService:
 | `DeadLetterMiddleware` | 실패 추적 | 실패한 메시지 캡처, DeadLetterStore에 저장 |
 | `FakeMessageBus` | 테스팅 유틸리티 | 핸들러 없이 메시지 녹화, assertion 헬퍼 |
 | `ZmqMessageBus` + `ZmqWorker` | 멀티프로세스 | PUSH/PULL, REQ/REP, PUB/SUB 패턴, pickle 직렬화 |
-| `AsyncRedisMessageBus` | 분산 async (Redis) | Redis Streams, Command/Task 경쟁 소비, Event fan-out, Query reply는 **Pub/Sub 2-RTT** (XADD→XREADGROUP→PUBLISH→push; shared PSUBSCRIBE + asyncio.Future), 자동 재연결; `query_reply_timeout` 파라미터로 대기시간 설정 (기본 30.0초); 헬스체크 API 제공 (`health_check()` → `{is_healthy, redis_connected, consumer_loop_active, redis_error}`, `is_healthy()` → bool); **`metadata_mode`** 파라미터 — `"standard"` (기본): `source_id`(캐싱된 hostname), `message_type`, `timestamp`(UNIX float) enrichment 포함 / `"none"` (opt-in): enrichment 비활성화, dedup 필드(`message_id`, `idempotency_key`)만 유지 |
+| `AsyncRedisMessageBus` | 분산 async (Redis) | Redis Streams, Command/Task 경쟁 소비, Event fan-out, Query reply는 **Pub/Sub 2-RTT** (XADD→XREADGROUP→PUBLISH→push; shared PSUBSCRIBE + asyncio.Future), 자동 재연결; `query_reply_timeout` 파라미터로 대기시간 설정 (기본 30.0초); 헬스체크 API 제공 (`health_check()` → `{is_healthy, redis_connected, consumer_loop_active, redis_error}`, `is_healthy()` → bool); **`metadata_mode`** 파라미터 — `"standard"` (기본): `source_id`(캐싱된 hostname), `message_type`, `timestamp`(UNIX float) enrichment 포함 / `"none"` (opt-in): enrichment 비활성화, dedup 필드(`message_id`, `idempotency_key`)만 유지; **멱등성 파라미터** — `command_idempotency=True` (기본 ON), `task_idempotency=True` (기본 ON), `event_idempotency=False` (기본 OFF), `query_idempotency=False` (기본 OFF); `ack_and_dedup.lua` Lua 스크립트로 XACK + SET NX 원자 연산 (1 RTT 절감) |
 
 ### 에러 규칙
 
