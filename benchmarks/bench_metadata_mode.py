@@ -52,6 +52,8 @@ class OrderCommand(Command):
 ITERATIONS = 5_000
 WARMUP = 500
 ROUNDS = 5
+TARGET_MSGS = 12_000
+TARGET_OVERHEAD = 5.0
 
 
 async def _measure(bus: AsyncRedisMessageBus, iterations: int) -> float:
@@ -134,12 +136,12 @@ async def run_benchmark() -> None:
     print(f"Iterations: {ITERATIONS:,}  |  Warmup: {WARMUP:,}  |  Rounds: {ROUNDS}")
     print("=" * 65)
 
-    bus_standard = _make_bus("standard")
-    bus_none = _make_bus("none")
-    # Legacy bus uses same instance — we call _measure_legacy directly
-    bus_legacy = _make_bus("standard")
-
+    bus_standard = bus_none = bus_legacy = None
     try:
+        bus_standard = _make_bus("standard")
+        bus_none = _make_bus("none")
+        # Legacy bus uses same instance — we call _measure_legacy directly
+        bus_legacy = _make_bus("standard")
         legacy_results: list[float] = []
         standard_results: list[float] = []
         none_results: list[float] = []
@@ -174,9 +176,6 @@ async def run_benchmark() -> None:
         print(f"{'none':<12} {avg_none:>14,.0f}  {'0.00%':>10}  {'n/a':>10}")
         print(f"{'─' * 65}")
 
-        TARGET_MSGS = 12_000
-        TARGET_OVERHEAD = 5.0
-
         passed = True
         if avg_standard >= TARGET_MSGS:
             print(f"✓ Throughput : {avg_standard:,.0f} >= {TARGET_MSGS:,} msg/s")
@@ -202,9 +201,12 @@ async def run_benchmark() -> None:
         sys.exit(0 if passed else 1)
 
     finally:
-        await bus_standard.close()
-        await bus_none.close()
-        await bus_legacy.close()
+        if bus_standard is not None:
+            await bus_standard.close()
+        if bus_none is not None:
+            await bus_none.close()
+        if bus_legacy is not None:
+            await bus_legacy.close()
 
 
 if __name__ == "__main__":

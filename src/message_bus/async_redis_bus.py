@@ -317,6 +317,11 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             raise ValueError(
                 f"max_stream_length must be a positive integer, got {max_stream_length}"
             )
+        _valid_metadata_modes = ("standard", "none")
+        if metadata_mode not in _valid_metadata_modes:
+            raise ValueError(
+                f"metadata_mode must be one of {_valid_metadata_modes!r}, got {metadata_mode!r}"
+            )
         # Validate connection mode mutual exclusivity
         _connection_modes = sum(
             [

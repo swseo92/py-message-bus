@@ -11,6 +11,7 @@ Covers:
 import asyncio
 from dataclasses import dataclass
 from decimal import Decimal
+from typing import Any
 
 import pytest
 
@@ -22,6 +23,24 @@ import fakeredis.aioredis  # noqa: E402, F401
 
 from message_bus import AsyncJsonSerializer, AsyncRedisMessageBus, TypeRegistry
 from message_bus.ports import Command, Event
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def get_stream_field(fields: dict[Any, Any], key: str) -> str | None:
+    """Extract a string field from Redis stream data, handling both bytes and str keys."""
+    raw = fields.get(key.encode()) or fields.get(key)
+    if raw is None:
+        return None
+    return raw.decode() if isinstance(raw, bytes) else raw
+
+
+def has_stream_field(fields: dict[Any, Any], key: str) -> bool:
+    """Check if a field exists in Redis stream data, handling both bytes and str keys."""
+    return bool(fields.get(key.encode()) or fields.get(key))
+
 
 # ---------------------------------------------------------------------------
 # Test message types
@@ -100,9 +119,7 @@ class TestMessageSchemaEnrichment:
         messages = await fake_redis.xrange(stream_key)
         assert len(messages) == 1
         _, fields = messages[0]
-        raw = fields.get(b"message_id") or fields.get("message_id")
-        assert raw is not None, "message_id must be present"
-        assert len(raw) > 0
+        assert get_stream_field(fields, "message_id") is not None
 
     @pytest.mark.asyncio
     async def test_xadd_source_id_is_hostname(self, bus, fake_redis):
@@ -114,10 +131,7 @@ class TestMessageSchemaEnrichment:
 
         messages = await fake_redis.xrange(stream_key)
         _, fields = messages[0]
-        raw = fields.get(b"source_id") or fields.get("source_id")
-        assert raw is not None, "source_id must be present"
-        source_id = raw.decode() if isinstance(raw, bytes) else raw
-        assert source_id == _socket.gethostname()
+        assert get_stream_field(fields, "source_id") == _socket.gethostname()
 
     @pytest.mark.asyncio
     async def test_xadd_includes_idempotency_key(self, bus, fake_redis):
@@ -127,8 +141,7 @@ class TestMessageSchemaEnrichment:
 
         messages = await fake_redis.xrange(stream_key)
         _, fields = messages[0]
-        raw = fields.get(b"idempotency_key") or fields.get("idempotency_key")
-        assert raw is not None, "idempotency_key must be present"
+        assert get_stream_field(fields, "idempotency_key") is not None
 
     @pytest.mark.asyncio
     async def test_xadd_timestamp_is_unix_float(self, bus, fake_redis):
@@ -142,9 +155,8 @@ class TestMessageSchemaEnrichment:
 
         messages = await fake_redis.xrange(stream_key)
         _, fields = messages[0]
-        raw = fields.get(b"timestamp") or fields.get("timestamp")
-        assert raw is not None, "timestamp must be present"
-        ts_str = raw.decode() if isinstance(raw, bytes) else raw
+        ts_str = get_stream_field(fields, "timestamp")
+        assert ts_str is not None
         ts = float(ts_str)
         assert before <= ts <= after
 
@@ -156,10 +168,7 @@ class TestMessageSchemaEnrichment:
 
         messages = await fake_redis.xrange(stream_key)
         _, fields = messages[0]
-        raw = fields.get(b"message_type") or fields.get("message_type")
-        assert raw is not None, "message_type must be present"
-        msg_type = raw.decode() if isinstance(raw, bytes) else raw
-        assert msg_type == "PlaceOrderCommand"
+        assert get_stream_field(fields, "message_type") == "PlaceOrderCommand"
 
     @pytest.mark.asyncio
     async def test_idempotency_key_equals_message_id_by_default(self, bus, fake_redis):
@@ -169,10 +178,8 @@ class TestMessageSchemaEnrichment:
 
         messages = await fake_redis.xrange(stream_key)
         _, fields = messages[0]
-        mid_raw = fields.get(b"message_id") or fields.get("message_id")
-        ikey_raw = fields.get(b"idempotency_key") or fields.get("idempotency_key")
-        mid = mid_raw.decode() if isinstance(mid_raw, bytes) else mid_raw
-        ikey = ikey_raw.decode() if isinstance(ikey_raw, bytes) else ikey_raw
+        mid = get_stream_field(fields, "message_id")
+        ikey = get_stream_field(fields, "idempotency_key")
         assert mid == ikey, "Default idempotency_key must equal message_id"
 
     @pytest.mark.asyncio
@@ -186,8 +193,8 @@ class TestMessageSchemaEnrichment:
         assert len(messages) == 2
         _, f1 = messages[0]
         _, f2 = messages[1]
-        mid1 = f1.get(b"message_id") or f1.get("message_id")
-        mid2 = f2.get(b"message_id") or f2.get("message_id")
+        mid1 = get_stream_field(f1, "message_id")
+        mid2 = get_stream_field(f2, "message_id")
         assert mid1 != mid2, "Each _xadd must produce a unique message_id"
 
 
@@ -441,18 +448,14 @@ class TestMetadataMode:
         messages = await fake_redis.xrange(stream_key)
         _, fields = messages[0]
 
-        def get_field(key: str) -> str | None:
-            raw = fields.get(key.encode()) or fields.get(key)
-            return (raw.decode() if isinstance(raw, bytes) else raw) if raw else None
-
-        assert get_field("data") is not None
-        assert get_field("message_id") is not None
-        assert get_field("idempotency_key") is not None
-        assert get_field("source_id") is not None
-        assert get_field("message_type") == "PlaceOrderCommand"
-        assert get_field("timestamp") is not None
-        # timestamp must be parseable as a float
-        float(get_field("timestamp"))  # type: ignore[arg-type]
+        assert get_stream_field(fields, "data") is not None
+        assert get_stream_field(fields, "message_id") is not None
+        assert get_stream_field(fields, "idempotency_key") is not None
+        assert get_stream_field(fields, "source_id") is not None
+        assert get_stream_field(fields, "message_type") == "PlaceOrderCommand"
+        ts_str = get_stream_field(fields, "timestamp")
+        assert ts_str is not None
+        float(ts_str)  # timestamp must be parseable as a float
 
     @pytest.mark.asyncio
     async def test_none_mode_omits_enrichment_fields(self, bus_none_mode, fake_redis):
@@ -464,15 +467,12 @@ class TestMetadataMode:
         messages = await fake_redis.xrange(stream_key)
         _, fields = messages[0]
 
-        def has_field(key: str) -> bool:
-            return bool(fields.get(key.encode()) or fields.get(key))
-
-        assert has_field("data"), "data must always be present"
-        assert has_field("message_id"), "none mode must still write message_id for dedup"
-        assert has_field("idempotency_key"), "none mode must still write idempotency_key for dedup"
-        assert not has_field("source_id"), "none mode must not write source_id"
-        assert not has_field("message_type"), "none mode must not write message_type"
-        assert not has_field("timestamp"), "none mode must not write timestamp"
+        assert has_stream_field(fields, "data"), "data must always be present"
+        assert has_stream_field(fields, "message_id"), "none mode must write message_id for dedup"
+        assert has_stream_field(fields, "idempotency_key"), "none mode must write idempotency_key"
+        assert not has_stream_field(fields, "source_id"), "none mode must not write source_id"
+        assert not has_stream_field(fields, "message_type"), "none mode must not write message_type"
+        assert not has_stream_field(fields, "timestamp"), "none mode must not write timestamp"
 
     @pytest.mark.asyncio
     async def test_none_mode_messages_are_consumed(self, bus_none_mode, fake_redis):
@@ -504,8 +504,84 @@ class TestMetadataMode:
         messages = await fake_redis.xrange(stream_key)
         _, f1 = messages[0]
         _, f2 = messages[1]
-        sid1 = f1.get(b"source_id") or f1.get("source_id")
-        sid2 = f2.get(b"source_id") or f2.get("source_id")
-        s1 = sid1.decode() if isinstance(sid1, bytes) else sid1
-        s2 = sid2.decode() if isinstance(sid2, bytes) else sid2
+        s1 = get_stream_field(f1, "source_id")
+        s2 = get_stream_field(f2, "source_id")
         assert s1 == s2, "source_id must be identical across calls (cached)"
+
+    @pytest.mark.asyncio
+    async def test_invalid_metadata_mode_raises(self, fake_redis, serializer):
+        """Passing an unknown metadata_mode must raise ValueError immediately."""
+        with pytest.raises(ValueError, match="metadata_mode"):
+            AsyncRedisMessageBus(
+                redis_url="redis://localhost",
+                consumer_group="test-group",
+                app_name="test",
+                serializer=serializer,
+                metadata_mode="verbose",  # type: ignore[arg-type]
+                _redis_client=fake_redis,
+            )
+
+    @pytest.mark.asyncio
+    async def test_standard_mode_messages_are_consumed(self, bus, fake_redis):
+        """standard mode messages must be processed end-to-end by consumers."""
+        results: list[str] = []
+
+        async def handler(cmd: PlaceOrderCommand) -> None:
+            results.append(cmd.order_id)
+
+        bus.register_command(PlaceOrderCommand, handler)
+        await bus.start()
+
+        cmd = PlaceOrderCommand(order_id="std-consume-1", amount=Decimal("5.00"))
+        await bus.execute(cmd)
+
+        await asyncio.sleep(0.15)
+        await bus.close()
+
+        assert "std-consume-1" in results
+
+    @pytest.mark.asyncio
+    async def test_legacy_stream_entry_with_old_fields_still_processed(self, bus, fake_redis):
+        """Backward compat: entries with old producer_id/enqueue_timestamp are processed."""
+        results: list[str] = []
+
+        async def handler(cmd: PlaceOrderCommand) -> None:
+            results.append(cmd.order_id)
+
+        bus.register_command(PlaceOrderCommand, handler)
+        await bus.start()
+
+        stream_key = bus._stream_key("command", "PlaceOrderCommand")
+        cmd = PlaceOrderCommand(order_id="legacy-old-fields", amount=Decimal("99.00"))
+        data = bus._serializer.dumps(cmd)
+
+        # Inject a message using the old pre-SWS2-58 field schema
+        await fake_redis.xadd(
+            stream_key,
+            {
+                "data": data,
+                "message_id": "legacy-msg-id",
+                "producer_id": "legacy-producer",  # old field name
+                "idempotency_key": "legacy-ikey",
+                "enqueue_timestamp": "2025-01-01T00:00:00+00:00",  # old ISO format
+            },
+        )
+
+        await asyncio.sleep(0.15)
+        await bus.close()
+
+        assert "legacy-old-fields" in results, "Legacy messages must still be processed"
+
+    @pytest.mark.asyncio
+    async def test_event_standard_mode_has_enrichment_fields(self, bus, fake_redis):
+        """Events must also include enrichment fields in standard mode."""
+        evt = StockUpdatedEvent(product_id="prod-std", quantity=10)
+        stream_key = bus._stream_key("event", "StockUpdatedEvent")
+        await bus._xadd(stream_key, evt)
+
+        messages = await fake_redis.xrange(stream_key)
+        _, fields = messages[0]
+
+        assert get_stream_field(fields, "source_id") is not None
+        assert get_stream_field(fields, "message_type") == "StockUpdatedEvent"
+        assert get_stream_field(fields, "timestamp") is not None
