@@ -199,8 +199,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
     * **Task** – identical to Command.
     * **Query** – ``XADD`` to a query stream + ``XREADGROUP`` (competitive
       consumption).  Each call generates a unique ``correlation_id``; the
-      consumer writes the reply to a per-request reply stream; the caller
-      polls until the reply arrives or *query_reply_timeout* elapses.
+      caller subscribes to a Pub/Sub reply channel before sending, and the
+      consumer ``PUBLISH``-es the reply directly to that channel.  This
+      reduces round-trips from 4 (XADD→XREADGROUP→XADD→XREAD) to 2
+      (XADD→XREADGROUP→PUBLISH→push), eliminating reply-stream polling.
 
     Parameters
     ----------
@@ -221,10 +223,10 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         Identity of this consumer within its group.
         Auto-generated from ``hostname-<random>`` if omitted.
     _block_ms:
-        Milliseconds passed to ``XREADGROUP``'s ``block`` parameter.
-        **Testing only** – set to ``0`` when using fakeredis, which does
-        not implement async blocking correctly. Defaults to ``100`` ms
-        for production use with a real Redis server.
+        Milliseconds passed to ``XREADGROUP``'s ``block`` parameter
+        (consumer side).  **Testing only** – set to ``0`` when using
+        fakeredis, which does not implement async blocking correctly.
+        Defaults to ``10`` ms for production use with a real Redis server.
     _redis_client:
         **Testing only.** Inject a pre-built async Redis client
         (e.g. ``fakeredis.aioredis.FakeRedis()``). When provided, the
@@ -281,6 +283,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         # Metadata mode
         "_metadata_mode",
         "_source_id",
+        # Shared Pub/Sub reply listener
+        "_pubsub",
+        "_pending_queries",
     )
 
     def __init__(
@@ -305,7 +310,7 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         sentinel_kwargs: dict[str, Any] | None = None,
         cluster_mode: bool = False,
         metadata_mode: Literal["standard", "none"] = "standard",
-        _block_ms: int = 100,
+        _block_ms: int = 10,
         _redis_client: Any | None = None,
     ) -> None:
         if aioredis is None:
@@ -396,6 +401,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         self._consumer_tasks: list[asyncio.Task[None]] = []
         # (message_type → max_concurrent) – None means unlimited (sequential)
         self._concurrency_config: dict[type, int | None] = {}
+        # Shared Pub/Sub reply listener (correlation_id → Future)
+        self._pubsub: Any = None
+        self._pending_queries: dict[str, asyncio.Future[bytes]] = {}
 
     # ------------------------------------------------------------------
     # Registration (sync) – AsyncHandlerRegistry + AsyncQueryRegistry
@@ -458,10 +466,17 @@ class AsyncRedisMessageBus(AsyncMessageBus):
     # ------------------------------------------------------------------
 
     async def send(self, query: Query[T]) -> T:
-        """Send *query* and await its reply via a correlation_id–based reply stream.
+        """Send *query* and await its reply via the shared Pub/Sub reply listener.
 
-        A unique reply stream is created per call and cleaned up after the reply
-        is received (or on timeout).
+        A unique ``correlation_id`` is generated per call and registered as an
+        ``asyncio.Future`` in ``_pending_queries``.  The shared
+        ``_run_pubsub_reply_listener`` background task receives the
+        ``PUBLISH``-ed reply and resolves the matching future, eliminating
+        per-call subscribe/unsubscribe connection overhead.
+
+        This reduces round-trips from 4 (XADD→XREADGROUP→XADD→XREAD) to 2
+        (XADD→XREADGROUP→PUBLISH→push) and reuses a single Pub/Sub connection
+        for all concurrent queries.
 
         Raises
         ------
@@ -472,80 +487,56 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             in the error message).
         """
         correlation_id = uuid.uuid4().hex
-        reply_stream = self._stream_key("reply", correlation_id)
+        reply_channel = self._reply_channel_key(correlation_id)
         stream_key = self._stream_key("query", type(query).__name__)
 
-        data = self._serializer.dumps(query)
-        await self._redis.xadd(
-            stream_key,
-            {
-                "data": data,
-                "correlation_id": correlation_id.encode(),
-                "reply_stream": reply_stream.encode(),
-            },
-            maxlen=self._max_stream_length,
-            approximate=True,
-        )
-
         loop = asyncio.get_running_loop()
-        last_id = "0-0"
-        deadline = loop.time() + self._query_reply_timeout
+        future: asyncio.Future[bytes] = loop.create_future()
+        self._pending_queries[correlation_id] = future
         try:
-            while True:
-                remaining = deadline - loop.time()
-                if remaining <= 0:
-                    raise TimeoutError(
-                        f"Query {type(query).__name__!r} timed out "
-                        f"after {self._query_reply_timeout}s"
-                    )
+            data = self._serializer.dumps(query)
+            await self._redis.xadd(
+                stream_key,
+                {
+                    "data": data,
+                    "correlation_id": correlation_id.encode(),
+                    "reply_channel": reply_channel.encode(),
+                },
+                maxlen=self._max_stream_length,
+                approximate=True,
+            )
 
-                if self._block_ms > 0:
-                    block_ms = max(1, int(remaining * 1000))
-                    result_msgs = await self._redis.xread(
-                        {reply_stream: last_id}, count=1, block=block_ms
-                    )
-                else:
-                    result_msgs = await self._redis.xread({reply_stream: last_id}, count=1)
-
-                if result_msgs:
-                    for _, msgs in result_msgs:
-                        for msg_id, fields in msgs:
-                            last_id = msg_id
-                            error_type_raw = fields.get(b"error_type") or fields.get("error_type")
-                            if error_type_raw:
-                                error_msg_raw = (
-                                    fields.get(b"error_message")
-                                    or fields.get("error_message")
-                                    or b""
-                                )
-                                et = (
-                                    error_type_raw.decode()
-                                    if isinstance(error_type_raw, bytes)
-                                    else error_type_raw
-                                )
-                                em = (
-                                    error_msg_raw.decode()
-                                    if isinstance(error_msg_raw, bytes)
-                                    else error_msg_raw
-                                )
-                                raise RuntimeError(f"{et}: {em}")
-                            raw = fields.get(b"data") or fields.get("data")
-                            if raw is not None:
-                                return self._serializer.loads(  # type: ignore[no-any-return]
-                                    raw if isinstance(raw, bytes) else raw.encode()
-                                )
-                            raise RuntimeError(
-                                f"Malformed reply envelope on stream {reply_stream!r}: "
-                                f"missing 'data' and 'error_type' "
-                                f"(id={msg_id!r}, keys={list(fields.keys())!r})"
-                            )
-                elif self._block_ms == 0:
-                    await asyncio.sleep(0)  # yield to event loop in non-blocking mode
-        finally:
             try:
-                await self._redis.delete(reply_stream)
-            except (RedisConnectionError, RedisTimeoutError, RedisResponseError, OSError) as e:
-                logger.warning("Failed to delete reply stream %s: %s", reply_stream, e)
+                raw_payload = await asyncio.wait_for(
+                    asyncio.shield(future),
+                    timeout=self._query_reply_timeout,
+                )
+            except TimeoutError:
+                raise TimeoutError(
+                    f"Query {type(query).__name__!r} timed out "
+                    f"after {self._query_reply_timeout}s"
+                ) from None
+        finally:
+            self._pending_queries.pop(correlation_id, None)
+
+        try:
+            payload = json.loads(raw_payload)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Malformed reply on channel {reply_channel!r}: invalid JSON"
+            ) from exc
+        error_type = payload.get("error_type")
+        if error_type:
+            error_message = payload.get("error_message", "")
+            raise RuntimeError(f"{error_type}: {error_message}")
+        raw_data = payload.get("data")
+        if raw_data is None:
+            raise RuntimeError(
+                f"Malformed reply on channel {reply_channel!r}: missing 'data' field"
+            )
+        return self._serializer.loads(  # type: ignore[no-any-return]
+            raw_data if isinstance(raw_data, bytes) else raw_data.encode()
+        )
 
     async def execute(self, command: Command) -> None:
         """Publish *command* to its Redis stream (competitive consumption)."""
@@ -648,6 +639,26 @@ class AsyncRedisMessageBus(AsyncMessageBus):
         if self._query_handlers:
             self._consumer_tasks.append(asyncio.create_task(self._run_query_consumer()))
 
+        # Shared Pub/Sub reply listener – always started so that send() works
+        # even on buses that have no local query handlers (producer-only).
+        self._pubsub = self._redis.pubsub()
+        reply_pattern = (
+            f"{{{self._app_name}}}:reply_ch:*"
+            if self._cluster_mode
+            else f"{self._app_name}:reply_ch:*"
+        )
+        try:
+            await self._pubsub.psubscribe(reply_pattern)
+        except Exception as exc:
+            await self._pubsub.aclose()
+            self._pubsub = None
+            raise RuntimeError(
+                f"Failed to subscribe to Pub/Sub reply pattern {reply_pattern!r}: {exc}"
+            ) from exc
+        self._consumer_tasks.append(
+            asyncio.create_task(self._run_pubsub_reply_listener())
+        )
+
         # Dedicated consumer loop per event subscriber (fan-out)
         for event_type, subscriber_group, event_handler in self._event_subscriptions:
             stream_key = self._stream_key("event", event_type.__name__)
@@ -698,6 +709,13 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
         self._consumer_tasks.clear()
+        if self._pubsub is not None:
+            try:
+                await self._pubsub.punsubscribe()
+                await self._pubsub.aclose()
+            except Exception as e:
+                logger.warning("Error closing Pub/Sub connection: %s", e)
+            self._pubsub = None
         if self._redis is not None:
             try:
                 await self._redis.aclose()
@@ -870,6 +888,12 @@ class AsyncRedisMessageBus(AsyncMessageBus):
             # given consumer group to be in the same hash slot.
             return f"{{{self._app_name}}}:{prefix}:{name}"
         return f"{self._app_name}:{prefix}:{name}"
+
+    def _reply_channel_key(self, correlation_id: str) -> str:
+        """Return the Pub/Sub channel name for a query reply."""
+        if self._cluster_mode:
+            return f"{{{self._app_name}}}:reply_ch:{correlation_id}"
+        return f"{self._app_name}:reply_ch:{correlation_id}"
 
     async def _xadd(
         self, stream_key: str, message: Any, idempotency_key: str | None = None
@@ -1479,37 +1503,33 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                     logger.exception("Unexpected error in query consumer")
                 await asyncio.sleep(0.1)
 
-    # TTL for orphaned reply streams (seconds); guards against late consumer writes
-    # after the caller has already timed out and deleted its local copy.
-    _REPLY_STREAM_TTL_SECONDS = 60
-
     async def _handle_query_batch(self, stream_str: str, batch: list[Any]) -> None:
-        """Process a batch of query messages, writing replies to their reply streams."""
+        """Process a batch of query messages, publishing replies to their Pub/Sub channels."""
         for message_id, fields in batch:
-            reply_stream: str | None = None
+            reply_channel: str | None = None
             try:
                 raw = fields.get(b"data") or fields.get("data")
-                reply_stream_raw = fields.get(b"reply_stream") or fields.get("reply_stream")
+                reply_channel_raw = fields.get(b"reply_channel") or fields.get("reply_channel")
 
-                # Decode reply_stream early so we can send error replies even on bad data
-                if reply_stream_raw is not None:
-                    reply_stream = (
-                        reply_stream_raw.decode()
-                        if isinstance(reply_stream_raw, bytes)
-                        else reply_stream_raw
+                # Decode reply_channel early so we can send error replies even on bad data
+                if reply_channel_raw is not None:
+                    reply_channel = (
+                        reply_channel_raw.decode()
+                        if isinstance(reply_channel_raw, bytes)
+                        else reply_channel_raw
                     )
 
-                if raw is None or reply_stream_raw is None:
+                if raw is None or reply_channel_raw is None:
                     logger.warning(
                         "Query message missing required fields "
-                        "(data=%s, reply_stream=%s); skipping id=%s",
+                        "(data=%s, reply_channel=%s); skipping id=%s",
                         raw is not None,
-                        reply_stream_raw is not None,
+                        reply_channel_raw is not None,
                         message_id,
                     )
-                    if reply_stream:
+                    if reply_channel:
                         await self._send_error_reply(
-                            reply_stream, "ValueError", "Missing required query fields"
+                            reply_channel, "ValueError", "Missing required query fields"
                         )
                     await self._redis.xack(stream_str, self._consumer_group, message_id)
                     continue
@@ -1523,26 +1543,22 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                         try:
                             result = await handler(msg)
                             result_data = self._serializer.dumps(result)
-                            await self._redis.xadd(
-                                reply_stream,
-                                {"data": result_data},
-                                maxlen=self._max_stream_length,
-                                approximate=True,
-                            )
+                            payload = json.dumps({"data": result_data.decode("utf-8")})
+                            await self._redis.publish(reply_channel, payload)
                             _handler_ok = True
                         except Exception as exc:
                             logger.warning(
-                                "Query handler %s raised %s (reply_stream=%s): %s",
+                                "Query handler %s raised %s (reply_channel=%s): %s",
                                 type(msg).__name__,
                                 type(exc).__name__,
-                                reply_stream,
+                                reply_channel,
                                 exc,
                             )
                             if self._metrics_collector is not None:
                                 self._metrics_collector.record_failed(stream_str)
-                            await self._send_error_reply(reply_stream, type(exc).__name__, str(exc))
-                        finally:
-                            await self._redis.expire(reply_stream, self._REPLY_STREAM_TTL_SECONDS)
+                            await self._send_error_reply(
+                                reply_channel, type(exc).__name__, str(exc)
+                            )
                         if _handler_ok and self._metrics_collector is not None:
                             self._metrics_collector.record_processed(stream_str)
                         await self._redis.xack(stream_str, self._consumer_group, message_id)
@@ -1560,9 +1576,9 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                     await self._redis.xack(stream_str, self._consumer_group, message_id)
             except Exception:
                 logger.exception("Error processing query message id=%s", message_id)
-                if reply_stream:
+                if reply_channel:
                     await self._send_error_reply(
-                        reply_stream, "RuntimeError", "Internal error processing query"
+                        reply_channel, "RuntimeError", "Internal error processing query"
                     )
                 # Always ACK to prevent PEL growth on unrecoverable errors
                 try:
@@ -1570,22 +1586,57 @@ class AsyncRedisMessageBus(AsyncMessageBus):
                 except Exception as e:
                     logger.warning("Failed to XACK query message id=%s: %s", message_id, e)
 
-    async def _send_error_reply(
-        self, reply_stream: str, error_type: str, error_message: str
-    ) -> None:
-        """Write an error reply to *reply_stream*, logging failures instead of swallowing."""
+    async def _run_pubsub_reply_listener(self) -> None:
+        """Background coroutine: receive PUBLISH-ed query replies and dispatch to futures.
+
+        Uses PSUBSCRIBE on ``{app_name}:reply_ch:*`` so a single connection
+        serves all concurrent ``send()`` callers without per-call subscribe
+        overhead.  Polls via ``get_message()`` so that ``_running=False``
+        causes a clean exit on the next iteration.
+        """
         try:
-            await self._redis.xadd(
-                reply_stream,
-                {"error_type": error_type, "error_message": error_message},
-                maxlen=self._max_stream_length,
-                approximate=True,
-            )
+            while self._running:
+                message = await self._pubsub.get_message(
+                    ignore_subscribe_messages=True, timeout=0.01
+                )
+                if message is None:
+                    await asyncio.sleep(0)
+                    continue
+                msg_type = message.get("type")
+                if msg_type not in ("pmessage", "message"):
+                    continue  # skip subscribe/unsubscribe confirmations
+                channel = message.get("channel", b"")
+                if isinstance(channel, bytes):
+                    channel = channel.decode()
+                # Extract correlation_id: last `:` segment of the channel name
+                correlation_id = channel.rsplit(":", 1)[-1]
+                future = self._pending_queries.get(correlation_id)
+                if future is not None and not future.done():
+                    raw = message["data"]
+                    future.set_result(raw if isinstance(raw, bytes) else raw.encode())
+        except asyncio.CancelledError:
+            return
+        except (RedisConnectionError, RedisTimeoutError, OSError) as e:
+            logger.warning("Pub/Sub reply listener disconnected: %s", e)
+            # Fail all pending queries immediately so callers get ConnectionError
+            # rather than waiting until their individual timeouts expire.
+            conn_err = ConnectionError(f"Pub/Sub reply listener disconnected: {e}")
+            for fut in list(self._pending_queries.values()):
+                if not fut.done():
+                    fut.set_exception(conn_err)
+
+    async def _send_error_reply(
+        self, reply_channel: str, error_type: str, error_message: str
+    ) -> None:
+        """Publish an error reply to *reply_channel*, logging failures instead of swallowing."""
+        try:
+            payload = json.dumps({"error_type": error_type, "error_message": error_message})
+            await self._redis.publish(reply_channel, payload)
         except Exception:
             logger.exception(
-                "Failed to write error reply to %s (%s: %s); "
+                "Failed to publish error reply to %s (%s: %s); "
                 "requester will receive TimeoutError instead of the original error",
-                reply_stream,
+                reply_channel,
                 error_type,
                 error_message,
             )

@@ -678,12 +678,8 @@ class TestAsyncRedisMessageBusQuery:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_send_query_uses_xread_block_when_block_ms_positive(
-        self, fake_redis_server, serializer
-    ):
-        """send() must call xread(block=N) instead of polling when _block_ms > 0."""
-        from unittest.mock import patch  # noqa: PLC0415
-
+    async def test_send_query_uses_pubsub_not_xread(self, fake_redis_server, serializer):
+        """send() must use Pub/Sub (psubscribe) instead of XREAD polling for reply."""
         import fakeredis
 
         client = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
@@ -693,38 +689,49 @@ class TestAsyncRedisMessageBusQuery:
             app_name="test",
             serializer=serializer,
             consumer_name="caller",
-            _block_ms=50,
+            _block_ms=0,
             _redis_client=client,
             query_reply_timeout=0.15,
         )
         await bus.start()
 
-        xread_block_values: list[int | None] = []
+        # Pub/Sub connection is established during start() via psubscribe.
+        assert bus._pubsub is not None, (
+            "start() must establish a Pub/Sub connection for reply listening"
+        )
+
+        xread_reply_calls: list[str] = []
+        original_xread = client.xread
 
         async def spy_xread(streams, count=None, block=None):
-            if any("reply" in str(k) for k in streams):
-                xread_block_values.append(block)
-            return []  # always empty → triggers timeout
+            for k in streams:
+                if "reply" in str(k):
+                    xread_reply_calls.append(str(k))
+            return await original_xread(streams, count=count, block=block)
 
         try:
             with (
-                patch.object(client, "xread", side_effect=spy_xread),
+                __import__("unittest.mock", fromlist=["patch"]).patch.object(
+                    client, "xread", side_effect=spy_xread
+                ),
                 pytest.raises((asyncio.TimeoutError, TimeoutError)),
             ):
-                await bus.send(GetOrderQuery(order_id="test-block"))
+                await bus.send(GetOrderQuery(order_id="test-pubsub"))
 
-            assert xread_block_values, "No xread calls recorded for reply stream"
-            assert all(b is not None and b > 0 for b in xread_block_values), (
-                f"Expected all reply xread calls to use block>0, got: {xread_block_values}"
+            # XREAD was NOT called for the reply channel
+            assert not xread_reply_calls, (
+                f"XREAD must not be used for reply (Pub/Sub replaces it), "
+                f"but got calls: {xread_reply_calls}"
             )
         finally:
             await bus.close()
 
     @pytest.mark.asyncio
-    async def test_send_query_last_id_advances_after_malformed_envelope(
+    async def test_send_query_malformed_pubsub_reply_raises_runtime_error(
         self, fake_redis_server, serializer
     ):
-        """send() raises RuntimeError on malformed envelope and starts cursor at '0-0'."""
+        """send() raises RuntimeError when the Pub/Sub reply payload is missing 'data'."""
+        import json as _json  # noqa: PLC0415
         from unittest.mock import patch  # noqa: PLC0415
 
         import fakeredis
@@ -742,51 +749,32 @@ class TestAsyncRedisMessageBusQuery:
         )
         await bus.start()
 
-        call_ids: list[str] = []
-        malformed_msg_id = "1700000000000-0"
-        call_count = [0]
+        original_xadd = client.xadd
 
-        async def spy_xread(streams, count=None, block=None):
-            for k, stream_id in streams.items():
-                if "reply" in str(k):
-                    call_ids.append(stream_id if isinstance(stream_id, str) else stream_id.decode())
-            call_count[0] += 1
-            if call_count[0] == 1:
-                # First call: return empty → cursor stays at "0-0"
-                return []
-            if call_count[0] == 2:
-                # Second call: return malformed envelope → last_id advances, RuntimeError raised
-                return [
-                    (
-                        b"reply_stream",
-                        [(malformed_msg_id.encode(), {b"irrelevant": b"field"})],
-                    )
-                ]
-            return []
+        async def inject_malformed_reply(name, fields, *args, **kwargs):
+            result = await original_xadd(name, fields, *args, **kwargs)
+            # After the query XADD, publish a malformed payload to the reply channel.
+            # The reply_channel field is encoded as bytes in send().
+            if "query" in str(name) and "reply_channel" in fields:
+                reply_ch = fields["reply_channel"]
+                if isinstance(reply_ch, bytes):
+                    reply_ch = reply_ch.decode()
+                malformed = _json.dumps({"irrelevant": "field"}).encode()
+                await client.publish(reply_ch, malformed)
+            return result
 
         try:
             with (
-                patch.object(client, "xread", side_effect=spy_xread),
-                pytest.raises(RuntimeError, match="Malformed reply envelope"),
+                patch.object(client, "xadd", side_effect=inject_malformed_reply),
+                pytest.raises(RuntimeError, match="Malformed reply.*missing 'data'"),
             ):
-                await bus.send(GetOrderQuery(order_id="test-lastid"))
-
-            # First call used "0-0"
-            assert call_ids[0] == "0-0", f"First read must start at '0-0', got: {call_ids[0]}"
-            # Second call also used "0-0" (empty first read, cursor not advanced)
-            assert call_ids[1] == "0-0", (
-                f"Second read must use '0-0' after empty read, got: {call_ids[1]}"
-            )
+                await bus.send(GetOrderQuery(order_id="test-malformed"))
         finally:
             await bus.close()
 
     @pytest.mark.asyncio
-    async def test_send_query_blocking_mode_receives_valid_reply(
-        self, fake_redis_server, serializer
-    ):
-        """send() with _block_ms > 0 correctly deserializes and returns the handler reply."""
-        from unittest.mock import patch  # noqa: PLC0415
-
+    async def test_send_query_pubsub_receives_valid_reply(self, fake_redis_server, serializer):
+        """send() correctly deserializes and returns the handler reply via Pub/Sub."""
         import fakeredis
 
         client = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
@@ -796,25 +784,57 @@ class TestAsyncRedisMessageBusQuery:
             app_name="test",
             serializer=serializer,
             consumer_name="caller",
-            _block_ms=50,
+            _block_ms=0,
             _redis_client=client,
             query_reply_timeout=1.0,
         )
+
+        expected = "order:test-pubsub-ok"
+
+        async def handler(q: GetOrderQuery) -> str:
+            return f"order:{q.order_id}"
+
+        bus.register_query(GetOrderQuery, handler)
         await bus.start()
 
-        expected = "order:test-block-ok"
-        serialized_reply = serializer.dumps(expected)
+        try:
+            result = await bus.send(GetOrderQuery(order_id="test-pubsub-ok"))
+            assert result == expected
+        finally:
+            await bus.close()
 
-        async def mock_xread(streams, count=None, block=None):
-            for stream_key in streams:
-                if "reply" in str(stream_key):
-                    return [(stream_key, [(b"1-0", {b"data": serialized_reply})])]
-            return []
+    @pytest.mark.asyncio
+    async def test_concurrent_queries_routed_correctly(self, fake_redis_server, serializer):
+        """Concurrent send() calls must each receive their own reply via correlation_id."""
+        import fakeredis
+
+        fake_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
+        bus = AsyncRedisMessageBus(
+            redis_url="redis://localhost",
+            consumer_group="svc",
+            app_name="test",
+            serializer=serializer,
+            consumer_name="worker",
+            _block_ms=0,
+            _redis_client=fake_redis,
+        )
+
+        async def handler(q: GetOrderQuery) -> str:
+            return f"reply:{q.order_id}"
+
+        bus.register_query(GetOrderQuery, handler)
+        await bus.start()
 
         try:
-            with patch.object(client, "xread", side_effect=mock_xread):
-                result = await bus.send(GetOrderQuery(order_id="test-block-ok"))
-            assert result == expected
+            # Fire 5 queries concurrently; each must receive its own reply.
+            order_ids = [f"order-{i}" for i in range(5)]
+            results = await asyncio.gather(
+                *[bus.send(GetOrderQuery(order_id=oid)) for oid in order_ids]
+            )
+            for oid, result in zip(order_ids, results, strict=True):
+                assert result == f"reply:{oid}", (
+                    f"Query {oid!r} got wrong reply: {result!r}"
+                )
         finally:
             await bus.close()
 
@@ -1235,12 +1255,14 @@ class TestAsyncRedisMessageBusXAutoclaim:
         bus.register_query(GetOrderQuery, handler)
         await bus.start()
         try:
-            # Verify: only _run_query_consumer task is spawned (no xautoclaim task)
+            # Verify: only _run_query_consumer + _run_pubsub_reply_listener are spawned.
             # Command/Event buses spawn 2 tasks per stream (consumer + xautoclaim).
-            # A Query-only bus must spawn exactly 1 task (query consumer, no xautoclaim).
-            assert len(bus._consumer_tasks) == 1, (
-                "Query-only bus must spawn exactly 1 background task "
-                "(no XAUTOCLAIM loop for query streams)"
+            # A Query-only bus must spawn exactly 2 tasks:
+            #   1. query consumer (no xautoclaim – query streams don't need it)
+            #   2. shared Pub/Sub reply listener (always started so send() can receive replies)
+            assert len(bus._consumer_tasks) == 2, (
+                "Query-only bus must spawn exactly 2 background tasks "
+                "(query consumer + Pub/Sub reply listener, no XAUTOCLAIM loop)"
             )
         finally:
             await bus.close()
@@ -1340,50 +1362,70 @@ class TestMaxStreamLength:
 
         producer_redis.xadd = capturing_xadd
 
+        await producer.start()
         await consumer.start()
         try:
             await producer.send(GetOrderQuery(order_id="q1"))
         finally:
             await consumer.close()
+            await producer.close()
 
         query_stream_calls = [c for c in xadd_calls if "query" in c["name"]]
         assert len(query_stream_calls) >= 1
         assert query_stream_calls[0]["kwargs"].get("maxlen") == 777
 
     @pytest.mark.asyncio
-    async def test_reply_stream_xadd_includes_maxlen(self, serializer, fake_redis_server):
-        """Reply stream XADD (query result) must pass maxlen."""
+    async def test_reply_uses_publish_not_xadd(self, serializer, fake_redis_server):
+        """Query reply must use PUBLISH (Pub/Sub), not XADD to a reply stream."""
         import fakeredis
 
         producer_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
         consumer_redis = fakeredis.aioredis.FakeRedis(server=fake_redis_server)
 
         producer = self._make_bus(serializer, producer_redis)
-        consumer = self._make_bus(serializer, consumer_redis, max_stream_length=666)
+        consumer = self._make_bus(serializer, consumer_redis)
 
         async def handler(q: GetOrderQuery) -> str:
             return f"ok:{q.order_id}"
 
         consumer.register_query(GetOrderQuery, handler)
 
-        xadd_calls: list[dict] = []
+        publish_calls: list[str] = []
+        original_publish = consumer_redis.publish
+
+        async def capturing_publish(channel, message):
+            publish_calls.append(str(channel))
+            return await original_publish(channel, message)
+
+        consumer_redis.publish = capturing_publish
+
+        xadd_reply_calls: list[str] = []
         original_xadd = consumer_redis.xadd
 
         async def capturing_xadd(name, fields, *args, **kwargs):
-            xadd_calls.append({"name": name, "kwargs": kwargs})
+            if "reply" in str(name):
+                xadd_reply_calls.append(str(name))
             return await original_xadd(name, fields, *args, **kwargs)
 
         consumer_redis.xadd = capturing_xadd
 
+        await producer.start()
         await consumer.start()
         try:
             await producer.send(GetOrderQuery(order_id="q1"))
         finally:
             await consumer.close()
+            await producer.close()
 
-        reply_stream_calls = [c for c in xadd_calls if "reply" in c["name"]]
-        assert len(reply_stream_calls) >= 1
-        assert reply_stream_calls[0]["kwargs"].get("maxlen") == 666
+        # PUBLISH must be used for the reply channel
+        assert any("reply_ch" in ch for ch in publish_calls), (
+            f"Expected PUBLISH to a reply_ch channel, got: {publish_calls}"
+        )
+        # XADD must NOT be used for reply
+        assert not xadd_reply_calls, (
+            f"XADD must not be used for reply (Pub/Sub replaces it), "
+            f"but got: {xadd_reply_calls}"
+        )
 
     def test_invalid_max_stream_length_raises(self, serializer, fake_redis):
         """max_stream_length <= 0 must raise ValueError at construction time (fail-fast)."""
@@ -1397,7 +1439,7 @@ class TestMaxStreamLength:
     async def test_send_error_reply_failure_is_logged_as_exception(
         self, serializer, fake_redis, caplog
     ):
-        """When _send_error_reply XADD fails, it must log at ERROR level (not silently swallow)."""
+        """When _send_error_reply PUBLISH fails, must log at ERROR level (not silently swallow)."""
         import logging
 
         bus = self._make_bus(serializer, fake_redis)
@@ -1405,12 +1447,12 @@ class TestMaxStreamLength:
         async def always_fail(*args, **kwargs):
             raise OSError("Redis connection lost")
 
-        fake_redis.xadd = always_fail
+        fake_redis.publish = always_fail
 
         with caplog.at_level(logging.ERROR):
-            await bus._send_error_reply("test:reply:stream", "ValueError", "some error")
+            await bus._send_error_reply("test:reply_ch:abc123", "ValueError", "some error")
 
-        assert any("test:reply:stream" in r.message for r in caplog.records)
+        assert any("test:reply_ch:abc123" in r.message for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -1508,9 +1550,10 @@ class TestHOLBlockingFix:
 
         await bus.start()
 
-        # 3 타입 × 2 태스크(consumer + xautoclaim) = 6
-        assert len(bus._consumer_tasks) == 6, (
-            f"3 message types × 2 tasks each = 6 expected, got {len(bus._consumer_tasks)}"
+        # 3 타입 × 2 태스크(consumer + xautoclaim) = 6, + 1 shared Pub/Sub reply listener = 7
+        assert len(bus._consumer_tasks) == 7, (
+            f"3 message types × 2 tasks each = 6 + 1 Pub/Sub listener = 7 expected, "
+            f"got {len(bus._consumer_tasks)}"
         )
 
         await bus.close()
